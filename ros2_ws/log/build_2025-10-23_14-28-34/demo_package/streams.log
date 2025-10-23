@@ -1,0 +1,50 @@
+[0.601s] Invoking command in '/home/dennisd2/obstacle-avoidance-comps/ros2_ws/src/demo_package': PYTHONPATH=/home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/demo_package build --build-base /home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/build install --record /home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/install.log --single-version-externally-managed install_data
+[0.801s] /usr/local/lib/python3.10/dist-packages/setuptools_scm/_integration/setuptools.py:31: RuntimeWarning: 
+[0.801s] ERROR: setuptools==59.6.0 is used in combination with setuptools-scm>=8.x
+[0.801s] 
+[0.801s] Your build configuration is incomplete and previously worked by accident!
+[0.802s] setuptools-scm requires setuptools>=61
+[0.802s] 
+[0.802s] Suggested workaround if applicable:
+[0.802s]  - migrating from the deprecated setup_requires mechanism to pep517/518
+[0.802s]    and using a pyproject.toml to declare build dependencies
+[0.802s]    which are reliably pre-installed before running the build tools
+[0.802s] 
+[0.802s]   warnings.warn(
+[0.816s] running egg_info
+[0.816s] creating ../../build/demo_package/demo_package.egg-info
+[0.816s] writing ../../build/demo_package/demo_package.egg-info/PKG-INFO
+[0.816s] writing dependency_links to ../../build/demo_package/demo_package.egg-info/dependency_links.txt
+[0.816s] writing entry points to ../../build/demo_package/demo_package.egg-info/entry_points.txt
+[0.816s] writing requirements to ../../build/demo_package/demo_package.egg-info/requires.txt
+[0.816s] writing top-level names to ../../build/demo_package/demo_package.egg-info/top_level.txt
+[0.816s] writing manifest file '../../build/demo_package/demo_package.egg-info/SOURCES.txt'
+[0.921s] reading manifest file '../../build/demo_package/demo_package.egg-info/SOURCES.txt'
+[0.921s] adding license file 'LICENSE'
+[0.921s] writing manifest file '../../build/demo_package/demo_package.egg-info/SOURCES.txt'
+[0.921s] running build
+[0.921s] running build_py
+[0.922s] creating /home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/build
+[0.922s] creating /home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/build/lib
+[0.922s] creating /home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/build/lib/demo_package
+[0.922s] copying demo_package/__init__.py -> /home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/build/lib/demo_package
+[0.922s] copying demo_package/demo_node.py -> /home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/build/lib/demo_package
+[0.922s] running install
+[0.922s] running install_lib
+[0.923s] creating /home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/lib/python3.10/site-packages/demo_package
+[0.923s] copying /home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/build/lib/demo_package/__init__.py -> /home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/lib/python3.10/site-packages/demo_package
+[0.923s] copying /home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/build/lib/demo_package/demo_node.py -> /home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/lib/python3.10/site-packages/demo_package
+[0.923s] byte-compiling /home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/lib/python3.10/site-packages/demo_package/__init__.py to __init__.cpython-310.pyc
+[0.924s] byte-compiling /home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/lib/python3.10/site-packages/demo_package/demo_node.py to demo_node.cpython-310.pyc
+[0.924s] running install_data
+[0.924s] creating /home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/share/ament_index
+[0.924s] creating /home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/share/ament_index/resource_index
+[0.924s] creating /home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/share/ament_index/resource_index/packages
+[0.924s] copying resource/demo_package -> /home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/share/ament_index/resource_index/packages
+[0.924s] copying package.xml -> /home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/share/demo_package
+[0.924s] running install_egg_info
+[0.925s] Copying ../../build/demo_package/demo_package.egg-info to /home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/lib/python3.10/site-packages/demo_package-0.0.0-py3.10.egg-info
+[0.925s] running install_scripts
+[0.935s] Installing demo_node script to /home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/lib/demo_package
+[0.935s] writing list of installed files to '/home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/install.log'
+[0.960s] Invoked command in '/home/dennisd2/obstacle-avoidance-comps/ros2_ws/src/demo_package' returned '0': PYTHONPATH=/home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/demo_package build --build-base /home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/build install --record /home/dennisd2/obstacle-avoidance-comps/ros2_ws/build/demo_package/install.log --single-version-externally-managed install_data
