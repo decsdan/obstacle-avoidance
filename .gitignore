@@ -1,7 +1,13 @@
 
-# VS Code symbol DB
-ros2_ws/.vscode/*
-build/*
-install/*
-log/*
+# VS Code files
+.vscode/
+**/.vscode/
+*.vc.db
+*.vc.db-shm
+*.vc.db-wal
+
+# ROS 2 generated directories
+build/
+install/
+log/
 
