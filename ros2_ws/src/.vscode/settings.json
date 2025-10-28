@@ -1,0 +1,14 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/turtlesim/local/lib/python3.10/dist-packages",
+        "/home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/turtlesim/local/lib/python3.10/dist-packages",
+        "/home/dennisd2/obstacle-avoidance-comps/ros2_ws/install/demo_package/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
+}

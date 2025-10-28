@@ -1,33 +1,30 @@
-import rospy
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
 from geometry_msgs.msg import Twist
 
-class control_tb3():
+class SpinBot(Node):
     def __init__(self):
-        rospy.init_node('control_tb3', anonymous=True)
-        rospy.loginfo("Press CTRL + C to terminate the TurtleBot3")
-        rospy.on_shutdown(self.shutdown)
+        super().__init__('spin_bot')
+        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
+        timer_period = 0.1  # seconds
+        self.timer = self.create_timer(timer_period, self.spin_robot)
+        self.get_logger().info('Spinning node started!')
         
-        self.cmd_vel_object = rospy.Publisher('cmd_vel', Twist, queue_size=10)
-        
-        self.vel_msg = Twist()
-        self.vel_msg.linear.x = 1
-        self.vel_msg.angular.z = 0.5
-        
-        r = rospy.Rate(30)
-        
-        while not rospy.is_shutdown():
-            self.cmd_vel_object.publish(self.vel_msg)
-            r.sleep()
-            
-    def shutdown(self):
-        self.cmd_vel_object.publish(Twist())
-        rospy.loginfo("The TB3 is stopping")
-        rospy.sleep(1)
-        
+        self.twist = Twist()
+        self.twist.linear.x = 0.0
+        self.twist.angular.z = 0.5  # Positive = spin left (counterclockwise)
+
+    def spin_robot(self):
+        self.publisher_.publish(self.twist)
+        self.get_logger().info('Spinning...')
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SpinBot()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
 if __name__ == '__main__':
-    try:
-        control_tb3()
-    except rospy.ROSInterruptException:
-        pass
-    except:
-        rospy.loginfo("Turtlebot node is terminated")
+    main()
