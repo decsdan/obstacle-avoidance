@@ -1,4 +1,7 @@
 
 # VS Code symbol DB
 ros2_ws/.vscode/*
+build/*
+install/*
+log/*
 
