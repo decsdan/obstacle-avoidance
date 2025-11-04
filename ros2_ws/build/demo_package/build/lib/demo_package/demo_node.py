@@ -13,7 +13,7 @@ class MoveAndSpin(Node):
 
         # Create a Twist message for forward + rotational motion
         self.twist = Twist()
-        self.twist.linear.x = 1.0   # forward speed (m/s)
+        self.twist.linear.x = 0.5   # forward speed (m/s)
         self.twist.angular.z = 0.9    # rotation speed (rad/s)
 
     def timer_callback(self):
