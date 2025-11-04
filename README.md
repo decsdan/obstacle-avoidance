@@ -9,6 +9,7 @@ In this file, add these commands:
 source /opt/ros/humble/setup.bash
 source /usr/share/colcon_argcomplete/hook/colcon-argcomplete.bash
 source ~/obstacle-avoidance-comps/ros2_ws/install/setup.bash
+source install/setup.bash
 
 This allows for ROS2, Colcon, and python packages to run.
 
