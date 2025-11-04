@@ -1,3 +1,0 @@
-[console_scripts]
-demo_node = demo_package.demo_node:main
-

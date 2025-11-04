@@ -1,4 +1,3 @@
-LICENSE
 package.xml
 setup.cfg
 setup.py
@@ -11,7 +10,11 @@ setup.py
 ../../build/demo_package/demo_package.egg-info/zip-safe
 demo_package/__init__.py
 demo_package/demo_node.py
+demo_package.egg-info/PKG-INFO
+demo_package.egg-info/SOURCES.txt
+demo_package.egg-info/dependency_links.txt
+demo_package.egg-info/entry_points.txt
+demo_package.egg-info/requires.txt
+demo_package.egg-info/top_level.txt
+demo_package.egg-info/zip-safe
 resource/demo_package
-test/test_copyright.py
-test/test_flake8.py
-test/test_pep257.py
