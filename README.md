@@ -2,6 +2,12 @@
 
 Lab Computer Setup:
 
+**important**
+- cd into ros2_ws package
+- run colcon build
+  
+Then
+
 gedit ~/.bashrc
 
 In this file, add these commands:
