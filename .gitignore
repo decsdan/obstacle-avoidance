@@ -6,8 +6,8 @@
 *.vc.db-shm
 *.vc.db-wal
 
-# ROS 2 generated directories
-ros2_ws/build/
-ros2_ws/install/
-ros2_ws/log/
+# for all ROS 2 generated directories (not just within ros2_ws)
+**/build/
+**/install/
+**/log/
 
