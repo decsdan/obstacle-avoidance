@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'demo_package'
+package_name = 'dwa_package'
 
 setup(
     name=package_name,
@@ -13,18 +13,17 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='dennisd2',
-    maintainer_email='dennisd2@todo.todo',
+    maintainer='daniel',
+    maintainer_email='scheiderd@carleton.edu',
     description='TODO: Package description',
-    license='Apache-2.0',
+    license='TODO: License declaration',
     extras_require={
         'test': [
             'pytest',
         ],
     },
-    entry_points={
-        'console_scripts': [ #THIS IS WHERE THE PACKAGE BECOMES RUNNABLE
-            'demo_node = demo_package.demo_node:main'
+    entry_points={ #THIS IS WHERE THE PACKAGE BECOMES RUNNABLE
+        'console_scripts': [ "dwa_node = dwa_package.dwa_node:main",
         ],
     },
 )
