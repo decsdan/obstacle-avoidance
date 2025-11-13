@@ -59,15 +59,18 @@ running the ROS2 sensor_data:
 Shows a GUI of either the camera/lidar of the robot.
 
 
-To Run the DWA package: (which currently doesn't process the message inputs, or publish to twist, will be implementing that within the next few days)
+**To Run the DWA package:** (which currently doesn't process the message inputs, or publish to twist, will be implementing that within the next few days)
 
  - download src files
  - cd into ros2_ws package
  - $ source install/local_setup.bash
  - $ ros2 launch turtlebot4_ignition_bringup turtlebot4_ignition.launch.py
- - in another terminal, 
+ - in another terminal,
+   
 $ colcon build
+
 $ source install/local_setup.bash
+
 $ ros2 run dwa_package dwa_node
 
 
