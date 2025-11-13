@@ -57,38 +57,7 @@ class DWA(Node):
         """gets unsynced raw lidar from the LaserScan directly, for use in emergency stop
         from https://docs.ros.org/en/humble/p/sensor_msgs/
 
-
-        # Single scan from a planar laser range-finder
-#
-# If you have another ranging device with different behavior (e.g. a sonar
-# array), please find or create a different message, since applications
-# will make fairly laser-specific assumptions about this data
-
-    std_msgs/Header header # timestamp in the header is the acquisition time of
-                             # the first ray in the scan.
-                             #
-                             # in frame frame_id, angles are measured around
-                             # the positive Z axis (counterclockwise, if Z is up)
-                             # with zero angle being forward along the x axis
-
-    float32 angle_min            # start angle of the scan [rad]
-    float32 angle_max            # end angle of the scan [rad]
-    float32 angle_increment      # angular distance between measurements [rad]
-
-    float32 time_increment       # time between measurements [seconds] - if your scanner
-                             # is moving, this will be used in interpolating position
-                             # of 3d points
-    float32 scan_time            # time between scans [seconds]
-
-    float32 range_min            # minimum range value [m]
-    float32 range_max            # maximum range value [m]
-
-    float32[] ranges             # range data [m]
-                             # (Note: values < range_min or > range_max should be discarded)
-    float32[] intensities    # intensity data [device-specific units].  If your
-                             # device does not provide intensities, please leave
-                             # the array empty.
-        """        
+        """
         self.emergency_scan_msg = msg
         self.scan_count += 1
         #self.get_logger().info(f"Recieved scan message {self.scan_count}") #also if you want to see the scan messages, just scan_msg instead of scan_count
@@ -100,45 +69,6 @@ class DWA(Node):
         """gets odometry from Odometry
 
 https://docs.ros.org/en/humble/p/nav_msgs/msg/Odometry.html
-
-# This represents an estimate of a position and velocity in free space.
-# The pose in this message should be specified in the coordinate frame given by header.frame_id
-# The twist in this message should be specified in the coordinate frame given by the child_frame_id
-
-# Includes the frame id of the pose parent.
-    std_msgs/Header header
-
-# Frame id the pose points to. The twist is in this coordinate frame.
-    string child_frame_id
-
-# Estimated pose that is typically relative to a fixed world frame.
-    geometry_msgs/PoseWithCovariance pose
-
-# Estimated linear and angular velocity relative to child_frame_id.
-    geometry_msgs/TwistWithCovariance twist
-            TWISTWITHCOVARIANCE  :
-
-
-            # This expresses velocity in free space with uncertainty.
-
-                Twist twist
-                    # This expresses velocity in free space broken into its linear and angular parts.
-
-                        Vector3  linear
-                        Vector3  angular
-
-            # Row-major representation of the 6x6 covariance matrix
-            # The orientation parameters use a fixed-axis representation.
-            # In order, the parameters are:
-            # (x, y, z, rotation about X axis, rotation about Y axis, rotation about Z axis)
-                float64[36] covariance
-
-        """        
-        
-        self.odom_msg = msg
-        self.odom_count += 1
-        #self.get_logger().info(f"Recieved odom message {self.odom_count}") #also if you want to see the odom messages, just odom_msg instead of odom_count
-
         '''
 
     def synchronized_callback(self, odom_msg, scan_msg):
