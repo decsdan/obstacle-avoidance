@@ -431,14 +431,14 @@ def main(args=None):
     safety_clearance = 0.15  # Additional safety margin in meters
 
     # Default map path (same as run_a_star.py)
-    yaml_file = '/opt/ros/humble/share/turtlebot4_navigation/maps/maze.yaml'
-    pgm_file = '/opt/ros/humble/share/turtlebot4_navigation/maps/maze.pgm'
+    yaml_file = '/opt/ros/jazzy/share/turtlebot4_navigation/maps/maze.yaml'
+    pgm_file = '/opt/ros/jazzy/share/turtlebot4_navigation/maps/maze.pgm'
 
     # Parse command line arguments
     # Usage: visualizer [yaml_file] [pgm_file] [robot_radius] [safety_clearance]
     if len(sys.argv) >= 3:
-        yaml_file = sys.argv[1]
         pgm_file = sys.argv[2]
+        yaml_file = sys.argv[1]
         print(f"Using custom map: {yaml_file}, {pgm_file}")
 
     if len(sys.argv) >= 4:

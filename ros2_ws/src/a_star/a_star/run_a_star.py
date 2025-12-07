@@ -2,7 +2,8 @@
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, PoseStamped
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
 from nav_msgs.msg import Odometry
 import numpy as np
 import yaml
@@ -15,8 +16,22 @@ class AStarNavigator(Node):
         super().__init__('astar_navigator')
 
         # Publishers and Subscribers
-        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        # Twist (Humble) TwistStamped (Jazzy)
+        self.cmd_vel_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+
+        # Use sim_ground_truth_pose instead of odom to get position in map frame
+        # Configure QoS to match the publisher (BEST_EFFORT reliability)
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            '/sim_ground_truth_pose',
+            self.odom_callback,
+            qos_profile
+        )
 
         # Map data
         self.grid = None
@@ -43,7 +58,8 @@ class AStarNavigator(Node):
         self.control_timer = self.create_timer(0.1, self.control_loop)
 
         # Load map
-        self.load_map('/opt/ros/humble/share/turtlebot4_navigation/maps/maze.yaml', '/opt/ros/humble/share/turtlebot4_navigation/maps/maze.pgm')
+        # Note: These need to be changed based on the version (Jazzy/Humble)
+        self.load_map('/opt/ros/jazzy/share/turtlebot4_navigation/maps/maze.yaml', '/opt/ros/jazzy/share/turtlebot4_navigation/maps/maze.pgm')
 
         self.get_logger().info('A* Navigator initialized')
         self.get_logger().info(f'Robot radius: {self.robot_radius}m, Safety clearance: {self.safety_clearance}m')
@@ -78,7 +94,13 @@ class AStarNavigator(Node):
             self.inflate_obstacles(total_inflation)
 
             self.get_logger().info(f'Map loaded: {self.grid.shape}, resolution: {self.resolution}')
+            self.get_logger().info(f'Map origin: {self.origin}')
             self.get_logger().info(f'Obstacles inflated by {total_inflation}m ({int(total_inflation/self.resolution)} pixels)')
+
+            # Debug: Log map bounds in world coordinates
+            map_width = self.grid.shape[1] * self.resolution
+            map_height = self.grid.shape[0] * self.resolution
+            self.get_logger().info(f'Map bounds: X=[{self.origin[0]:.2f}, {self.origin[0]+map_width:.2f}], Y=[{self.origin[1]:.2f}, {self.origin[1]+map_height:.2f}]')
         except Exception as e:
             self.get_logger().error(f'Failed to load map: {e}')
     
@@ -127,17 +149,37 @@ class AStarNavigator(Node):
         """Plan path using A*"""
         start_grid = self.world_to_grid(start_x, start_y)
         goal_grid = self.world_to_grid(goal_x, goal_y)
-        
+
         self.get_logger().info(f'Grid coordinates: Start {start_grid}, Goal {goal_grid}')
-        
-        # Check if start/goal are valid
-        if not self.is_valid(start_grid):
-            self.get_logger().error(f'Start position ({start_x:.2f}, {start_y:.2f}) is invalid or occupied!')
+
+        # Debug: Verify the conversion is reversible
+        start_world_check = self.grid_to_world(start_grid[0], start_grid[1])
+        goal_world_check = self.grid_to_world(goal_grid[0], goal_grid[1])
+        self.get_logger().info(f'World coords check: Start ({start_world_check[0]:.2f}, {start_world_check[1]:.2f}), Goal ({goal_world_check[0]:.2f}, {goal_world_check[1]:.2f})')
+
+        # Check if start is valid in ORIGINAL grid (before inflation)
+        # since robot is already there
+        if not self.is_valid_in_original_grid(start_grid):
+            self.get_logger().error(f'Start position ({start_x:.2f}, {start_y:.2f}) is invalid or in actual obstacle!')
             return []
-        
+
+        # Check if goal is valid in INFLATED grid (for safety)
         if not self.is_valid(goal_grid):
-            self.get_logger().error(f'Goal position ({goal_x:.2f}, {goal_y:.2f}) is invalid or occupied!')
+            self.get_logger().error(f'Goal position ({goal_x:.2f}, {goal_y:.2f}) is invalid or too close to obstacles!')
             return []
+
+        # Debug: Check neighbors of start position
+        neighbors_valid = 0
+        for dx, dy in [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]:
+            neighbor = (start_grid[0] + dx, start_grid[1] + dy)
+            if self.is_valid(neighbor):
+                neighbors_valid += 1
+        self.get_logger().info(f'Start has {neighbors_valid}/8 valid neighbors in inflated grid')
+
+        if neighbors_valid == 0:
+            self.get_logger().warn(f'Start position is surrounded by inflated obstacles!')
+            self.get_logger().warn(f'Consider reducing safety_clearance (current: {self.safety_clearance}m) or robot_radius (current: {self.robot_radius}m)')
+            self.get_logger().warn(f'Current total inflation: {self.robot_radius + self.safety_clearance}m')
         
         # Run A* algorithm
         self.get_logger().info('Running A* pathfinding...')
@@ -153,24 +195,24 @@ class AStarNavigator(Node):
         return simplified_path
     
     def astar(self, start, goal):
-        """A* pathfinding algorithm"""
+        """A* pathfinding algorithm with hybrid obstacle checking"""
         def heuristic(a, b):
             return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
-        
+
         rows, cols = self.grid.shape
         open_set = []
         heapq.heappush(open_set, (0, start))
-        
+
         came_from = {}
         g_score = {start: 0}
         f_score = {start: heuristic(start, goal)}
-        
+
         nodes_explored = 0
-        
+
         while open_set:
             _, current = heapq.heappop(open_set)
             nodes_explored += 1
-            
+
             if current == goal:
                 # Reconstruct path
                 path = []
@@ -180,13 +222,22 @@ class AStarNavigator(Node):
                 path.append(start)
                 self.get_logger().info(f'A* explored {nodes_explored} nodes')
                 return path[::-1]
-            
+
             # 8-connected neighbors
             for dx, dy in [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]:
                 neighbor = (current[0] + dx, current[1] + dy)
-                
-                if not self.is_valid(neighbor):
-                    continue
+
+                # Hybrid validation: use original grid for cells close to start (tight spaces)
+                # and inflated grid for cells far from start (safety)
+                distance_from_start = abs(neighbor[0] - start[0]) + abs(neighbor[1] - start[1])
+                if distance_from_start <= 3:
+                    # Close to start - use original grid to escape tight spaces
+                    if not self.is_valid_in_original_grid(neighbor):
+                        continue
+                else:
+                    # Far from start - use inflated grid for safety
+                    if not self.is_valid(neighbor):
+                        continue
                 
                 # Diagonal moves cost more
                 move_cost = 1.414 if dx != 0 and dy != 0 else 1.0
@@ -202,14 +253,24 @@ class AStarNavigator(Node):
         return []  # No path found
     
     def is_valid(self, grid_pos):
-        """Check if grid position is valid and free"""
+        """Check if grid position is valid and free in inflated grid"""
         gx, gy = grid_pos
         rows, cols = self.grid.shape
-        
+
         if gx < 0 or gx >= cols or gy < 0 or gy >= rows:
             return False
-        
+
         return self.grid[gy, gx] == 0  # Note: grid is [row, col] = [y, x]
+
+    def is_valid_in_original_grid(self, grid_pos):
+        """Check if grid position is valid and free in original grid (before inflation)"""
+        gx, gy = grid_pos
+        rows, cols = self.grid_original.shape
+
+        if gx < 0 or gx >= cols or gy < 0 or gy >= rows:
+            return False
+
+        return self.grid_original[gy, gx] == 0  # Note: grid is [row, col] = [y, x]
     
     def world_to_grid(self, x, y):
         """Convert world coordinates to grid indices"""
@@ -243,48 +304,53 @@ class AStarNavigator(Node):
         """Main control loop - follows waypoints"""
         if not self.path or self.current_pose is None:
             return
-        
+
         if self.current_waypoint_idx >= len(self.path):
             # Goal reached
             self.stop_robot()
             self.get_logger().info('🎯 Goal reached!')
             self.path = []
             return
-        
+
         # Get current waypoint
         target = self.path[self.current_waypoint_idx]
         tx, ty = target
-        
+
         # Calculate distance and angle to target
         dx = tx - self.current_pose['x']
         dy = ty - self.current_pose['y']
         distance = math.sqrt(dx**2 + dy**2)
         target_angle = math.atan2(dy, dx)
         angle_diff = self.normalize_angle(target_angle - self.current_pose['theta'])
-        
-        # Create velocity command
-        cmd = Twist()
-        
+
+        # Create velocity command with timestamp - Twist (Humble) TwistStamped (Jazzy)
+        cmd = TwistStamped()
+        cmd.header.stamp = self.get_clock().now().to_msg()
+        cmd.header.frame_id = 'base_link'
+
         # If close enough to waypoint, move to next
         if distance < self.position_tolerance:
             self.current_waypoint_idx += 1
             self.get_logger().info(f'Waypoint {self.current_waypoint_idx}/{len(self.path)} reached')
             return
-        
+
         # First rotate towards target
         if abs(angle_diff) > self.angle_tolerance:
-            cmd.angular.z = self.angular_speed if angle_diff > 0 else -self.angular_speed
+            cmd.twist.angular.z = self.angular_speed if angle_diff > 0 else -self.angular_speed
         else:
             # Then move forward
-            cmd.linear.x = min(self.linear_speed, distance)
+            cmd.twist.linear.x = min(self.linear_speed, distance)
             # Small correction for angle while moving
-            cmd.angular.z = 0.3 * angle_diff
-        
+            cmd.twist.angular.z = 0.3 * angle_diff
+
         self.cmd_vel_pub.publish(cmd)
     
     def stop_robot(self):
         """Stop the robot"""
-        cmd = Twist()
+        # Twist (Humble) TwistStamped (Jazzy)
+        cmd = TwistStamped()
+        cmd.header.stamp = self.get_clock().now().to_msg()
+        cmd.header.frame_id = 'base_link'
         self.cmd_vel_pub.publish(cmd)
     
     def get_current_position(self):
@@ -339,23 +405,29 @@ def main(args=None):
     print("\nTo customize clearance:")
     print("  ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.20 ros2 run a_star run_a_star")
     print("="*60 + "\n")
-    
-    # Example: Wait for odometry, then navigate
+
+    # Wait for odometry data
     print("Waiting for odometry data...")
     while navigator.current_pose is None and rclpy.ok():
         rclpy.spin_once(navigator, timeout_sec=0.1)
-    
+
     if navigator.current_pose:
         print(f"Current position: ({navigator.current_pose['x']:.2f}, {navigator.current_pose['y']:.2f})")
-        
-        # Example usage - you can modify these values
-        goal_x = float(input("Enter goal X coordinate (meters): "))
-        goal_y = float(input("Enter goal Y coordinate (meters): "))
-        
+
+        # Get goal from user input
+        try:
+            goal_x = float(input("Enter goal X coordinate (meters): "))
+            goal_y = float(input("Enter goal Y coordinate (meters): "))
+        except (ValueError, EOFError, KeyboardInterrupt):
+            print("\nInvalid input or interrupted. Exiting...")
+            navigator.destroy_node()
+            rclpy.shutdown()
+            return
+
         # Use current position as start
         start_x = navigator.current_pose['x']
         start_y = navigator.current_pose['y']
-        
+
         # Plan and execute path
         if navigator.navigate_to_goal(start_x, start_y, goal_x, goal_y):
             print("\nNavigation started! Press Ctrl+C to stop.\n")
@@ -365,7 +437,7 @@ def main(args=None):
                 print("\nStopping navigation...")
         else:
             print("\nNavigation failed!")
-    
+
     navigator.stop_robot()
     navigator.destroy_node()
     rclpy.shutdown()
