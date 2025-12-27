@@ -21,9 +21,7 @@ Add these lines to your `~/.bashrc`:
 
 ```bash
 # ROS 2 Setup
-source /opt/ros/humble/setup.bash  # or 'jazzy'
-source /usr/share/colcon_argcomplete/hook/colcon-argcomplete.bash
-source ~/obstacle-avoidance-comps/ros2_ws/install/setup.bash
+source /opt/ros/jazzy/setup.bash  # or 'humble'
 ```
 
 Apply changes:
