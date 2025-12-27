@@ -5,6 +5,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 
 import pygame
+import sys
 
 class LidarSubscriber(Node):
     def __init__(self):
@@ -13,6 +14,32 @@ class LidarSubscriber(Node):
         self.screen_initialized = False
 
     def scan_callback(self, msg: LaserScan):
+        # Clear screen and move cursor to top (ANSI escape codes)
+        sys.stdout.write('\033[2J\033[H')
+
+        # Print lidar data information
+        print('=== LiDAR Data ===')
+        print(f'Number of ranges: {len(msg.ranges)}')
+        print(f'Angle min: {msg.angle_min:.2f} rad, max: {msg.angle_max:.2f} rad')
+        print(f'Angle increment: {msg.angle_increment:.4f} rad')
+        print(f'Range min: {msg.range_min:.2f} m, max: {msg.range_max:.2f} m')
+
+        # Print sample ranges (front, left, right, back)
+        num_ranges = len(msg.ranges)
+        if num_ranges > 0:
+            front = msg.ranges[0] if msg.ranges[0] != float('inf') else 'inf'
+            left = msg.ranges[num_ranges // 4] if msg.ranges[num_ranges // 4] != float('inf') else 'inf'
+            back = msg.ranges[num_ranges // 2] if msg.ranges[num_ranges // 2] != float('inf') else 'inf'
+            right = msg.ranges[3 * num_ranges // 4] if msg.ranges[3 * num_ranges // 4] != float('inf') else 'inf'
+            print(f'\nSample ranges:')
+            print(f'  Front: {front}')
+            print(f'  Left:  {left}')
+            print(f'  Back:  {back}')
+            print(f'  Right: {right}')
+
+        sys.stdout.flush()
+
+        # Pygame visualization
         if not self.screen_initialized:
             self.initialize_screen(len(msg.ranges))
         for i in range(len(msg.ranges)):

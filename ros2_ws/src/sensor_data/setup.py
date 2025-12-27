@@ -26,7 +26,8 @@ setup(
     entry_points={
         'console_scripts': [
             'camera = sensor_data.image:main',
-            'lidar = sensor_data.lidar:main'
+            'lidar = sensor_data.lidar:main',
+            'map = sensor_data.map_subscriber:main'
         ],
     },
 )
