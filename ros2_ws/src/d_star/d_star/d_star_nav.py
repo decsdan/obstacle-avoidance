@@ -23,7 +23,7 @@ Grid Hierarchy:
     - grid_base: Accumulated SLAM obstacles + static map (persistent)
     - grid_dynamic: Current planning grid = base + lidar obstacles (temporary)
 
-Author: Generated with Claude Code
+Authors: Devin Dennis, Assisted with Claude Code
 """
 
 import rclpy
@@ -1270,6 +1270,7 @@ class DStarNavigator(Node):
             return []
 
         # Validate goal position (must be in free space in inflated grid)
+        # NOTE: This could be changed to allow to robot to get as close to the goal as possible
         if not self._is_valid_in_inflated_grid(goal_grid):
             self.get_logger().error(f'Goal position is invalid!')
             return []
@@ -1537,7 +1538,7 @@ class DStarNavigator(Node):
 
         if self.current_waypoint_idx >= len(self.path):
             self.stop_robot()
-            self.get_logger().info('Goal reached! 🎯')
+            self.get_logger().info('Goal reached! 😎')
             self.path = []
             return
 
