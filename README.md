@@ -1,79 +1,75 @@
-# obstacle-avoidance-comps
+# Obstacle Avoidance - ROS2 Jazzy
 
-Lab Computer Setup:
+Dynamic Window Approach (DWA) for TurtleBot4 in Gazebo Harmonic.
 
-**important**
-- cd into ros2_ws package
-- run colcon build
-  
-Then
+## Quick Install
 
-gedit ~/.bashrc
+```bash
+# Install dependencies
+sudo apt update
+sudo apt install ros-jazzy-desktop gz-harmonic ros-jazzy-turtlebot4-simulator
 
-In this file, add these commands:
+# Setup rosdep (first time only)
+sudo rosdep init
+rosdep update
+```
 
-source /opt/ros/humble/setup.bash
-source /usr/share/colcon_argcomplete/hook/colcon-argcomplete.bash
+## Setup
+
+Add to `~/.bashrc`:
+```bash
+source /opt/ros/jazzy/setup.bash
 source ~/obstacle-avoidance-comps/ros2_ws/install/setup.bash
+```
+
+Build workspace:
+```bash
+cd ~/obstacle-avoidance-comps/ros2_ws
+rosdep install -i --from-path src --rosdistro jazzy -y
+colcon build
 source install/setup.bash
+```
 
-This allows for ROS2, Colcon, and python packages to run.
+## Running
 
- 
+### Launch Simulation
+```bash
+ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py
+```
 
+### demo_package - Circular motion
+```bash
+ros2 run demo_package demo_node
+```
 
-Setup Gazebo (for the lab computers):
+### joy_test - Position output
+```bash
+ros2 run joy_test input
+```
 
-Initial setup (needs to run after for each terminal using ros):
-$ source /opt/ros/humble/setup.bash
+### sensor_data - Camera/LiDAR
+```bash
+ros2 run sensor_data camera  # or lidar
+```
 
-Run Gazebo:
-ros2 launch turtlebot4_ignition_bringup turtlebot4_ignition.launch.py
+### dwa_package - Obstacle avoidance
 
+**Terminal 1:**
+```bash
+ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py
+```
 
-running the ROS2 demo_package:
-- cd into ros2_ws package
-- run $ rosdep install -i --from-path src --rosdistro humble -y
-- then run $ colcon build --packages-select demo_package
-- then run $ source install/local_setup.bash
-- then run $ ros2 run demo_package demo_node
+**Terminal 2:**
+```bash
+rviz2
+```
 
-This makes the robot move in a circle.
+Set Rviz2 up, let it load, undock the turtlebot, then use the 2D goal Pose tool to create the goal for turtlebot
 
-running the ROS2 joy_test:
-- cd into ros2_ws package
-- run $ colcon build --symlink-install
-- then run $ source install/local_setup.bash
-- then run $ ros2 run joy_test input
-
-This prints the position data of where the robot is the in the world.
-
-
-running the ROS2 sensor_data:
-- cd into ros2_ws package
-- run $ colcon build --symlink-install
-- then run $ source install/local_setup.bash
-- then run $ ros2 run sensor_data camera (robot's camera pov)
-- or run $ ros2 run sensor_data lidar (robot's lidar pov)
-
-Shows a GUI of either the camera/lidar of the robot.
-
-
-**To Run the DWA package:** (which currently doesn't process the message inputs, or publish to twist, will be implementing that within the next few days)
-
- - download src files
- - cd into ros2_ws package
- - $ source install/local_setup.bash
- - $ ros2 launch turtlebot4_ignition_bringup turtlebot4_ignition.launch.py
- - in another terminal,
-   
-$ colcon build
-
-$ source install/local_setup.bash
-
-$ ros2 run dwa_package dwa_node
-
-
-This should return info on what functions are being run, in what order (and you can tweak dwa_node.py to also return the actual messages from LaserScan and Odometry)
-
-
+**Terminal 3:**
+```bash
+ros2 run dwa_package dwa_node
+```
+## Key Changes for Jazzy
+- `turtlebot4_ignition_bringup` → `turtlebot4_gz_bringup`
+- `turtlebot4_ignition.launch.py` → `turtlebot4_gz.launch.py`

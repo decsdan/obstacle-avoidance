@@ -6,7 +6,6 @@
   <description>This is a package meant to run dynamic window approach for local path planning and obstacle avoidance comps</description>
   <maintainer email="scheiderd@carleton.edu">daniel</maintainer>
   <license>Creative Commons License (for school use)</license>
-
   <depend>rclpy</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
