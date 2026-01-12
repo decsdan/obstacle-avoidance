@@ -22,7 +22,7 @@ Add these lines to your `~/.bashrc`:
 ```bash
 # ROS 2 Setup
 source /opt/ros/jazzy/setup.bash  # or 'humble'
-```
+```**Features:**
 
 Apply changes:
 ```bash
@@ -157,6 +157,7 @@ ros2 run jps jps_visualizer
 
 # Monitor robot position
 ros2 run jps odom
+```
 
 **Features:**
 - Interactive goal input via terminal
