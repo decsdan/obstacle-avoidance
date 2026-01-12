@@ -138,6 +138,26 @@ ros2 run d_star live_visualizer
 - Real-time path visualization
 
 ---
+### JPS (Jump Point Search) Navigator
+Autonomous navigation using Jump Point Search algorithm with optimized pathfinding through uniform-cost grids.
+
+```bash
+cd ~/obstacle-avoidance-comps/ros2_ws
+colcon build --packages-select jps
+source install/local_setup.bash
+
+# Run JPS navigator (prompts for goal coordinates)
+ros2 run jps jps_nav
+
+# With custom safety parameters
+ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.20 ros2 run jps jps_nav
+
+# Run interactive visualizer
+ros2 run jps jps_visualizer
+
+# Monitor robot position
+ros2 run jps odom
+---
 
 ## Using Saved Maps with Localization and Navigation
 
