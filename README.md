@@ -138,7 +138,7 @@ ros2 run d_star live_visualizer
 - Real-time path visualization
 
 ---
-### JPS (Jump Point Search) Navigator
+### Jump Point Search (JPS) Navigator
 Autonomous navigation using Jump Point Search algorithm with optimized pathfinding through uniform-cost grids.
 
 ```bash
@@ -161,7 +161,10 @@ ros2 run jps odom
 **Features:**
 - Interactive goal input via terminal
 - Jump Point Search optimization for uniform-cost grids
-- Hybrid obstacle validation (tight spaces + safety margins)```
+- Hybrid obstacle validation (tight spaces + safety margins)
+```
+
+---
 
 
 ## Using Saved Maps with Localization and Navigation
