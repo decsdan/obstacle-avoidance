@@ -163,6 +163,8 @@ ros2 run jps odom
 - Jump Point Search optimization for uniform-cost grids
 - Hybrid obstacle validation (tight spaces + safety margins)
 
+
+
 ## Using Saved Maps with Localization and Navigation
 
 ### Prerequisites
