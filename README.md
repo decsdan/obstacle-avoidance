@@ -166,8 +166,6 @@ ros2 run jps odom
 ```
 
 ---
-
-
 ## Using Saved Maps with Localization and Navigation
 
 ### Prerequisites
