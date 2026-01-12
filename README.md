@@ -161,8 +161,7 @@ ros2 run jps odom
 **Features:**
 - Interactive goal input via terminal
 - Jump Point Search optimization for uniform-cost grids
-- Hybrid obstacle validation (tight spaces + safety margins)
-
+- Hybrid obstacle validation (tight spaces + safety margins)```
 
 
 ## Using Saved Maps with Localization and Navigation
