@@ -24,7 +24,7 @@ Add these lines to your `~/.bashrc`:
 source /opt/ros/jazzy/setup.bash  # or 'humble'
 ```**Features:**
 
-```bash
+
 source /etc/turtlebot4_discovery/setup.bash
 ros2 daemon stop; ros2 daemon start
 # This is for running the physical robot
