@@ -4,67 +4,122 @@ import math
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Twist, TwistStamped
+from geometry_msgs.msg import TwistStamped, PoseStamped, Point
 from message_filters import Subscriber, ApproximateTimeSynchronizer
-from geometry_msgs.msg import PoseStamped
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.qos import QoSProfile, ReliabilityPolicy
-#NOTE: For callbacks, we wanna do as little as possible, just save messages and exit, and process the messages in another function, they block all other callbacks when being processed
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from visualization_msgs.msg import Marker
+from std_msgs.msg import ColorRGBA
+from tf2_ros import Buffer, TransformListener
 
 class DWA(Node):
-    """_summary_
-
-    Args:
-        Node (_type_): _description_
-    """    
+    
+    
     def __init__(self):
-        """ subscribes to lidar (LaserScan) and Odometry, and preps to publish to movement (Twist), then runs nav_loop over and over
-        """
         super().__init__('dynamic_window_approach')   
-
-        self.callback_group = ReentrantCallbackGroup() #adding a callback group for multi threaded work
-        self.dt = 0.1 #how long each step is in time
-        #relevant hyperprams for the DWA functions, I think these are more realistic
-        self.dt = 0.1
-        self.max_v = 0.5 
-        self.min_v = -0.1
-        self.max_w = 1.5
-        self.min_w = -1.5
-        self.v_accel = 0.5
-        self.w_accel = 0.5
-        self.steps = 10 #how far to look ahead
-        self.new_data = False
-
-        self.emergencyLidar = self.create_subscription(LaserScan, '/scan', self.emergency_lidar_callback,10) #the 10 here is how many messages it keeps in queue, not sure what a good number would be but demo_node had 10
-        #self.odom = self.create_subscription(Odometry, '/odom', self.odom_callback, 10) #these are regular subscribers, so things that arent filtered by Approximate TimeSync (we can use these for emergency override stuff, e.g. LIDAR detects an object extremely close but odom hasnt published yet, so we cant trust DWA to stop)
-        self.goal = None
-        self.goal_sub = self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
-
-        self.odom_sub = Subscriber(self, Odometry, '/odom')
-        self.scan_sub = Subscriber(self, LaserScan, '/scan')
-        self.timer = self.create_timer(self.dt, self.nav_loop, callback_group=self.callback_group) #edited to reference the callback group
         
-        #added this to match reliability policy of robot
-        qos_policy = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            depth=10
-        )
-        self.twist_publish = self.create_publisher(TwistStamped, '/cmd_vel', qos_policy)
 
-        self.sync = ApproximateTimeSynchronizer([self.odom_sub, self.scan_sub], 10, 0.5) # 0.5s tolerance
-        self.sync.registerCallback(self.synchronized_callback)
-        self.get_logger().info('Synchronizer node started.')
+#relevant hyperparams,,,, can edit here or test diff with command line
+#twist
+        self.declare_parameter('max_velocity', 0.5)
+        self.declare_parameter('min_velocity', -0.2)
+        self.declare_parameter('max_angular_velocity', 2.5)
+        self.declare_parameter('min_angular_velocity', -2.5)
+        self.declare_parameter('max_linear_acceleration', 0.5)
+        self.declare_parameter('max_angular_acceleration', 4.0)
+        self.declare_parameter('v_samples', 20) 
+        self.declare_parameter('w_samples', 20)
 
+        self.max_v = self.get_parameter('max_velocity').value
+        self.min_v = self.get_parameter('min_velocity').value
+        self.max_w = self.get_parameter('max_angular_velocity').value
+        self.min_w = self.get_parameter('min_angular_velocity').value
+        self.v_accel = self.get_parameter('max_linear_acceleration').value
+        self.w_accel = self.get_parameter('max_angular_acceleration').value
+        self.v_samples = self.get_parameter('v_samples').value
+        self.w_samples = self.get_parameter('w_samples').value
+        
+# planning
+        self.declare_parameter('dt', 0.1)
+        self.declare_parameter('prediction_steps', 20)
+        self.declare_parameter('window_steps', 5)
+
+        self.dt = self.get_parameter('dt').value
+        self.steps = self.get_parameter('prediction_steps').value
+        self.window_steps = self.get_parameter('window_steps').value
+        
+# bubbles
+        self.declare_parameter('critical_radius', 0.25)
+        self.declare_parameter('safe_distance', 0.50)
+        self.declare_parameter('emergency_stop_distance', 0.20)
+        self.declare_parameter('max_lidar_range', 4.0)
+
+        self.critical_radius = self.get_parameter('critical_radius').value
+        self.safe_dist = self.get_parameter('safe_distance').value
+        self.emergency_stop_dist = self.get_parameter('emergency_stop_distance').value
+        self.max_lidar_range = self.get_parameter('max_lidar_range').value
+        
+# cost weights
+        self.declare_parameter('weights.goal', 0.50)
+        self.declare_parameter('goal_tolerance', 0.3)
+        self.declare_parameter('weights.heading', 0.15)
+        self.declare_parameter('weights.velocity', 0.15)
+        self.declare_parameter('weights.smoothness', 0.1)
+        self.declare_parameter('weights.obstacle', 0.8)
+
+        self.w_goal = self.get_parameter('weights.goal').value
+        self.goal_tolerance = self.get_parameter('goal_tolerance').value
+        self.w_heading = self.get_parameter('weights.heading').value
+        self.w_velocity = self.get_parameter('weights.velocity').value
+        self.w_smoothness = self.get_parameter('weights.smoothness').value
+        self.w_obstacle = self.get_parameter('weights.obstacle').value
+        
+# recovery
+        self.declare_parameter('recovery.linear_velocity', 0.0)
+        self.declare_parameter('recovery.angular_velocity', 0.5)
+
+        self.recovery_v = self.get_parameter('recovery.linear_velocity').value
+        self.recovery_w = self.get_parameter('recovery.angular_velocity').value
+        
+#trajectory lines
+        self.declare_parameter('visualize_trajectories', True)
+        self.declare_parameter('trajectory_visualization_downsample', 5)
+
+        self.visualize_trajectories = self.get_parameter('visualize_trajectories').value
+        self.traj_downsample = self.get_parameter('trajectory_visualization_downsample').value
+        
+
+
+        self.new_data = False
+        self.goal = None
         self.emergency_scan_msg = None
         self.scan_msg = None
         self.odom_msg = None
-
-
-        self.odom_count = 0
         self.scan_count = 0
+        self.lidar_yaw_offset = 0.0
+        
+#subs
+        self.callback_group = ReentrantCallbackGroup()
+        self.emergencyLidar = self.create_subscription(LaserScan, '/scan', self.emergency_lidar_callback, 10)
+        self.goal_sub = self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
+        self.odom_sub = Subscriber(self, Odometry, '/odom', qos_profile=qos_profile_sensor_data)
+        self.scan_sub = Subscriber(self, LaserScan, '/scan', qos_profile=qos_profile_sensor_data)
 
+#pubs
+        qos_policy = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=10)
+        self.twist_publish = self.create_publisher(TwistStamped, '/cmd_vel', qos_policy)
+        self.debug_pub = self.create_publisher(Marker, '/debug_obstacles', 10)
+        self.traj_pub = self.create_publisher(Marker, '/dwa/trajectories', 10)
+        self.best_traj_pub = self.create_publisher(Marker, '/dwa/best_trajectory', 10)
 
+#syncing
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self) 
+        self.timer = self.create_timer(self.dt, self.nav_loop, callback_group=self.callback_group)
+        self.lidar_timer = self.create_timer(1.0, self.update_lidar_offset)
+        self.sync = ApproximateTimeSynchronizer([self.odom_sub, self.scan_sub], 10, 0.1)
+        self.sync.registerCallback(self.synchronized_callback)
         
 
 
@@ -73,146 +128,328 @@ class DWA(Node):
         self.get_logger().info(f"New Goal Set: {self.goal}")
 
     def emergency_lidar_callback(self, msg: LaserScan):
-        """gets unsynced raw lidar from the LaserScan directly, for use in emergency stop
-        from https://docs.ros.org/en/humble/p/sensor_msgs/
-
-        """
         self.emergency_scan_msg = msg
         self.scan_count += 1
-        #self.get_logger().info(f"Recieved scan message {self.scan_count}") #also if you want to see the scan messages, just scan_msg instead of scan_count
-
-
-    #commented out basic odom_callback, we can decide to use this if we want but for now we have synced messages
-    '''
-    def odom_callback(self, msg: Odometry):
-        """gets odometry from Odometry
-
-https://docs.ros.org/en/humble/p/nav_msgs/msg/Odometry.html
-        '''
-
+        
     def synchronized_callback(self, odom_msg, scan_msg):
-        # self.get_logger().info(f"Synced: Odom time {odom_msg.header.stamp}, Scan time {scan_msg.header.stamp}")
         self.scan_msg = scan_msg
         self.odom_msg = odom_msg
         self.new_data = True
 
+# helper funcs
+    def update_lidar_offset(self):
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'base_link', 'rplidar_link', rclpy.time.Time()
+            )
+            self.lidar_yaw_offset = self.quat_to_yaw(transform.transform.rotation)
+            self.get_logger().info(f"LiDAR offset set to {self.lidar_yaw_offset:.3f} rad")
+            self.lidar_timer.cancel()
+        except Exception as e:
+            self.get_logger().warn(f"Could not get LiDAR transform: {e}")
 
-
-
-    def cost_function(self,trajectory): #TODO implement obstacle avoidance into cost function, not just final state function
-
-        #self.get_logger().info(f"TESTING COST FUNCTION")
-        #get final location, twist, direction
-        x = trajectory[-1][0]
-        y = trajectory[-1][1]
-        theta= trajectory[-1][2]
-        w = trajectory[-1][3]
-        v = trajectory[-1][4]
-
-        final_pos = [x,y]
-        dist = np.linalg.norm(self.goal - final_pos)
-        score = -dist + 0.1 * v -0.1 * abs(w)
-
-        return score
-    
-    def predict_trajectory(self,v,w, curr_x, curr_y, curr_theta,steps=30, dt=0.1):
-
-        trajectory = np.zeros((steps,5))
-
-        for i in range(steps):
-            curr_x += v * np.cos(curr_theta) *dt
-            curr_y += v * np.sin(curr_theta) *dt
-            curr_theta += w *dt
-            trajectory[i] = [curr_x,curr_y,curr_theta,v,w]
-
-        return trajectory
-    
-    def dynamic_window(self, curr_v, curr_w):
-        poss_v_max = curr_v + self.v_accel * self.dt 
-        poss_v_max = min(poss_v_max,self.max_v) 
-
-        poss_v_min = curr_v - self.v_accel* self.dt
-        poss_v_min = max(poss_v_min, self.min_v)
-
-        poss_w_max = curr_w + self.w_accel * self.dt
-        poss_w_max = min(poss_w_max, self.max_w)
-
-        poss_w_min = curr_w - self.w_accel* self.dt
-        poss_w_min = max(poss_w_min, self.min_w)
-
-        return poss_v_max, poss_v_min, poss_w_max, poss_w_min
-
-
-    # the orientation needs to be converted from 3d (quaternion) to 2d (yaw)
     def quat_to_yaw(self, q):
-        """
-        Convert a quaternion into euler angle yaw
-        """
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         return math.atan2(siny_cosp, cosy_cosp)
 
+#for use in rviz,,, allows you to track possible paths, colored red to green based on score, with chosen path as a bold blue
+    def publish_trajectory_markers(self, trajectories, scores, best_idx):
+        if not self.visualize_trajectories:
+            return
+        
+        now = self.get_clock().now().to_msg()
+        marker = Marker()
+        marker.header.frame_id = "odom"
+        marker.header.stamp = now
+        marker.ns = "candidate_trajectories"
+        marker.id = 0
+        marker.type = Marker.LINE_LIST
+        marker.action = Marker.ADD
+        marker.scale.x = 0.01
+        marker.pose.orientation.w = 1.0
+
+        valid_scores = scores[np.isfinite(scores)]
+        if len(valid_scores) == 0:
+            return
+        
+        smin = np.min(valid_scores)
+        smax = np.max(valid_scores)
+        srange = smax - smin if smax > smin else 1.0
+        
+        for i in range(0, len(trajectories), self.traj_downsample):
+            if i == best_idx:
+                continue
+            
+            traj = trajectories[i]
+            score = scores[i]
+            
+            
+            if np.isfinite(score):
+                norm = (score - smin) / srange
+                if norm < 0.5:
+                    r, g, b = 1.0, norm * 2.0, 0.0
+                else:
+                    r, g, b = 1.0 - (norm - 0.5) * 2.0, 1.0, 0.0
+                a = 0.3 + 0.4 * norm
+            else:
+                r, g, b, a = 0.5, 0.5, 0.5, 0.1 #gray for paths that go through objects
+            
+
+            for j in range(len(traj) - 1):
+                p1 = Point()
+                p1.x, p1.y, p1.z = float(traj[j, 0]), float(traj[j, 1]), 0.05
+                p2 = Point()
+                p2.x, p2.y, p2.z = float(traj[j+1, 0]), float(traj[j+1, 1]), 0.05
+                marker.points.append(p1)
+                marker.points.append(p2)
+                
+                c = ColorRGBA()
+                c.r, c.g, c.b, c.a = r, g, b, a
+                marker.colors.append(c)
+                marker.colors.append(c)
+        
+        self.traj_pub.publish(marker)
+        
+        best_marker = Marker()
+        best_marker.header.frame_id = "odom"
+        best_marker.header.stamp = now
+        best_marker.ns = "best_trajectory"
+        best_marker.id = 1
+        best_marker.type = Marker.LINE_STRIP
+        best_marker.action = Marker.ADD
+        best_marker.scale.x = 0.05
+        best_marker.color.r, best_marker.color.g = 0.0, 1.0
+        best_marker.color.b, best_marker.color.a = 1.0, 1.0
+        best_marker.pose.orientation.w = 1.0
+        
+        for pt in trajectories[best_idx]:
+            p = Point()
+            p.x, p.y, p.z = float(pt[0]), float(pt[1]), 0.1
+            best_marker.points.append(p)
+        
+        self.best_traj_pub.publish(best_marker)
+
+
+
+
+
+    
+#funcs
+    def get_obstacles(self):
+        if self.scan_msg is None or self.odom_msg is None:
+            return np.array([])
+        
+        theta = self.quat_to_yaw(self.odom_msg.pose.pose.orientation)
+        x = self.odom_msg.pose.pose.position.x
+        y = self.odom_msg.pose.pose.position.y
+
+        ranges = np.array(self.scan_msg.ranges)
+        angles = np.linspace(
+            self.scan_msg.angle_min,
+            self.scan_msg.angle_max,
+            len(ranges)
+        )
+        
+        mask = (
+            (ranges > self.scan_msg.range_min) & 
+            (ranges < self.scan_msg.range_max) & 
+            (ranges < self.max_lidar_range)  # Use parameter
+        )
+        valid_ranges = ranges[mask]
+        valid_angles = angles[mask]
+
+        world_angles = theta + valid_angles + self.lidar_yaw_offset
+        
+        o_x = x + valid_ranges * np.cos(world_angles)
+        o_y = y + valid_ranges * np.sin(world_angles)
+        
+        return np.column_stack((o_x, o_y))
+        
+
+
+    def cost_function(self, trajectories, final_vs, final_ws, obstacles, curr_x, curr_y):
+        
+        final_pos = trajectories[:, -1, :2]
+        curr_dist = np.linalg.norm(self.goal - np.array([curr_x, curr_y]))
+        goal_dists = np.linalg.norm(self.goal - final_pos, axis=1)
+        
+        #goal score
+        max_prog = self.max_v * self.dt * self.steps
+        progress = curr_dist - goal_dists
+        g_score = np.clip((progress + max_prog) / (2 * max_prog), 0.0, 1.0)
+        
+        #heading score
+        dx = self.goal[0] - final_pos[:, 0]
+        dy = self.goal[1] - final_pos[:, 1]
+        goal_theta = np.arctan2(dy, dx)
+        final_theta = trajectories[:, -1, 2]
+        heading_err = np.abs(np.arctan2(
+            np.sin(goal_theta - final_theta),
+            np.cos(goal_theta - final_theta)
+        ))
+        h_score = 1.0 - (heading_err / np.pi)
+        
+        #obstacle score
+        if len(obstacles) > 0:
+            all_pts = trajectories[:, :, :2]
+            diffs = obstacles[None, None, :, :] - all_pts[:, :, None, :]
+            dists = np.linalg.norm(diffs, axis=3)
+            min_dists = np.min(dists, axis=(1, 2))
+        else:
+            min_dists = np.full(len(final_vs), self.max_lidar_range)
+        
+        o_score = np.clip(min_dists / self.safe_dist, 0.0, 1.0) ** 2
+        
+        #velocity and smoothness
+        v_score = final_vs / self.max_v
+        w_score = 1.0 - (np.abs(final_ws) / self.max_w)
+        
+        #combine
+        scores = (
+            self.w_goal * g_score +
+            self.w_heading * h_score +
+            self.w_velocity * v_score +
+            self.w_smoothness * w_score +
+            self.w_obstacle * o_score
+        )
+        
+        #hard reject if too close to objects
+        crit = np.where(np.abs(final_vs) > 0.1, self.critical_radius, self.emergency_stop_dist + 0.01)
+        scores[min_dists < crit] = -np.inf
+        
+        return scores, min_dists
+    
+        
+    # changed to do vector mult,, similar logic but applies to all v w 
+    def predict_trajectories(self, v_arr, w_arr, curr_x, curr_y, curr_theta, steps=30, dt=0.1):
+        
+                
+        #copy over v and w across array
+        vs = np.tile(v_arr[:, None], (1, steps))
+        ws = np.tile(w_arr[:, None], (1, steps))
+        
+        thetas = np.cumsum(ws * dt, axis=1) + curr_theta
+        xs = np.cumsum(vs * np.cos(thetas) * dt, axis=1) + curr_x
+        ys = np.cumsum(vs * np.sin(thetas) * dt, axis=1) + curr_y
+        
+        trajectories = np.stack((xs, ys, thetas), axis=2)
+        return trajectories, vs[:, -1], ws[:, -1]
+    
+    
+        
+    def dynamic_window(self, curr_v, curr_w):
+
+        window_time = self.dt * self.window_steps #look further ahead
+
+        v_range = self.v_accel * window_time
+        w_range = self.w_accel * window_time
+
+        poss_v_max = min(curr_v + v_range, self.max_v)
+        poss_v_min = max(curr_v - v_range, self.min_v)
+        poss_w_max = min(curr_w + w_range, self.max_w)
+        poss_w_min = max(curr_w - w_range, self.min_w)
+
+        return poss_v_max, poss_v_min, poss_w_max, poss_w_min
+
+
     def nav_loop(self):
-        """_summary_
-        """   
-        if self.goal is None: #need to set a goal via Rviz2
+        if self.goal is None:
             return 
         if self.new_data is False:
             return  
+        if self.emergency_scan_msg is not None:
+            ranges = np.array(self.emergency_scan_msg.ranges)
+            ranges = np.nan_to_num(ranges, posinf=10.0) 
+            cone_width = int(len(ranges) / 8)
+            front_ranges = np.concatenate((ranges[-cone_width:], ranges[:cone_width]))
+            if np.min(front_ranges) < self.emergency_stop_dist:
+                self.get_logger().warn("EMERGENCY STOP: Obstacle too close!")
+                stop_cmd = TwistStamped()
+                stop_cmd.header.stamp = self.get_clock().now().to_msg()
+                stop_cmd.header.frame_id = 'base_link'
+                stop_cmd.twist.linear.x = 0.0
+                stop_cmd.twist.angular.z = 0.0
+                self.twist_publish.publish(stop_cmd)
+                return
+            
 
-
-        curr_x = self.odom_msg.pose.pose.position.x #get pose and twist
+        curr_x = self.odom_msg.pose.pose.position.x 
         curr_y = self.odom_msg.pose.pose.position.y
         curr_theta = self.quat_to_yaw(self.odom_msg.pose.pose.orientation)
         curr_v = self.odom_msg.twist.twist.linear.x
         curr_w = self.odom_msg.twist.twist.angular.z
 
-        dist = np.linalg.norm(self.goal - np.array([curr_x, curr_y])) #created goal reached catch
-        if dist < 0.3: 
-            self.get_logger().info("goal hit")
-            stop_cmd = Twist()
+
+        dist = np.linalg.norm(self.goal - np.array([curr_x, curr_y]))
+        if dist < self.goal_tolerance:
+            self.get_logger().info("Goal reached!")
+            stop_cmd = TwistStamped()
+            stop_cmd.header.stamp = self.get_clock().now().to_msg()
+            stop_cmd.header.frame_id = 'base_link'
+            stop_cmd.twist.linear.x = 0.0
+            stop_cmd.twist.angular.z = 0.0
             self.twist_publish.publish(stop_cmd)
             self.new_data = False
-            return
-        best_score = -np.inf       
+            self.goal = None
+            return   
 
-        best_v = 0.0
-        best_w = 0.0
+
         poss_v_max, poss_v_min, poss_w_max, poss_w_min = self.dynamic_window(curr_v, curr_w)
+        poss_v = np.linspace(poss_v_min, poss_v_max, self.v_samples)  
+        poss_w = np.linspace(poss_w_min, poss_w_max, self.w_samples)
+        v_arr, w_arr = np.meshgrid(poss_v, poss_w)
+        v_arr = v_arr.flatten()
+        w_arr = w_arr.flatten()
+        trajectories, final_vs, final_ws = self.predict_trajectories(
+            v_arr, w_arr, curr_x, curr_y, curr_theta, self.steps, self.dt
+        )
 
-        poss_v = np.linspace(poss_v_min, poss_v_max,5)  #should test cost function 25 times (within max/min velocity)
-        poss_w = np.linspace(poss_w_min, poss_w_max, 5)
-        for v in poss_v:
-            for w in poss_w:
-                trajectory = self.predict_trajectory(v,w, curr_x, curr_y, curr_theta,steps=self.steps, dt=self.dt)
-                score = self.cost_function(trajectory)
-                if score > best_score:
-                    best_score = score
-                    best_v = v
-                    best_w = w
-        
-        self.get_logger().info(f"Best V and W set! {best_v}, {best_w}")
-        
-        #added twistStamped here, turtlebot4 requires twiststamped
+        obstacles = self.get_obstacles()
+        if len(obstacles) > 0:
+            marker = Marker()
+            marker.header.frame_id = "odom"
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.type = Marker.SPHERE_LIST
+            marker.action = Marker.ADD
+            marker.scale.x = 0.1
+            marker.scale.y = 0.1
+            marker.scale.z = 0.1
+            marker.color.a = 1.0
+            marker.color.r = 1.0
+            marker.color.g = 0.0
+            marker.color.b = 0.0
+            for obs in obstacles:
+                p = Point()
+                p.x = float(obs[0])
+                p.y = float(obs[1])
+                p.z = 0.0
+                marker.points.append(p)
+            self.debug_pub.publish(marker)
+
+        scores, min_dists = self.cost_function(trajectories, final_vs, final_ws, obstacles, curr_x, curr_y)
+        best_idx = np.argmax(scores)
+        self.publish_trajectory_markers(trajectories, scores, best_idx)
+            
+        if scores[best_idx] == -np.inf:
+            self.get_logger().warn("Too close backing up")
+            best_v = -0.05 
+            best_w = self.recovery_w
+        else:
+            best_v = float(final_vs[best_idx])
+            best_w = float(final_ws[best_idx])
+
+
         self.message = TwistStamped()
         self.message.header.stamp = self.get_clock().now().to_msg()
-        self.message.header.frame_id='base_link'
-        self.message.twist.linear.x = float(best_v)
-        self.message.twist.angular.z = float(best_w)
+        self.message.header.frame_id = 'base_link'
+        self.message.twist.linear.x = best_v
+        self.message.twist.angular.z = best_w
         self.twist_publish.publish(self.message)
+        self.new_data = False
 
 
 
-
-
-
-
-
-
-
-
-
-#edited to handle calcs and twist publishing to not stop and start
 def main(args=None):
     rclpy.init(args=args)
     node = DWA()
@@ -223,10 +460,5 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
-
 if __name__ == '__main__':
     main()
-
-
-
