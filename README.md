@@ -1,4 +1,4 @@
-# Obstacle Avoidance Competition
+# Obstacle Avoidance COMPS
 
 ROS 2 workspace for TurtleBot4 obstacle avoidance and navigation.
 
