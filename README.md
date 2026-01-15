@@ -175,7 +175,7 @@ colcon build --packages-select jps
 source /opt/ros/jazzy/setup.bash
 source install/local_setup.bash
 
-# Run JPS navigator (prompts for goal coordinates)
+# Run JPS navigator (gazebo prompts for goal coordinates)
 ros2 run jps jps_nav
 
 # With custom safety parameters
