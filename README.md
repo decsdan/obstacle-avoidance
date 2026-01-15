@@ -22,12 +22,10 @@ Add these lines to your `~/.bashrc`:
 ```bash
 # ROS 2 Setup
 source /opt/ros/jazzy/setup.bash  # or 'humble'
-```**Features:**
 
-
+# This is for running the physical robot
 source /etc/turtlebot4_discovery/setup.bash
 ros2 daemon stop; ros2 daemon start
-# This is for running the physical robot
 ```
 
 ### 3. Running Slam on Physical Robot
