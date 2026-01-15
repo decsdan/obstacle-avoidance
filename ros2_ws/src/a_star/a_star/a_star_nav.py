@@ -71,11 +71,11 @@ class NavigatorConstants:
 
     # Publishing/Subscribing Paths
     CMD_VEL = '/don/cmd_vel'
-    ODOMETRY = '/don/sim_ground_truth_pose'
+    ODOMETRY = '/don/odom'
 
     # Pgm and yaml paths
-    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olin304.yaml'
-    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/olin304.pgm'
+    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olin304-308.yaml'
+    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/olin304-308.pgm'
 
 
 
