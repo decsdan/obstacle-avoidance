@@ -69,6 +69,15 @@ class NavigatorConstants:
     MAX_PATH_WAYPOINTS = 20      # Maximum waypoints after simplification
     TIGHT_SPACE_RADIUS = 3       # Grid cells to use original grid near start
 
+    # Publishing/Subscribing Paths
+    CMD_VEL = '/don/cmd_vel'
+    ODOMETRY = '/don/sim_ground_truth_pose'
+
+    # Pgm and yaml paths
+    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/maze_slamed.yaml'
+    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/maze_slamed.pgm'
+
+
 
 # ============================================================================
 # MAIN NAVIGATOR CLASS
@@ -107,7 +116,7 @@ class AStarNavigator(Node):
         # ====================================================================
 
         # Command velocity publisher (TwistStamped for Jazzy, Twist for Humble)
-        self.cmd_vel_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+        self.cmd_vel_pub = self.create_publisher(TwistStamped, NavigatorConstants.CMD_VEL, 10)
 
         # Odometry subscriber (best-effort QoS to match publisher)
         qos_profile = QoSProfile(
@@ -117,7 +126,7 @@ class AStarNavigator(Node):
         )
         self.odom_sub = self.create_subscription(
             Odometry,
-            '/sim_ground_truth_pose',
+            NavigatorConstants.ODOMETRY,
             self.odom_callback,
             qos_profile
         )
@@ -166,8 +175,8 @@ class AStarNavigator(Node):
         # pgm_file = '/opt/ros/jazzy/share/turtlebot4_navigation/maps/maze.pgm'
 
         # Slammed maze map
-        yaml_file = os.path.expanduser('~/code/obstacle-avoidance-comps/ros2_ws/maze_slamed.yaml')
-        pgm_file = os.path.expanduser('~/code/obstacle-avoidance-comps/ros2_ws/maze_slamed.pgm')
+        yaml_file = os.path.expanduser(NavigatorConstants.SLAM_MAP_YAML)
+        pgm_file = os.path.expanduser(NavigatorConstants.SLAM_MAP_PGM)
 
         self.load_map(yaml_file, pgm_file)
 
