@@ -162,8 +162,8 @@ class JPSNavigator(Node):
         # ====================================================================
 
         # Slammed maze map
-        yaml_file = os.path.expanduser('~/code/obstacle-avoidance-comps/ros2_ws/maze_slamed.yaml')
-        pgm_file = os.path.expanduser('~/code/obstacle-avoidance-comps/ros2_ws/maze_slamed.pgm')
+        yaml_file = os.path.expanduser('~/code/obstacle-avoidance-comps/ros2_ws/olin304-308.yaml')
+        pgm_file = os.path.expanduser('~/code/obstacle-avoidance-comps/ros2_ws/olin304-308.pgm')
 
         self.load_map(yaml_file, pgm_file)
 
