@@ -44,10 +44,12 @@ class DWA(Node):
         self.declare_parameter('dt', 0.1)
         self.declare_parameter('prediction_steps', 30)
         self.declare_parameter('window_steps', 5)
+        self.declare_parameter('LIDAR_downsample', 4)
 
         self.dt = self.get_parameter('dt').value
         self.steps = self.get_parameter('prediction_steps').value
         self.window_steps = self.get_parameter('window_steps').value
+        self.LIDAR_downsample = self.get_parameter('LIDAR_downsample').value
         
 # bubbles
         self.declare_parameter('critical_radius', 0.22)
@@ -82,7 +84,7 @@ class DWA(Node):
         
 #trajectory lines
         self.declare_parameter('visualize_trajectories', True)
-        self.declare_parameter('trajectory_visualization_downsample', 5)
+        self.declare_parameter('trajectory_visualization_downsample', 10)
 
         self.visualize_trajectories = self.get_parameter('visualize_trajectories').value
         self.traj_downsample = self.get_parameter('trajectory_visualization_downsample').value
@@ -245,11 +247,20 @@ class DWA(Node):
         y = self.odom_msg.pose.pose.position.y
 
         ranges = np.array(self.scan_msg.ranges)
+        #TODO May have to downsample for Turtlebot performance
+        # ranges = np.array(self.scan_msg.ranges)[::self.LIDAR_downsample]
         angles = np.linspace(
             self.scan_msg.angle_min,
             self.scan_msg.angle_max,
             len(ranges)
         )
+
+        '''angles = np.linspace(
+                self.scan_msg.angle_min,
+                self.scan_msg.angle_max,
+                len(self.scan_msg.ranges)
+            )[::self.LIDAR_downsample]
+        '''
         
         mask = (
             (ranges > self.scan_msg.range_min) & 
