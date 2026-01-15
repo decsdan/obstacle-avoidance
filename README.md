@@ -30,6 +30,24 @@ ros2 daemon stop; ros2 daemon start
 # This is for running the physical robot
 ```
 
+### 3. Running Slam on Physical Robot
+
+Open two terminals and follow 2.configure your environment in each.
+
+In terminal 1 run:
+
+```bash
+ros2 launch turtlebot4_navigation slam.launch.py namespace:=/don
+```
+
+In terminal 1 run:
+
+```bash
+ros2 launch turtlebot4_viz view_navigation.launch.py namespace:=/don
+```
+
+then move the robot around to start.
+
 Apply changes:
 ```bash
 source ~/.bashrc
