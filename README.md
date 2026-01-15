@@ -150,6 +150,7 @@ Autonomous navigation using Jump Point Search algorithm with optimized pathfindi
 ```bash
 cd ~/obstacle-avoidance-comps/ros2_ws
 colcon build --packages-select jps
+source /opt/ros/jazzy/setup.bash
 source install/local_setup.bash
 
 # Run JPS navigator (prompts for goal coordinates)
