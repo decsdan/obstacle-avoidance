@@ -84,6 +84,19 @@ class PlannerConstants:
     ROBOT_CLEARANCE_CELLS = 2     # Cells around robot to keep free
     INFLATION_DIVISOR = 2         # Reduce inflation for dynamic obstacles
 
+    # Publishing/Subscribing Paths
+    CMD_VEL = '/don/cmd_vel'
+    ODOMETRY = '/don/odom'
+    SCAN = '/don/scan'
+    OCCUPANCY_GRID = '/don/map'
+    PATH = 'don/path'
+
+    # Pgm and yaml paths
+    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olin304-308.yaml'
+    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/olin304-308.pgm'
+
+
+
 
 # ============================================================================
 # D* LITE PATHFINDING ALGORITHM
@@ -439,7 +452,7 @@ class DStarNavigator(Node):
             robot_radius: Physical radius of robot in meters
             safety_clearance: Extra safety buffer around obstacles in meters
             optimistic_planning: If True, treat unknown areas as free
-        """
+        """'/scan'
         super().__init__('dstar_navigator')
 
         # Robot configuration
@@ -448,8 +461,8 @@ class DStarNavigator(Node):
         self.optimistic_planning = optimistic_planning
 
         # ROS2 publishers
-        self.cmd_vel_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
-        self.path_pub = self.create_publisher(Path, '/planned_path', 10)
+        self.cmd_vel_pub = self.create_publisher(TwistStamped, PlannerConstants.CMD_VEL, 10)
+        self.path_pub = self.create_publisher(Path, PlannerConstants.PATH, 10)
 
         # ROS2 subscribers
         self._setup_subscribers()
@@ -490,8 +503,8 @@ class DStarNavigator(Node):
         self.control_timer = self.create_timer(0.1, self.control_loop)
 
         # Load static map
-        yaml_file = os.path.expanduser('~/code/obstacle-avoidance-comps/ros2_ws/maze_slamed.yaml')
-        pgm_file = os.path.expanduser('~/code/obstacle-avoidance-comps/ros2_ws/maze_slamed.pgm')
+        yaml_file = os.path.expanduser(PlannerConstants.SLAM_MAP_YAML)
+        pgm_file = os.path.expanduser(PlannerConstants.SLAM_MAP_PGM)
         self.load_map(yaml_file, pgm_file)
 
         self._log_initialization()
@@ -506,11 +519,11 @@ class DStarNavigator(Node):
         )
 
         self.odom_sub = self.create_subscription(
-            Odometry, '/sim_ground_truth_pose', self.odom_callback, qos_best_effort
+            Odometry, PlannerConstants.ODOMETRY, self.odom_callback, qos_best_effort
         )
 
         self.scan_sub = self.create_subscription(
-            LaserScan, '/scan', self.scan_callback, 10
+            LaserScan, PlannerConstants.SCAN, self.scan_callback, 10
         )
 
         # Reliable + transient-local QoS for maps (latched topic)
@@ -522,7 +535,7 @@ class DStarNavigator(Node):
         )
 
         self.map_sub = self.create_subscription(
-            OccupancyGrid, '/map', self.map_callback, map_qos
+            OccupancyGrid, PlannerConstants.OCCUPANCY_GRID, self.map_callback, map_qos
         )
 
     def _log_initialization(self):

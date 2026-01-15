@@ -66,8 +66,13 @@ class LiveVisualizerConstants:
     COLOR_OBSTACLE = [0.3, 0.3, 0.3]    # Dark gray for obstacles
 
     # Default Map Path
-    DEFAULT_YAML = '~/code/obstacle-avoidance-comps/ros2_ws/maze_slamed.yaml'
-    DEFAULT_PGM = '~/code/obstacle-avoidance-comps/ros2_ws/maze_slamed.pgm'
+    DEFAULT_YAML = '~/obstacle-avoidance-comps/ros2_ws/olin304-308.yaml'
+    DEFAULT_PGM = '~/obstacle-avoidance-comps/ros2_ws/olin304-308.pgm'
+
+    ODOMETRY = '/don/odom'
+    PATH = '/don/path'
+
+
 
 
 # ============================================================================
@@ -115,7 +120,7 @@ class LivePathVisualizer(Node):
         )
         self.odom_sub = self.create_subscription(
             Odometry,
-            '/sim_ground_truth_pose',
+            LiveVisualizerConstants.ODOMETRY,
             self.odom_callback,
             qos_profile
         )
@@ -123,7 +128,7 @@ class LivePathVisualizer(Node):
         # Planned path subscription (reliable QoS)
         self.path_sub = self.create_subscription(
             Path,
-            '/planned_path',
+            LiveVisualizerConstants.PATH,
             self.path_callback,
             10
         )
@@ -144,7 +149,7 @@ class LivePathVisualizer(Node):
         self.lock = threading.Lock()        # Thread-safe access to shared data
 
         self.get_logger().info('Live Path Visualizer initialized')
-        self.get_logger().info('Subscribing to /sim_ground_truth_pose and /planned_path')
+        self.get_logger().info('Subscribing to /odom and /path')
 
     # ========================================================================
     # MAP LOADING
