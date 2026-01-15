@@ -27,6 +27,12 @@ source /opt/ros/jazzy/setup.bash  # or 'humble'
 source /etc/turtlebot4_discovery/setup.bash
 ros2 daemon stop; ros2 daemon start
 ```
+### 3. Manual Control on Physical Robot
+```bash
+# Note: ROBOT_NAME must match robot /cmd_vel:=/{ROBOT_NAME}/cmd_vel
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p stamped:=true -r /cmd_vel:=/don/cmd_vel
+
+```
 
 ### 3. Running Slam on Physical Robot
 
