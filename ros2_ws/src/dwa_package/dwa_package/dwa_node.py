@@ -123,7 +123,6 @@ class DWA(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self) 
         self.timer = self.create_timer(self.dt, self.nav_loop, callback_group=self.callback_group)
-        self.lidar_timer = self.create_timer(1.0, self.update_lidar_offset)
         self.sync = ApproximateTimeSynchronizer([self.odom_sub, self.scan_sub], 10, 0.1)
         self.sync.registerCallback(self.synchronized_callback)
         
@@ -143,16 +142,6 @@ class DWA(Node):
         self.new_data = True
 
 # helper funcs
-    def update_lidar_offset(self):
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                'base_link', 'rplidar_link', rclpy.time.Time()
-            )
-            self.lidar_yaw_offset = self.quat_to_yaw(transform.transform.rotation)
-            self.get_logger().info(f"LiDAR offset set to {self.lidar_yaw_offset:.3f} rad")
-            self.lidar_timer.cancel()
-        except Exception as e:
-            self.get_logger().warn(f"Could not get LiDAR transform: {e}")
 
     def quat_to_yaw(self, q):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
