@@ -102,18 +102,22 @@ class DWA(Node):
         self.lidar_yaw_offset = 0.0
         
 #subs
+        self.declare_parameter('namespace', '/don') #currently blank, but to get it to work on the robot, you need to use the robot name, for us it is /don
+        self.namespace = self.get_parameter('namespace').value
         self.callback_group = ReentrantCallbackGroup()
-        self.emergencyLidar = self.create_subscription(LaserScan, '/scan', self.emergency_lidar_callback, 10)
-        self.goal_sub = self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
-        self.odom_sub = Subscriber(self, Odometry, '/odom', qos_profile=qos_profile_sensor_data)
-        self.scan_sub = Subscriber(self, LaserScan, '/scan', qos_profile=qos_profile_sensor_data)
+        print(f"{self.namespace}/scan")
+
+        self.emergencyLidar = self.create_subscription(LaserScan, f"{self.namespace}/scan", self.emergency_lidar_callback, 10)
+        self.goal_sub = self.create_subscription(PoseStamped, f"{self.namespace}/goal_pose", self.goal_callback, 10)
+        self.odom_sub = Subscriber(self, Odometry, f'{self.namespace}/odom', qos_profile=qos_profile_sensor_data)
+        self.scan_sub = Subscriber(self, LaserScan, f'{self.namespace}/scan', qos_profile=qos_profile_sensor_data)
 
 #pubs
         qos_policy = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=10)
-        self.twist_publish = self.create_publisher(TwistStamped, '/cmd_vel', qos_policy)
-        self.debug_pub = self.create_publisher(Marker, '/debug_obstacles', 10)
-        self.traj_pub = self.create_publisher(Marker, '/dwa/trajectories', 10)
-        self.best_traj_pub = self.create_publisher(Marker, '/dwa/best_trajectory', 10)
+        self.twist_publish = self.create_publisher(TwistStamped, f'{self.namespace}/cmd_vel', qos_policy)
+        self.debug_pub = self.create_publisher(Marker, f'{self.namespace}/debug_obstacles', 10)
+        self.traj_pub = self.create_publisher(Marker, f'{self.namespace}/dwa/trajectories', 10)
+        self.best_traj_pub = self.create_publisher(Marker, f'{self.namespace}/dwa/best_trajectory', 10)
 
 #syncing
         self.tf_buffer = Buffer()
