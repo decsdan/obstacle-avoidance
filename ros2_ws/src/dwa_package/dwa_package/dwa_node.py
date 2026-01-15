@@ -22,12 +22,12 @@ class DWA(Node):
 
 #relevant hyperparams,,,, can edit here or test diff with command line
 #twist
-        self.declare_parameter('max_velocity', 0.5)
-        self.declare_parameter('min_velocity', -0.2)
+        self.declare_parameter('max_velocity', 1.5)
+        self.declare_parameter('min_velocity', 0.0)
         self.declare_parameter('max_angular_velocity', 2.5)
         self.declare_parameter('min_angular_velocity', -2.5)
         self.declare_parameter('max_linear_acceleration', 0.5)
-        self.declare_parameter('max_angular_acceleration', 4.0)
+        self.declare_parameter('max_angular_acceleration', 2.0)
         self.declare_parameter('v_samples', 20) 
         self.declare_parameter('w_samples', 20)
 
@@ -42,7 +42,7 @@ class DWA(Node):
         
 # planning
         self.declare_parameter('dt', 0.1)
-        self.declare_parameter('prediction_steps', 20)
+        self.declare_parameter('prediction_steps', 30)
         self.declare_parameter('window_steps', 5)
 
         self.dt = self.get_parameter('dt').value
@@ -50,10 +50,10 @@ class DWA(Node):
         self.window_steps = self.get_parameter('window_steps').value
         
 # bubbles
-        self.declare_parameter('critical_radius', 0.25)
-        self.declare_parameter('safe_distance', 0.50)
+        self.declare_parameter('critical_radius', 0.22)
+        self.declare_parameter('safe_distance', 0.35)
         self.declare_parameter('emergency_stop_distance', 0.20)
-        self.declare_parameter('max_lidar_range', 4.0)
+        self.declare_parameter('max_lidar_range', 8.0)
 
         self.critical_radius = self.get_parameter('critical_radius').value
         self.safe_dist = self.get_parameter('safe_distance').value
@@ -61,15 +61,13 @@ class DWA(Node):
         self.max_lidar_range = self.get_parameter('max_lidar_range').value
         
 # cost weights
-        self.declare_parameter('weights.goal', 0.50)
-        self.declare_parameter('goal_tolerance', 0.3)
-        self.declare_parameter('weights.heading', 0.15)
-        self.declare_parameter('weights.velocity', 0.15)
-        self.declare_parameter('weights.smoothness', 0.1)
-        self.declare_parameter('weights.obstacle', 0.8)
+        self.declare_parameter('weights.goal', 0.3)
+        self.declare_parameter('weights.heading', 0.02)
+        self.declare_parameter('weights.velocity', 0.3)
+        self.declare_parameter('weights.smoothness', 0.02)
+        self.declare_parameter('weights.obstacle', 0.1)
 
         self.w_goal = self.get_parameter('weights.goal').value
-        self.goal_tolerance = self.get_parameter('goal_tolerance').value
         self.w_heading = self.get_parameter('weights.heading').value
         self.w_velocity = self.get_parameter('weights.velocity').value
         self.w_smoothness = self.get_parameter('weights.smoothness').value
@@ -89,6 +87,8 @@ class DWA(Node):
         self.visualize_trajectories = self.get_parameter('visualize_trajectories').value
         self.traj_downsample = self.get_parameter('trajectory_visualization_downsample').value
         
+        self.declare_parameter('goal_tolerance', 0.3)
+        self.goal_tolerance = self.get_parameter('goal_tolerance').value
 
 
         self.new_data = False
@@ -302,8 +302,8 @@ class DWA(Node):
         o_score = np.clip(min_dists / self.safe_dist, 0.0, 1.0) ** 2
         
         #velocity and smoothness
-        v_score = final_vs / self.max_v
-        w_score = 1.0 - (np.abs(final_ws) / self.max_w)
+        v_score = np.clip(final_vs / self.max_v, 0.0, 1.0)
+        w_score = np.clip(1.0 - (np.abs(final_ws) / self.max_w), 0.0, 1.0)
         
         #combine
         scores = (
