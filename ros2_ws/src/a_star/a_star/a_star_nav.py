@@ -74,8 +74,8 @@ class NavigatorConstants:
     ODOMETRY = '/don/sim_ground_truth_pose'
 
     # Pgm and yaml paths
-    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/maze_slamed.yaml'
-    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/maze_slamed.pgm'
+    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olin304.yaml'
+    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/olin304.pgm'
 
 
 
