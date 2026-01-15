@@ -44,7 +44,7 @@ class DWA(Node):
         self.declare_parameter('dt', 0.1)
         self.declare_parameter('prediction_steps', 30)
         self.declare_parameter('window_steps', 5)
-        self.declare_parameter('LIDAR_downsample', 4)
+        self.declare_parameter('LIDAR_downsample', 1)
 
         self.dt = self.get_parameter('dt').value
         self.steps = self.get_parameter('prediction_steps').value
@@ -246,21 +246,15 @@ class DWA(Node):
         x = self.odom_msg.pose.pose.position.x
         y = self.odom_msg.pose.pose.position.y
 
-        ranges = np.array(self.scan_msg.ranges)
+        
         #TODO May have to downsample for Turtlebot performance
-        # ranges = np.array(self.scan_msg.ranges)[::self.LIDAR_downsample]
+        ranges = np.array(self.scan_msg.ranges)[::self.LIDAR_downsample]
         angles = np.linspace(
             self.scan_msg.angle_min,
             self.scan_msg.angle_max,
-            len(ranges)
-        )
-
-        '''angles = np.linspace(
-                self.scan_msg.angle_min,
-                self.scan_msg.angle_max,
-                len(self.scan_msg.ranges)
-            )[::self.LIDAR_downsample]
-        '''
+            len(self.scan_msg.ranges)
+        )[::self.LIDAR_downsample]
+        
         
         mask = (
             (ranges > self.scan_msg.range_min) & 
