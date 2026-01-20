@@ -24,6 +24,7 @@ setup(
     },
     entry_points={ #THIS IS WHERE THE PACKAGE BECOMES RUNNABLE
         'console_scripts': [ "dwa_node = dwa_package.dwa_node:main",
+                            "map_node = dwa_package.map_node:main"
         ],
     },
 )
