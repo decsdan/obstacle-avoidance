@@ -220,5 +220,3 @@ def getAngleAlignment(posx, posy, theta, goalx, goaly):
     #get radians
     angleErr = (angleErr + math.pi) % (2 * math.pi) - math.pi
     return angleErr
-
-testGetDistanceGrid()
