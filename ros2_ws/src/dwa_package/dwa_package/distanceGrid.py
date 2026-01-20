@@ -32,10 +32,19 @@ def getNeighborCoords(xcoordinate, ycoordinate, grid):
         - list[(int,int)]: all valid neighbors for a given coordinate
     """
     #list of all horizontal and vertical neighbors
+    """
+    chebyshev distance
     neighbors = [(xcoordinate+1, ycoordinate+1),
             (xcoordinate+1, ycoordinate-1),
             (xcoordinate-1, ycoordinate+1),
-            (xcoordinate-1, ycoordinate-1)]
+            (xcoordinate-1, ycoordinate-1)]"""
+    #manhattan distance
+    neighbors = [
+    (xcoordinate + 1, ycoordinate),
+    (xcoordinate - 1, ycoordinate),
+    (xcoordinate, ycoordinate + 1),
+    (xcoordinate, ycoordinate - 1),
+    ]
     #gathering all valid neighbors. This is not grid based because
     #the maps provided by tbot will likely need to be processed as a non-rectangular shape
     #eg. a circle shape in a square grid
@@ -65,13 +74,13 @@ def initializeGrid(grid, WIDTH, HEIGHT, OCCUPIED):
         - list[(int, int, int)]: a list to hold all final values
         - deque[(int, int, int)]: a deque used for BFS
     """
-    checkedCoords = []
+    checkedCoords = set()
     finalValues = []
     queuedCoords = deque()
     for xcoordinate in range(WIDTH):
         for ycoordinate in range(HEIGHT):
             if grid[xcoordinate, ycoordinate] == OCCUPIED:
-                checkedCoords.append((xcoordinate, ycoordinate))
+                checkedCoords.add((xcoordinate, ycoordinate))
                 finalValues.append((xcoordinate, ycoordinate, 0))
                 queuedCoords.append((xcoordinate, ycoordinate, 0))
     return checkedCoords, finalValues, queuedCoords
@@ -97,7 +106,7 @@ def BFS_distanceCalculation(checkedCoords, finalValues, queuedCoords, grid):
             if coords not in checkedCoords:
                 queuedCoords.append((coords[0], coords[1], curCoord[2]+1))
                 finalValues.append((coords[0], coords[1], curCoord[2]+1))
-                checkedCoords.append(coords)
+                checkedCoords.add(coords)
     return finalValues
 
 def newGrid(finalValues, WIDTH, HEIGHT):
@@ -211,3 +220,5 @@ def getAngleAlignment(posx, posy, theta, goalx, goaly):
     #get radians
     angleErr = (angleErr + math.pi) % (2 * math.pi) - math.pi
     return angleErr
+
+testGetDistanceGrid()
