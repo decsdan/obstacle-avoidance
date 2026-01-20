@@ -58,7 +58,7 @@ class PlannerConstants:
 
     # -------- Robot Physical Parameters (meters) --------
     ROBOT_RADIUS = 0.22           # Physical radius of the robot body
-    SAFETY_CLEARANCE = 0.15       # Extra safety buffer around obstacles
+    SAFETY_CLEARANCE = 0.001      # Extra safety buffer around obstacles
                                   # Total inflation = ROBOT_RADIUS + SAFETY_CLEARANCE
 
     # -------- Lidar Obstacle Detection (meters) --------
@@ -92,8 +92,8 @@ class PlannerConstants:
     PATH = 'don/path'
 
     # Pgm and yaml paths
-    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olin304-308.yaml'
-    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/olin304-308.pgm'
+    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/maze.yaml'
+    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/maze.pgm'
 
 
 
