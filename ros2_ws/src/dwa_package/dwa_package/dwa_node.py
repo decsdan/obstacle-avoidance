@@ -6,8 +6,6 @@ from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import TwistStamped, PoseStamped, Point
 from message_filters import Subscriber, ApproximateTimeSynchronizer
-from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
@@ -22,14 +20,14 @@ class DWA(Node):
 
 #relevant hyperparams,,,, can edit here or test diff with command line
 #twist
-        self.declare_parameter('max_velocity', 1.5)
+        self.declare_parameter('max_velocity', 1.0)
         self.declare_parameter('min_velocity', 0.0)
         self.declare_parameter('max_angular_velocity', 2.5)
         self.declare_parameter('min_angular_velocity', -2.5)
         self.declare_parameter('max_linear_acceleration', 0.5)
         self.declare_parameter('max_angular_acceleration', 2.0)
-        self.declare_parameter('v_samples', 20) 
-        self.declare_parameter('w_samples', 20)
+        self.declare_parameter('v_samples', 10) 
+        self.declare_parameter('w_samples', 10)
 
         self.max_v = self.get_parameter('max_velocity').value
         self.min_v = self.get_parameter('min_velocity').value
@@ -52,9 +50,9 @@ class DWA(Node):
         self.LIDAR_downsample = self.get_parameter('LIDAR_downsample').value
         
 # bubbles
-        self.declare_parameter('critical_radius', 0.22)
-        self.declare_parameter('safe_distance', 0.35)
-        self.declare_parameter('emergency_stop_distance', 0.20)
+        self.declare_parameter('critical_radius', 0.30)
+        self.declare_parameter('safe_distance', 0.50)
+        self.declare_parameter('emergency_stop_distance', 0.25)
         self.declare_parameter('max_lidar_range', 8.0)
 
         self.critical_radius = self.get_parameter('critical_radius').value
@@ -92,19 +90,15 @@ class DWA(Node):
         self.declare_parameter('goal_tolerance', 0.3)
         self.goal_tolerance = self.get_parameter('goal_tolerance').value
 
-
-        self.new_data = False
+        self.timer = self.create_timer(self.dt, self.nav_loop)
         self.goal = None
         self.emergency_scan_msg = None
         self.scan_msg = None
         self.odom_msg = None
-        self.scan_count = 0
-        self.lidar_yaw_offset = 0.0
         
 #subs
         self.declare_parameter('namespace', '/don') #currently blank, but to get it to work on the robot, you need to use the robot name, for us it is /don
         self.namespace = self.get_parameter('namespace').value
-        self.callback_group = ReentrantCallbackGroup()
         print(f"{self.namespace}/scan")
 
         self.emergencyLidar = self.create_subscription(LaserScan, f"{self.namespace}/scan", self.emergency_lidar_callback, 10)
@@ -122,7 +116,6 @@ class DWA(Node):
 #syncing
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self) 
-        self.timer = self.create_timer(self.dt, self.nav_loop, callback_group=self.callback_group)
         self.sync = ApproximateTimeSynchronizer([self.odom_sub, self.scan_sub], 10, 0.1)
         self.sync.registerCallback(self.synchronized_callback)
         
@@ -133,13 +126,10 @@ class DWA(Node):
         self.get_logger().info(f"New Goal Set: {self.goal}")
 
     def emergency_lidar_callback(self, msg: LaserScan):
-        self.emergency_scan_msg = msg
-        self.scan_count += 1
-        
+        self.emergency_scan_msg = msg        
     def synchronized_callback(self, odom_msg, scan_msg):
         self.scan_msg = scan_msg
         self.odom_msg = odom_msg
-        self.new_data = True
 
 # helper funcs
 
@@ -257,7 +247,7 @@ class DWA(Node):
         valid_ranges = ranges[mask]
         valid_angles = angles[mask]
 
-        world_angles = theta + valid_angles + self.lidar_yaw_offset
+        world_angles = theta + valid_angles
         
         o_x = x + valid_ranges * np.cos(world_angles)
         o_y = y + valid_ranges * np.sin(world_angles)
@@ -354,11 +344,11 @@ class DWA(Node):
     def nav_loop(self):
         if self.goal is None:
             return 
-        if self.new_data is False:
-            return  
+        if self.odom_msg is None or self.scan_msg is None:
+            return
         if self.emergency_scan_msg is not None:
             ranges = np.array(self.emergency_scan_msg.ranges)
-            ranges = np.nan_to_num(ranges, posinf=10.0) 
+            ranges = np.nan_to_num(ranges, nan=10.0, posinf=10.0, neginf=10.0)
             cone_width = int(len(ranges) / 8)
             front_ranges = np.concatenate((ranges[-cone_width:], ranges[:cone_width]))
             if np.min(front_ranges) < self.emergency_stop_dist:
@@ -388,7 +378,6 @@ class DWA(Node):
             stop_cmd.twist.linear.x = 0.0
             stop_cmd.twist.angular.z = 0.0
             self.twist_publish.publish(stop_cmd)
-            self.new_data = False
             self.goal = None
             return   
 
@@ -431,7 +420,7 @@ class DWA(Node):
             
         if scores[best_idx] == -np.inf:
             self.get_logger().warn("Too close backing up")
-            best_v = -0.05 
+            best_v = self.recovery_v
             best_w = self.recovery_w
         else:
             best_v = float(final_vs[best_idx])
@@ -444,19 +433,16 @@ class DWA(Node):
         self.message.twist.linear.x = best_v
         self.message.twist.angular.z = best_w
         self.twist_publish.publish(self.message)
-        self.new_data = False
 
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = DWA()
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
-    try:
-        executor.spin()
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
 if __name__ == '__main__':
     main()
