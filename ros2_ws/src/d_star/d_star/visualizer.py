@@ -53,7 +53,7 @@ class VisualizerConstants:
 
     # Robot Physical Parameters (meters)
     ROBOT_RADIUS = 0.22          # TurtleBot4 radius
-    SAFETY_CLEARANCE = 0.001      # Additional safety margin
+    SAFETY_CLEARANCE = 0.0001      # Additional safety margin
 
     # Simulation Parameters
     LOOKAHEAD_DISTANCE = 1.0     # Distance to check for obstacles ahead (meters)
@@ -1097,8 +1097,8 @@ def main(args=None):
     safety_clearance = VisualizerConstants.SAFETY_CLEARANCE
 
     # Default map path
-    yaml_file = os.path.expanduser('~/obstacle-avoidance-comps/ros2_ws/maze.yaml')
-    pgm_file = os.path.expanduser('~/obstacle-avoidance-comps/ros2_ws/maze.pgm')
+    yaml_file = os.path.expanduser('~/obstacle-avoidance-comps/ros2_ws/olinmaze.yaml')
+    pgm_file = os.path.expanduser('~/obstacle-avoidance-comps/ros2_ws/olinmaze.pgm')
 
     # Parse command line arguments
     if len(sys.argv) >= 3:

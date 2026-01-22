@@ -66,8 +66,8 @@ class LiveVisualizerConstants:
     COLOR_OBSTACLE = [0.3, 0.3, 0.3]    # Dark gray for obstacles
 
     # Default Map Path
-    DEFAULT_YAML = '~/obstacle-avoidance-comps/ros2_ws/olin304-308.yaml'
-    DEFAULT_PGM = '~/obstacle-avoidance-comps/ros2_ws/olin304-308.pgm'
+    DEFAULT_YAML = '~/obstacle-avoidance-comps/ros2_ws/olinmaze.yaml'
+    DEFAULT_PGM = '~/obstacle-avoidance-comps/ros2_ws/olinmaze.pgm'
 
     ODOMETRY = '/don/odom'
     PATH = '/don/path'

@@ -58,31 +58,31 @@ class PlannerConstants:
 
     # -------- Robot Physical Parameters (meters) --------
     ROBOT_RADIUS = 0.22           # Physical radius of the robot body
-    SAFETY_CLEARANCE = 0.001      # Extra safety buffer around obstacles
+    SAFETY_CLEARANCE = 0.0001      # Extra safety buffer around obstacles
                                   # Total inflation = ROBOT_RADIUS + SAFETY_CLEARANCE
 
     # -------- Lidar Obstacle Detection (meters) --------
-    LIDAR_MIN_RANGE = 0.3         # Ignore readings closer than this (robot body/noise)
-    LIDAR_MAX_RANGE = 1.0         # Only detect obstacles up to this distance
+    LIDAR_MIN_RANGE = 0.1         # Ignore readings closer than this (robot body/noise)
+    LIDAR_MAX_RANGE = 3.0         # Only detect obstacles up to this distance
 
     # -------- Grid Cell Tolerances (cells) --------
     STATIC_OBSTACLE_TOLERANCE = 10    # Cells to check for static obstacle filtering
     NEARBY_OBSTACLE_TOLERANCE = 2     # Tolerance for coordinate transform errors
     PATH_CHECK_RADIUS = 3             # Cells around waypoint to check
     ROBOT_BODY_RADIUS_CELLS = 3       # Min distance from robot (self-detection filter)
-    CLOSE_OBSTACLE_CELLS = 6          # Threshold for "very close" obstacles
+    CLOSE_OBSTACLE_CELLS = 12         # Threshold for "very close" obstacles
     EMERGENCY_OBSTACLE_CELLS = 8      # Max distance to immediately mark in grid
 
     # -------- Path Planning Parameters --------
-    MAX_PATH_ITERATIONS = 100000      # Max D* Lite iterations before timeout
+    MAX_PATH_ITERATIONS = 10000000      # Max D* Lite iterations before timeout
     PATH_BLOCKING_BUFFER = 5          # Extra buffer for blocking detection
     LOOKAHEAD_SEGMENTS = 10           # Path segments to check ahead for obstacles
     MAX_OBSTACLE_CHECK_DISTANCE = 20  # Max cells to check (prevents false triggers)
 
     # -------- Control Parameters --------
     REPLAN_COOLDOWN = 1.0         # Minimum seconds between replans
-    ROBOT_CLEARANCE_CELLS = 2     # Cells around robot to keep free
-    INFLATION_DIVISOR = 2         # Reduce inflation for dynamic obstacles
+    ROBOT_CLEARANCE_CELLS = 3     # Cells around robot to keep free
+    INFLATION_DIVISOR = 5         # Reduce inflation for dynamic obstacles
 
     # Publishing/Subscribing Paths
     CMD_VEL = '/don/cmd_vel'
@@ -92,8 +92,8 @@ class PlannerConstants:
     PATH = 'don/path'
 
     # Pgm and yaml paths
-    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/maze.yaml'
-    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/maze.pgm'
+    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olinmaze.yaml'
+    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/olinmaze.pgm'
 
 
 
@@ -278,7 +278,9 @@ class DStarLite:
 
             iterations += 1
             if iterations > PlannerConstants.MAX_PATH_ITERATIONS:
+                self.get_logger().info('Max path iterations timeout')
                 return False  # Timeout
+            
 
             k_old, u = heapq.heappop(self.open_list)
             k_new = self.calculate_key(u)
@@ -1292,6 +1294,7 @@ class DStarNavigator(Node):
         path_grid = self.dstar_plan(start_grid, goal_grid)
 
         if not path_grid:
+            self.get_logger().error(f'Dstar algorithm path not found!')
             return []
 
         # Convert to world coordinates
