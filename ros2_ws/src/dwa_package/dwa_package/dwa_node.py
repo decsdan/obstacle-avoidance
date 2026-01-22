@@ -28,6 +28,7 @@ class DWA(Node):
         self.declare_parameter('max_angular_acceleration', 2.0)
         self.declare_parameter('v_samples', 10) 
         self.declare_parameter('w_samples', 10)
+        self.declare_parameter('lidar_angle_offset', 1.5708) # for whatever reason, the real life turtlebot needs to be shifted 90 degrees
 
         self.max_v = self.get_parameter('max_velocity').value
         self.min_v = self.get_parameter('min_velocity').value
@@ -37,6 +38,8 @@ class DWA(Node):
         self.w_accel = self.get_parameter('max_angular_acceleration').value
         self.v_samples = self.get_parameter('v_samples').value
         self.w_samples = self.get_parameter('w_samples').value
+        self.lidar_offset = self.get_parameter('lidar_angle_offset').value
+
         
 # planning
         self.declare_parameter('dt', 0.1)
@@ -237,18 +240,17 @@ class DWA(Node):
             self.scan_msg.angle_max,
             len(self.scan_msg.ranges)
         )[::self.LIDAR_downsample]
-        
-        
         mask = (
+            np.isfinite(ranges) &
+            (ranges > 0.05) &
             (ranges > self.scan_msg.range_min) & 
             (ranges < self.scan_msg.range_max) & 
-            (ranges < self.max_lidar_range)  # Use parameter
+            (ranges < self.max_lidar_range)
         )
         valid_ranges = ranges[mask]
         valid_angles = angles[mask]
 
-        world_angles = theta + valid_angles
-        
+        world_angles = theta + valid_angles + self.lidar_offset        
         o_x = x + valid_ranges * np.cos(world_angles)
         o_y = y + valid_ranges * np.sin(world_angles)
         
@@ -351,6 +353,15 @@ class DWA(Node):
             ranges = np.nan_to_num(ranges, nan=10.0, posinf=10.0, neginf=10.0)
             cone_width = int(len(ranges) / 8)
             front_ranges = np.concatenate((ranges[-cone_width:], ranges[:cone_width]))
+                10.0
+            )
+            n = len(ranges)
+            angle_range = self.emergency_scan_msg.angle_max - self.emergency_scan_msg.angle_min
+            front_idx = int((-self.lidar_offset - self.emergency_scan_msg.angle_min) / angle_range * n) % n
+            cone_width = int(n / 8)
+            indices = np.arange(front_idx - cone_width, front_idx + cone_width) % n
+            front_ranges = ranges[indices]
+    
             if np.min(front_ranges) < self.emergency_stop_dist:
                 self.get_logger().warn("EMERGENCY STOP: Obstacle too close!")
                 stop_cmd = TwistStamped()
