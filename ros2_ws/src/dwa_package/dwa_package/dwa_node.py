@@ -348,11 +348,12 @@ class DWA(Node):
             return 
         if self.odom_msg is None or self.scan_msg is None:
             return
+        
         if self.emergency_scan_msg is not None:
-            ranges = np.array(self.emergency_scan_msg.ranges)
-            ranges = np.nan_to_num(ranges, nan=10.0, posinf=10.0, neginf=10.0)
-            cone_width = int(len(ranges) / 8)
-            front_ranges = np.concatenate((ranges[-cone_width:], ranges[:cone_width]))
+            ranges = np.array(self.emergency_scan_msg.ranges)            
+            ranges = np.where(
+                np.isfinite(ranges) & (ranges > 0.05),
+                ranges,
                 10.0
             )
             n = len(ranges)
