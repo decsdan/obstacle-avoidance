@@ -71,13 +71,13 @@ class PlannerConstants:
     PATH_CHECK_RADIUS = 3             # Cells around waypoint to check
     ROBOT_BODY_RADIUS_CELLS = 3       # Min distance from robot (self-detection filter)
     CLOSE_OBSTACLE_CELLS = 12         # Threshold for "very close" obstacles
-    EMERGENCY_OBSTACLE_CELLS = 8      # Max distance to immediately mark in grid
+    EMERGENCY_OBSTACLE_CELLS = 15      # Max distance to immediately mark in grid
 
     # -------- Path Planning Parameters --------
     MAX_PATH_ITERATIONS = 10000000      # Max D* Lite iterations before timeout
     PATH_BLOCKING_BUFFER = 5          # Extra buffer for blocking detection
-    LOOKAHEAD_SEGMENTS = 10           # Path segments to check ahead for obstacles
-    MAX_OBSTACLE_CHECK_DISTANCE = 20  # Max cells to check (prevents false triggers)
+    LOOKAHEAD_SEGMENTS = 20           # Path segments to check ahead for obstacles
+    MAX_OBSTACLE_CHECK_DISTANCE = 40  # Max cells to check (prevents false triggers)
 
     # -------- Control Parameters --------
     REPLAN_COOLDOWN = 1.0         # Minimum seconds between replans
