@@ -50,9 +50,13 @@ def getNeighborCoords(xcoordinate, ycoordinate, grid):
     #eg. a circle shape in a square grid
     validNeighbors = []
     UNKNOWN = -1
-    for neighbor in neighbors:
-        if grid[neighbor[0],neighbor[1]] != UNKNOWN:
-            validNeighbors.append(neighbor)
+    width, height = grid.shape
+
+    for nx, ny in neighbors:
+        if 0 <= nx < width and 0 <= ny < height:
+            if grid[nx, ny] != UNKNOWN:
+                validNeighbors.append((nx, ny))
+
     return validNeighbors
 
 def initializeGrid(grid, WIDTH, HEIGHT, OCCUPIED):
@@ -70,7 +74,7 @@ def initializeGrid(grid, WIDTH, HEIGHT, OCCUPIED):
         - int3: value grid items are set to when they are considered occupied
 
     Returns:
-        - list[(int, int)]: a list to hold all visited coordinates
+        - set[(int, int)]: a list to hold all visited coordinates
         - list[(int, int, int)]: a list to hold all final values
         - deque[(int, int, int)]: a deque used for BFS
     """
@@ -99,7 +103,7 @@ def BFS_distanceCalculation(checkedCoords, finalValues, queuedCoords, grid):
     Returns:
         - list[(int, int, int)]: a list of all coordinates and their value
     """
-    while len(queuedCoords) > 0:
+    while queuedCoords:
         curCoord = queuedCoords.popleft()
         neighborCoords = getNeighborCoords(curCoord[0], curCoord[1], grid)
         for coords in neighborCoords:
@@ -186,6 +190,7 @@ def testGetDistanceGrid():
             f.write(str(distGrid[x][y]))
             f.write(",")
         f.write("\n")
+    f.close()
 
 def getDistanceToGoal(currentPos, goal):
     """
@@ -220,3 +225,53 @@ def getAngleAlignment(posx, posy, theta, goalx, goaly):
     #get radians
     angleErr = (angleErr + math.pi) % (2 * math.pi) - math.pi
     return angleErr
+
+def generateSizeContainingPoints(occupiedPoints):
+    smallestX = largestX = occupiedPoints[0][0]
+    smallestY = largestY = occupiedPoints[0][1]
+
+    for x, y in occupiedPoints[1:]:
+        smallestX = min(smallestX, x)
+        largestX = max(largestX, x)
+        smallestY = min(smallestY, y)
+        largestY = max(largestY, y)
+
+    return (largestX - smallestX, largestY - smallestY)
+
+def generateRadiusWithPoints(occupiedPoints):
+    longestDistance = max(occupiedPoints[0][0], occupiedPoints[0][1])
+    for point in occupiedPoints[1:]:
+        if point[0] > longestDistance:
+            longestDistance = point[0]
+        if point[1] > longestDistance:
+            longestDistance = point[1]
+    return longestDistance
+
+def placeObstacles(grid, occupiedPoints):
+    width, height = grid.shape
+    for x, y in occupiedPoints:
+        if 0 <= x < width and 0 <= y < height:
+            grid[x, y] = 100
+    return grid
+
+def placeUnknown(grid, radius):
+    width = grid.shape[0]
+    height = grid.shape[1]
+    center = (width / 2, height / 2)
+    for x in range(width):
+        for y in range(height):
+            if getDistanceToGoal((x,y), center) > radius:
+                grid[x][y] = -1
+    return grid
+
+def generateOccupancyGrid(occupiedPoints, radius=None):
+    size = None
+    if radius == None:
+        radius = generateRadiusWithPoints(occupiedPoints)
+    size = (radius*2,radius*2)
+    WIDTH = size[0]
+    HEIGHT = size[1]
+    grid = np.zeros((WIDTH, HEIGHT), dtype=int)
+    grid = placeObstacles(grid, occupiedPoints)
+    grid = placeUnknown(grid, radius)
+    return grid
