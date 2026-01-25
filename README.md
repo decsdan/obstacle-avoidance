@@ -88,8 +88,10 @@ source /opt/ros/jazzy/setup.bash
 source /etc/turtlebot4_discovery/setup.bash
 ros2 daemon stop; ros2 daemon start
 
-ros2 launch turtlebot4_viz view_navigation.launch.py namespace:=/don
+ros2 launch turtlebot4_viz view_robot.launch.py namespace:=/don
 ```
+
+Then in RViz: File → Open Config → `~/obstacle-avoidance-comps/don_viz.rviz`
 
 ### RViz2 Configuration
 
@@ -104,9 +106,9 @@ ros2 launch turtlebot4_viz view_navigation.launch.py namespace:=/don
    - `/don/dwa/trajectories` (Marker) - candidate paths (red→green by score)
    - `/don/dwa/best_trajectory` (Marker) - selected path (cyan)
 
-**Save configuration** (optional):
-1. File → Save Config As → `~/dwa_nav.rviz`
-2. Future launches: `rviz2 -d ~/dwa_nav.rviz`
+**Save configuration:**
+1. File → Save Config As → `~/obstacle-avoidance-comps/don_viz.rviz`
+
 
 ### Terminal 3 - Debugging (optional)
 ```bash
@@ -117,14 +119,6 @@ ros2 topic hz /don/scan
 ros2 topic echo /don/goal_pose
 ros2 topic echo /don/cmd_vel
 ```
-
-### Manual Goal Publishing
-```bash
-ros2 topic pub --once /don/goal_pose geometry_msgs/msg/PoseStamped \
-  "{header: {frame_id: 'odom'}, pose: {position: {x: 1.0, y: 0.0, z: 0.0}, orientation: {w: 1.0}}}"
-```
-
----
 
 ## DWA Parameters
 
