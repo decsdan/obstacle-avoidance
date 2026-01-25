@@ -8,10 +8,14 @@ This ROS2 node visualizes the robot's real-time path execution, showing:
 - The actual traveled path from odometry
 - The current robot position
 - The static map
+- The dynamic grid (with lidar-detected obstacles)
+- Raw lidar scan points
 
 Subscribes to:
-    - /sim_ground_truth_pose (Odometry): Ground truth robot position
-    - /planned_path (Path): Planned path from d_star_nav node
+    - /don/odom (Odometry): Robot position
+    - /don/path (Path): Planned path from d_star_nav node
+    - /don/dynamic_grid (OccupancyGrid): Dynamic obstacle grid
+    - /don/scan (LaserScan): Raw lidar data
 
 Usage:
     ros2 run d_star live_visualizer
@@ -25,15 +29,18 @@ Architecture:
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from nav_msgs.msg import Odometry, Path
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from nav_msgs.msg import Odometry, Path, OccupancyGrid
+from sensor_msgs.msg import LaserScan
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from matplotlib.colors import ListedColormap
 import threading
 import yaml
 from PIL import Image
 import os
+import math
 
 
 # ============================================================================
@@ -44,12 +51,13 @@ class LiveVisualizerConstants:
     """Configuration constants for the live visualizer"""
 
     # Visualization Parameters
-    FIGURE_SIZE = (12, 10)              # Figure dimensions (width, height)
+    FIGURE_SIZE = (14, 10)              # Figure dimensions (width, height)
     UPDATE_INTERVAL_MS = 100            # Visualization update interval (milliseconds)
     MAX_TRAVELED_POINTS = 1000          # Maximum traveled path points to keep
 
     # Map Display
-    MAP_ALPHA = 0.7                     # Map transparency
+    MAP_ALPHA = 0.6                     # Map transparency
+    DYNAMIC_GRID_ALPHA = 0.4            # Dynamic grid transparency
     GRID_ALPHA = 0.3                    # Grid line transparency
 
     # Path Line Widths
@@ -58,21 +66,25 @@ class LiveVisualizerConstants:
 
     # Marker Sizes
     ROBOT_MARKER_SIZE = 15              # Size of robot position marker
+    LIDAR_POINT_SIZE = 3                # Size of lidar point markers
 
     # Colors
     COLOR_PLANNED_PATH = 'b'            # Blue for planned path
     COLOR_TRAVELED_PATH = 'g'           # Green for traveled path
     COLOR_ROBOT = 'r'                   # Red for current robot position
-    COLOR_OBSTACLE = [0.3, 0.3, 0.3]    # Dark gray for obstacles
+    COLOR_OBSTACLE = [0.3, 0.3, 0.3]    # Dark gray for static obstacles
+    COLOR_DYNAMIC_OBSTACLE = [1.0, 0.5, 0.0]  # Orange for dynamic obstacles
+    COLOR_LIDAR_POINTS = 'cyan'         # Cyan for lidar points
 
     # Default Map Path
     DEFAULT_YAML = '~/obstacle-avoidance-comps/ros2_ws/olinmaze.yaml'
     DEFAULT_PGM = '~/obstacle-avoidance-comps/ros2_ws/olinmaze.pgm'
 
+    # ROS2 Topics
     ODOMETRY = '/don/odom'
     PATH = '/don/path'
-
-
+    DYNAMIC_GRID = '/don/dynamic_grid'
+    SCAN = '/don/scan'
 
 
 # ============================================================================
@@ -83,8 +95,9 @@ class LivePathVisualizer(Node):
     """
     ROS2 node for real-time path visualization.
 
-    Displays the planned path and actual traveled path on the static map,
-    allowing real-time monitoring of the robot's navigation performance.
+    Displays the planned path, actual traveled path, dynamic obstacles,
+    and lidar scan on the static map, allowing real-time monitoring
+    of the robot's navigation performance.
     """
 
     def __init__(self):
@@ -96,6 +109,7 @@ class LivePathVisualizer(Node):
         # ====================================================================
 
         self.current_position = None        # Current (x, y) position
+        self.current_theta = 0.0            # Current orientation
         self.traveled_path = []             # List of (x, y) points traveled
         self.planned_path = []              # List of (x, y) points from planner
 
@@ -107,6 +121,14 @@ class LivePathVisualizer(Node):
         self.grid_original = None           # Original grid before any processing
         self.resolution = None              # Meters per grid cell
         self.origin = None                  # Map origin [x, y, theta]
+
+        # Dynamic grid data
+        self.dynamic_grid = None            # Dynamic obstacle grid from planner
+        self.dynamic_grid_resolution = None
+        self.dynamic_grid_origin = None
+
+        # Lidar data
+        self.lidar_points = []              # List of (x, y) lidar hit points
 
         # ====================================================================
         # INITIALIZATION - ROS2 Subscriptions
@@ -133,6 +155,22 @@ class LivePathVisualizer(Node):
             10
         )
 
+        # Dynamic grid subscription
+        self.dynamic_grid_sub = self.create_subscription(
+            OccupancyGrid,
+            LiveVisualizerConstants.DYNAMIC_GRID,
+            self.dynamic_grid_callback,
+            10
+        )
+
+        # Lidar scan subscription
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            LiveVisualizerConstants.SCAN,
+            self.scan_callback,
+            qos_profile
+        )
+
         # ====================================================================
         # INITIALIZATION - Map Loading
         # ====================================================================
@@ -149,7 +187,10 @@ class LivePathVisualizer(Node):
         self.lock = threading.Lock()        # Thread-safe access to shared data
 
         self.get_logger().info('Live Path Visualizer initialized')
-        self.get_logger().info('Subscribing to /odom and /path')
+        self.get_logger().info(f'Subscribing to: {LiveVisualizerConstants.ODOMETRY}, '
+                               f'{LiveVisualizerConstants.PATH}, '
+                               f'{LiveVisualizerConstants.DYNAMIC_GRID}, '
+                               f'{LiveVisualizerConstants.SCAN}')
 
     # ========================================================================
     # MAP LOADING
@@ -212,8 +253,15 @@ class LivePathVisualizer(Node):
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
 
+        # Extract yaw from quaternion
+        q = msg.pose.pose.orientation
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+        theta = math.atan2(siny_cosp, cosy_cosp)
+
         with self.lock:
             self.current_position = (x, y)
+            self.current_theta = theta
             self.traveled_path.append((x, y))
 
             # Keep only most recent points
@@ -239,6 +287,72 @@ class LivePathVisualizer(Node):
                 f'Received planned path with {len(self.planned_path)} waypoints'
             )
 
+    def dynamic_grid_callback(self, msg):
+        """
+        Callback for dynamic grid updates.
+
+        Updates the dynamic obstacle grid visualization showing
+        lidar-detected obstacles and SLAM updates.
+
+        Args:
+            msg: OccupancyGrid message with dynamic obstacles
+        """
+        with self.lock:
+            width = msg.info.width
+            height = msg.info.height
+            self.dynamic_grid_resolution = msg.info.resolution
+            self.dynamic_grid_origin = [
+                msg.info.origin.position.x,
+                msg.info.origin.position.y
+            ]
+
+            # Convert to numpy array
+            data = np.array(msg.data, dtype=np.int8).reshape((height, width))
+            self.dynamic_grid = data
+
+    def scan_callback(self, msg):
+        """
+        Callback for lidar scan updates.
+
+        Converts lidar scan to world coordinates for visualization.
+
+        Args:
+            msg: LaserScan message with lidar data
+        """
+        if self.current_position is None:
+            return
+
+        with self.lock:
+            robot_x, robot_y = self.current_position
+            robot_theta = self.current_theta
+
+            points = []
+            angle = msg.angle_min
+
+            for range_val in msg.ranges:
+                # Skip invalid readings
+                if (range_val >= msg.range_min and
+                    range_val <= msg.range_max and
+                    not math.isinf(range_val) and
+                    not math.isnan(range_val)):
+
+                    # Convert to world coordinates
+                    obstacle_x_local = range_val * math.cos(angle)
+                    obstacle_y_local = range_val * math.sin(angle)
+
+                    obstacle_x_world = (robot_x +
+                                       obstacle_x_local * math.cos(robot_theta) -
+                                       obstacle_y_local * math.sin(robot_theta))
+                    obstacle_y_world = (robot_y +
+                                       obstacle_x_local * math.sin(robot_theta) +
+                                       obstacle_y_local * math.cos(robot_theta))
+
+                    points.append((obstacle_x_world, obstacle_y_world))
+
+                angle += msg.angle_increment
+
+            self.lidar_points = points
+
     # ========================================================================
     # VISUALIZATION
     # ========================================================================
@@ -248,8 +362,8 @@ class LivePathVisualizer(Node):
         Update the visualization plot.
 
         Called by FuncAnimation to update the display at regular intervals.
-        Shows the static map, planned path, traveled path, and current
-        robot position.
+        Shows the static map, dynamic grid, lidar points, planned path,
+        traveled path, and current robot position.
 
         Args:
             frame: Animation frame number (from FuncAnimation, unused)
@@ -258,7 +372,7 @@ class LivePathVisualizer(Node):
             self.ax.clear()
 
             # ----------------------------------------------------------------
-            # MAP DISPLAY
+            # STATIC MAP DISPLAY
             # ----------------------------------------------------------------
             if self.grid is not None:
                 rows, cols = self.grid.shape
@@ -281,6 +395,54 @@ class LivePathVisualizer(Node):
                 )
 
             # ----------------------------------------------------------------
+            # DYNAMIC GRID OVERLAY
+            # ----------------------------------------------------------------
+            if self.dynamic_grid is not None and self.dynamic_grid_resolution is not None:
+                rows, cols = self.dynamic_grid.shape
+                extent = [
+                    self.dynamic_grid_origin[0],
+                    self.dynamic_grid_origin[0] + cols * self.dynamic_grid_resolution,
+                    self.dynamic_grid_origin[1],
+                    self.dynamic_grid_origin[1] + rows * self.dynamic_grid_resolution
+                ]
+
+                # Create overlay showing only dynamic obstacles (not static)
+                # Compare with static grid to find new obstacles
+                dynamic_overlay = np.zeros((rows, cols, 4))  # RGBA
+
+                # Mark dynamic obstacles in orange with transparency
+                dynamic_mask = self.dynamic_grid > 50  # Occupied cells
+                if self.grid is not None and self.grid.shape == self.dynamic_grid.shape:
+                    # Only show cells that are in dynamic but not in static
+                    static_mask = self.grid == 1
+                    new_obstacles = dynamic_mask & ~static_mask
+                else:
+                    new_obstacles = dynamic_mask
+
+                dynamic_overlay[new_obstacles] = [1.0, 0.5, 0.0, 0.7]  # Orange with alpha
+
+                self.ax.imshow(
+                    dynamic_overlay,
+                    extent=extent,
+                    origin='lower',
+                    alpha=LiveVisualizerConstants.DYNAMIC_GRID_ALPHA
+                )
+
+            # ----------------------------------------------------------------
+            # LIDAR POINTS
+            # ----------------------------------------------------------------
+            if self.lidar_points:
+                lx = [p[0] for p in self.lidar_points]
+                ly = [p[1] for p in self.lidar_points]
+                self.ax.scatter(
+                    lx, ly,
+                    c=LiveVisualizerConstants.COLOR_LIDAR_POINTS,
+                    s=LiveVisualizerConstants.LIDAR_POINT_SIZE,
+                    alpha=0.6,
+                    label=f'Lidar ({len(self.lidar_points)} pts)'
+                )
+
+            # ----------------------------------------------------------------
             # PLANNED PATH
             # ----------------------------------------------------------------
             if self.planned_path:
@@ -290,7 +452,7 @@ class LivePathVisualizer(Node):
                     px, py,
                     f'{LiveVisualizerConstants.COLOR_PLANNED_PATH}--',
                     linewidth=LiveVisualizerConstants.PLANNED_PATH_WIDTH,
-                    alpha=0.5,
+                    alpha=0.7,
                     label='Planned Path'
                 )
 
@@ -322,14 +484,36 @@ class LivePathVisualizer(Node):
                     markeredgewidth=2
                 )
 
+                # Draw heading indicator
+                arrow_length = 0.3
+                dx = arrow_length * math.cos(self.current_theta)
+                dy = arrow_length * math.sin(self.current_theta)
+                self.ax.arrow(
+                    self.current_position[0],
+                    self.current_position[1],
+                    dx, dy,
+                    head_width=0.1,
+                    head_length=0.05,
+                    fc='red',
+                    ec='black'
+                )
+
             # ----------------------------------------------------------------
             # AXIS CONFIGURATION
             # ----------------------------------------------------------------
             self.ax.set_xlabel('X (meters)')
             self.ax.set_ylabel('Y (meters)')
+
+            # Build status string
+            status_parts = [f'Traveled: {len(self.traveled_path)} pts']
+            if self.lidar_points:
+                status_parts.append(f'Lidar: {len(self.lidar_points)} pts')
+            if self.dynamic_grid is not None:
+                dynamic_count = np.sum(self.dynamic_grid > 50)
+                status_parts.append(f'Dynamic obstacles: {dynamic_count} cells')
+
             self.ax.set_title(
-                f'Live Robot Path Visualization '
-                f'(Traveled: {len(self.traveled_path)} points)'
+                f'Live Robot Path Visualization\n({", ".join(status_parts)})'
             )
             self.ax.legend(loc='upper right')
             self.ax.grid(True, alpha=LiveVisualizerConstants.GRID_ALPHA)

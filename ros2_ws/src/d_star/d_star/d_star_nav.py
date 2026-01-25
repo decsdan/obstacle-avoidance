@@ -90,6 +90,7 @@ class PlannerConstants:
     SCAN = '/don/scan'
     OCCUPANCY_GRID = '/don/map'
     PATH = 'don/path'
+    DYNAMIC_GRID = '/don/dynamic_grid'
 
     # Pgm and yaml paths
     SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olinmaze.yaml'
@@ -465,6 +466,7 @@ class DStarNavigator(Node):
         # ROS2 publishers
         self.cmd_vel_pub = self.create_publisher(TwistStamped, PlannerConstants.CMD_VEL, 10)
         self.path_pub = self.create_publisher(Path, PlannerConstants.PATH, 10)
+        self.dynamic_grid_pub = self.create_publisher(OccupancyGrid, PlannerConstants.DYNAMIC_GRID, 10)
 
         # ROS2 subscribers
         self._setup_subscribers()
@@ -790,6 +792,9 @@ class DStarNavigator(Node):
 
         # Update dynamic grid to match base (lidar will add on top)
         self.grid_dynamic = self.grid_base.copy()
+
+        # Publish updated dynamic grid for visualization
+        self.publish_dynamic_grid()
 
     def _check_path_blocked_by_obstacles(self, obstacles_grid):
         """
@@ -1118,6 +1123,9 @@ class DStarNavigator(Node):
                     0 <= free_y < self.grid_dynamic.shape[0] and
                     self.grid[free_y, free_x] == 0):  # Don't clear static obstacles
                     self.grid_dynamic[free_y, free_x] = 0
+
+        # Publish updated dynamic grid for visualization
+        self.publish_dynamic_grid()
 
     def _check_obstacles_block_path(self, obst_neighbors, robot_gx, robot_gy, detected_obstacles):
         """
@@ -1657,6 +1665,36 @@ class DStarNavigator(Node):
             path_msg.poses.append(pose)
 
         self.path_pub.publish(path_msg)
+
+    def publish_dynamic_grid(self):
+        """
+        Publish the dynamic grid for visualization.
+
+        The dynamic grid shows the current planning grid including:
+        - Static obstacles (from map)
+        - SLAM-discovered obstacles
+        - Lidar-detected obstacles (temporary)
+        """
+        if self.grid_dynamic is None or self.resolution is None:
+            return
+
+        grid_msg = OccupancyGrid()
+        grid_msg.header.stamp = self.get_clock().now().to_msg()
+        grid_msg.header.frame_id = 'map'
+
+        # Set map metadata
+        grid_msg.info.resolution = self.resolution
+        grid_msg.info.width = self.grid_dynamic.shape[1]
+        grid_msg.info.height = self.grid_dynamic.shape[0]
+        grid_msg.info.origin.position.x = self.origin[0]
+        grid_msg.info.origin.position.y = self.origin[1]
+        grid_msg.info.origin.position.z = 0.0
+
+        # Convert grid to occupancy data (0=free, 100=occupied)
+        occupancy_data = (self.grid_dynamic * 100).astype(np.int8).flatten().tolist()
+        grid_msg.data = occupancy_data
+
+        self.dynamic_grid_pub.publish(grid_msg)
 
     def _is_valid_in_inflated_grid(self, grid_pos):
         """
