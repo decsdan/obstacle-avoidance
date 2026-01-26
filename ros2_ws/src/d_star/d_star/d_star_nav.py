@@ -1137,19 +1137,26 @@ class DStarNavigator(Node):
         """
         Update grid_dynamic with lidar-detected obstacles.
 
-        Starts from grid_base (persistent SLAM obstacles) and adds temporary
-        lidar obstacles on top. Uses reduced inflation for dynamic obstacles.
+        Starts from grid_base (persistent SLAM obstacles) and adds
+        lidar obstacles on top. Also updates D* Lite planner's graph
+        to keep it in sync with all detected obstacles.
 
         Args:
             obst_neighbors: List of neighbor cells with obstacles
             robot_gx, robot_gy: Robot position
         """
+        # Store previous grid state to detect changes
+        previous_grid = self.grid_dynamic.copy() if self.grid_dynamic is not None else None
+
         # Start from base grid (preserves SLAM obstacles)
         self.grid_dynamic = self.grid_base.copy() if self.grid_base is not None else self.grid.copy()
 
         # Use reduced inflation for dynamic obstacles
         inflation_cells = max(3, int((self.robot_radius + self.safety_clearance) /
                                     self.resolution) // PlannerConstants.INFLATION_DIVISOR)
+
+        # Track cells that changed for D* update
+        changed_cells = []
 
         # Inflate and mark obstacle neighbors
         for gx, gy in obst_neighbors:
@@ -1159,6 +1166,9 @@ class DStarNavigator(Node):
                     if (0 <= inflate_x < self.grid_dynamic.shape[1] and
                         0 <= inflate_y < self.grid_dynamic.shape[0] and
                         self.grid[inflate_y, inflate_x] == 0):  # Don't overwrite static
+                        # Track if this is a new obstacle
+                        if self.grid_dynamic[inflate_y, inflate_x] == 0:
+                            changed_cells.append((inflate_x, inflate_y))
                         self.grid_dynamic[inflate_y, inflate_x] = 1
 
         # Keep robot's immediate position free
@@ -1171,6 +1181,11 @@ class DStarNavigator(Node):
                     0 <= free_y < self.grid_dynamic.shape[0] and
                     self.grid[free_y, free_x] == 0):  # Don't clear static obstacles
                     self.grid_dynamic[free_y, free_x] = 0
+
+        # Update D* Lite planner with lidar changes to keep graph in sync
+        if self.dstar_planner is not None and changed_cells:
+            self.dstar_planner.grid = self.grid_dynamic.copy()
+            self.dstar_planner.update_obstacles(changed_cells)
 
         # Publish updated dynamic grid for visualization
         self.publish_dynamic_grid()
