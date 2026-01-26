@@ -66,7 +66,7 @@ class PlannerConstants:
     LIDAR_MAX_RANGE = 3.0         # Only detect obstacles up to this distance
 
     # -------- Grid Cell Tolerances (cells) --------
-    STATIC_OBSTACLE_TOLERANCE = 10    # Cells to check for static obstacle filtering
+    STATIC_OBSTACLE_TOLERANCE = 2     # Cells to check for static obstacle filtering
     NEARBY_OBSTACLE_TOLERANCE = 2     # Tolerance for coordinate transform errors
     PATH_CHECK_RADIUS = 3             # Cells around waypoint to check
     ROBOT_BODY_RADIUS_CELLS = 3       # Min distance from robot (self-detection filter)
@@ -886,9 +886,8 @@ class DStarNavigator(Node):
 
         Processing pipeline:
         1. Process lidar scan to get obstacle positions
-        2. Map obstacles to robot's neighbor cells
-        3. Update grid_dynamic with lidar obstacles
-        4. Check if obstacles block upcoming path segments
+        2. Update grid_dynamic with lidar obstacles at actual positions
+        3. Check if obstacles block upcoming path segments
 
         Args:
             scan_msg: LaserScan message
@@ -909,17 +908,11 @@ class DStarNavigator(Node):
         if not detected_obstacles:
             return False
 
-        # Map obstacles to robot's neighbor cells for grid marking
-        obst_neighbors = self._map_obstacles_to_neighbors(detected_obstacles, robot_gx, robot_gy)
-
-        if not obst_neighbors:
-            return False
-
-        # Update grid_dynamic with detected obstacles
-        self._update_dynamic_grid_with_lidar(obst_neighbors, robot_gx, robot_gy)
+        # Update grid_dynamic with detected obstacles at their actual positions
+        self._update_dynamic_grid_with_lidar(detected_obstacles, robot_gx, robot_gy)
 
         # Check if obstacles block the planned path
-        return self._check_obstacles_block_path(obst_neighbors, robot_gx, robot_gy, detected_obstacles)
+        return self._check_obstacles_block_path(detected_obstacles, robot_gx, robot_gy, detected_obstacles)
 
     def _process_lidar_scan(self, scan_msg, robot_gx, robot_gy, robot_theta):
         """
@@ -942,9 +935,21 @@ class DStarNavigator(Node):
         detected_obstacles = []
         angle = scan_msg.angle_min
 
+        # Debug counters
+        total_readings = 0
+        invalid_range_count = 0
+        filtered_by_validation = 0
+        front_angle_detections = 0  # Track front-facing detections
+
         for range_val in scan_msg.ranges:
+            total_readings += 1
+
+            # Check if this is a front-facing reading (within ~30 degrees of forward)
+            is_front = abs(angle) < 0.52  # ~30 degrees in radians
+
             # Validate reading
             if not self._is_valid_lidar_reading(range_val, scan_msg):
+                invalid_range_count += 1
                 angle += scan_msg.angle_increment
                 continue
 
@@ -960,8 +965,28 @@ class DStarNavigator(Node):
             # Filter out false positives
             if self._is_valid_obstacle(grid_pos, robot_gx, robot_gy):
                 detected_obstacles.append(grid_pos)
+                if is_front:
+                    front_angle_detections += 1
+            else:
+                filtered_by_validation += 1
+                # Debug: log why front obstacles are being filtered
+                if is_front and range_val < 1.0:
+                    self._debug_obstacle_filter(grid_pos, robot_gx, robot_gy, range_val, angle)
 
             angle += scan_msg.angle_increment
+
+        # Periodic debug logging (every ~50 scans to avoid spam)
+        if hasattr(self, '_lidar_debug_counter'):
+            self._lidar_debug_counter += 1
+        else:
+            self._lidar_debug_counter = 0
+
+        if self._lidar_debug_counter % 50 == 0:
+            self.get_logger().debug(
+                f'Lidar scan: {total_readings} readings, {invalid_range_count} invalid range, '
+                f'{filtered_by_validation} filtered, {len(detected_obstacles)} detected, '
+                f'{front_angle_detections} front'
+            )
 
         return detected_obstacles
 
@@ -1059,6 +1084,50 @@ class DStarNavigator(Node):
 
         return True
 
+    def _debug_obstacle_filter(self, grid_pos, robot_gx, robot_gy, range_val, angle):
+        """
+        Debug helper to log why a front-facing obstacle was filtered.
+
+        Only called for close front obstacles that were rejected.
+        """
+        gx, gy = grid_pos
+        dist_from_robot = math.sqrt((gx - robot_gx)**2 + (gy - robot_gy)**2)
+
+        reasons = []
+
+        # Check bounds
+        if not (0 <= gx < self.grid_original.shape[1] and
+                0 <= gy < self.grid_original.shape[0]):
+            reasons.append('OUT_OF_BOUNDS')
+        else:
+            # Check robot body filter
+            if dist_from_robot < PlannerConstants.ROBOT_BODY_RADIUS_CELLS:
+                reasons.append(f'ROBOT_BODY(dist={dist_from_robot:.1f}<{PlannerConstants.ROBOT_BODY_RADIUS_CELLS})')
+
+            # Check static obstacle filter
+            if self._is_near_static_obstacle(gx, gy, PlannerConstants.STATIC_OBSTACLE_TOLERANCE):
+                reasons.append(f'NEAR_STATIC(tol={PlannerConstants.STATIC_OBSTACLE_TOLERANCE})')
+
+            # Check completely free filter
+            if (0 <= gx < self.grid_original.shape[1] and 0 <= gy < self.grid_original.shape[0]):
+                is_completely_free = (self.grid_original[gy, gx] == 0 and
+                                     self.grid[gy, gx] == 0 and
+                                     self.grid_dynamic[gy, gx] == 0)
+                if is_completely_free:
+                    slam_confirmed = (self.grid_slam is not None and
+                                    0 <= gx < self.grid_slam.shape[1] and
+                                    0 <= gy < self.grid_slam.shape[0] and
+                                    self.grid_slam[gy, gx] != 0)
+                    if not slam_confirmed and dist_from_robot > PlannerConstants.CLOSE_OBSTACLE_CELLS:
+                        reasons.append(f'FREE_NO_SLAM(dist={dist_from_robot:.1f}>{PlannerConstants.CLOSE_OBSTACLE_CELLS})')
+
+        if reasons:
+            angle_deg = math.degrees(angle)
+            self.get_logger().warn(
+                f'FILTERED front obstacle: pos=({gx},{gy}), range={range_val:.2f}m, '
+                f'angle={angle_deg:.1f}deg, reasons={reasons}'
+            )
+
     def _is_near_static_obstacle(self, gx, gy, tolerance):
         """
         Check if position is near a static obstacle.
@@ -1133,16 +1202,16 @@ class DStarNavigator(Node):
 
         return obst_neighbors
 
-    def _update_dynamic_grid_with_lidar(self, obst_neighbors, robot_gx, robot_gy):
+    def _update_dynamic_grid_with_lidar(self, detected_obstacles, robot_gx, robot_gy):
         """
-        Update grid_dynamic with lidar-detected obstacles.
+        Update grid_dynamic with lidar-detected obstacles at their actual positions.
 
         Starts from grid_base (persistent SLAM obstacles) and adds
         lidar obstacles on top. Also updates D* Lite planner's graph
         to keep it in sync with all detected obstacles.
 
         Args:
-            obst_neighbors: List of neighbor cells with obstacles
+            detected_obstacles: List of obstacle positions [(gx, gy), ...] at actual locations
             robot_gx, robot_gy: Robot position
         """
         # Store previous grid state to detect changes
@@ -1158,8 +1227,8 @@ class DStarNavigator(Node):
         # Track cells that changed for D* update
         changed_cells = []
 
-        # Inflate and mark obstacle neighbors
-        for gx, gy in obst_neighbors:
+        # Inflate and mark obstacles at their actual detected positions
+        for gx, gy in detected_obstacles:
             for dy in range(-inflation_cells, inflation_cells + 1):
                 for dx in range(-inflation_cells, inflation_cells + 1):
                     inflate_x, inflate_y = gx + dx, gy + dy
@@ -1190,7 +1259,7 @@ class DStarNavigator(Node):
         # Publish updated dynamic grid for visualization
         self.publish_dynamic_grid()
 
-    def _check_obstacles_block_path(self, obst_neighbors, robot_gx, robot_gy, detected_obstacles):
+    def _check_obstacles_block_path(self, detected_obstacles, robot_gx, robot_gy, _unused=None):
         """
         Check if detected obstacles block the planned path.
 
@@ -1201,9 +1270,9 @@ class DStarNavigator(Node):
         - Uses robot footprint as blocking threshold
 
         Args:
-            obst_neighbors: Neighbor cells with obstacles (for grid marking)
+            detected_obstacles: Actual obstacle positions [(gx, gy), ...]
             robot_gx, robot_gy: Robot position
-            detected_obstacles: Actual obstacle positions (for path checking)
+            _unused: Deprecated parameter, kept for compatibility
 
         Returns:
             True if obstacles block path, False otherwise
