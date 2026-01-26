@@ -89,8 +89,9 @@ class PlannerConstants:
     ODOMETRY = '/don/odom'
     SCAN = '/don/scan'
     OCCUPANCY_GRID = '/don/map'
-    PATH = 'don/path'
+    PATH = '/don/path'
     DYNAMIC_GRID = '/don/dynamic_grid'
+    GOAL_POSE = '/don/goal_pose'
 
     # Pgm and yaml paths
     SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olinmaze.yaml'
@@ -542,11 +543,46 @@ class DStarNavigator(Node):
             OccupancyGrid, PlannerConstants.OCCUPANCY_GRID, self.map_callback, map_qos
         )
 
+        # Goal pose subscriber for receiving navigation goals
+        self.goal_pose_sub = self.create_subscription(
+            PoseStamped, PlannerConstants.GOAL_POSE, self.goal_pose_callback, 10
+        )
+
+    def goal_pose_callback(self, msg: PoseStamped):
+        """
+        Handle incoming goal pose messages.
+
+        Extracts x, y coordinates from the PoseStamped message and
+        initiates navigation from current position to the goal.
+
+        Args:
+            msg: PoseStamped message containing the goal position
+        """
+        goal_x = msg.pose.position.x
+        goal_y = msg.pose.position.y
+
+        self.get_logger().info(f'Received goal pose: ({goal_x:.2f}, {goal_y:.2f})')
+
+        if self.current_pose is None:
+            self.get_logger().warn('No odometry data yet, cannot navigate to goal')
+            return
+
+        start_x = self.current_pose['x']
+        start_y = self.current_pose['y']
+
+        self.get_logger().info(f'Starting navigation from ({start_x:.2f}, {start_y:.2f}) to ({goal_x:.2f}, {goal_y:.2f})')
+
+        if self.navigate_to_goal(start_x, start_y, goal_x, goal_y):
+            self.get_logger().info('Navigation started successfully')
+        else:
+            self.get_logger().error('Failed to plan path to goal')
+
     def _log_initialization(self):
         """Log initialization information."""
         total_inflation = self.robot_radius + self.safety_clearance
         self.get_logger().info('D* Lite Navigator initialized')
         self.get_logger().info(f'Robot radius: {self.robot_radius}m, Safety: {self.safety_clearance}m, Total: {total_inflation}m')
+        self.get_logger().info(f'Listening for goal poses on: {PlannerConstants.GOAL_POSE}')
 
         if self.use_live_slam:
             self.get_logger().info('Using LIVE SLAM map from /map topic')
@@ -1844,8 +1880,11 @@ def main(args=None):
         - Set environment variables to override defaults:
           ROBOT_RADIUS, SAFETY_CLEARANCE, OPTIMISTIC_PLANNING
         - Or modify PlannerConstants class directly
+
+    Navigation:
+        - Send goal poses to the goal_pose topic (PoseStamped messages)
+        - Example: ros2 topic pub /don/goal_pose geometry_msgs/PoseStamped '{pose: {position: {x: 1.0, y: 2.0}}}'
     """
-    import os
 
     # Load configuration from environment (with PlannerConstants as defaults)
     robot_radius = float(os.getenv('ROBOT_RADIUS', str(PlannerConstants.ROBOT_RADIUS)))
@@ -1867,8 +1906,13 @@ def main(args=None):
     print(f"  Robot radius: {robot_radius}m")
     print(f"  Safety clearance: {safety_clearance}m")
     print(f"  Optimistic planning: {'ENABLED' if optimistic_planning else 'DISABLED'}")
-    print("\nUsage:")
-    print("  navigator.navigate_to_goal(start_x, start_y, goal_x, goal_y)")
+    print(f"\nTopics:")
+    print(f"  Goal pose input: {PlannerConstants.GOAL_POSE}")
+    print(f"  Odometry: {PlannerConstants.ODOMETRY}")
+    print(f"  Scan: {PlannerConstants.SCAN}")
+    print(f"  Map: {PlannerConstants.OCCUPANCY_GRID}")
+    print(f"\nUsage:")
+    print(f"  ros2 topic pub {PlannerConstants.GOAL_POSE} geometry_msgs/PoseStamped '{{pose: {{position: {{x: 1.0, y: 2.0}}}}}}' --once")
     print("="*60 + "\n")
 
     # Wait for odometry
@@ -1876,37 +1920,21 @@ def main(args=None):
     while navigator.current_pose is None and rclpy.ok():
         rclpy.spin_once(navigator, timeout_sec=0.1)
 
+    if navigator.current_pose:
+        print(f"Odometry received. Current position: ({navigator.current_pose['x']:.2f}, {navigator.current_pose['y']:.2f})")
+
     # Wait for SLAM map
     if navigator.use_live_slam:
         print("Listening for SLAM map updates...")
         for _ in range(20):
             rclpy.spin_once(navigator, timeout_sec=0.1)
 
-    # Get goal from user input
-    if navigator.current_pose:
-        print(f"Current position: ({navigator.current_pose['x']:.2f}, {navigator.current_pose['y']:.2f})")
+    print(f"\nReady! Waiting for goal poses on {PlannerConstants.GOAL_POSE}...")
 
-        try:
-            goal_x = float(input("Enter goal X coordinate (meters): "))
-            goal_y = float(input("Enter goal Y coordinate (meters): "))
-        except (ValueError, EOFError, KeyboardInterrupt):
-            print("\nExiting...")
-            navigator.destroy_node()
-            rclpy.shutdown()
-            return
-
-        start_x = navigator.current_pose['x']
-        start_y = navigator.current_pose['y']
-
-        # Start navigation
-        if navigator.navigate_to_goal(start_x, start_y, goal_x, goal_y):
-            print("\nNavigation started! Press Ctrl+C to stop.\n")
-            try:
-                rclpy.spin(navigator)
-            except KeyboardInterrupt:
-                print("\nStopping navigation...")
-        else:
-            print("\nNavigation failed!")
+    try:
+        rclpy.spin(navigator)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
 
     # Cleanup
     navigator.stop_robot()
