@@ -62,6 +62,7 @@ class PlannerConstants:
     ROBOT_RADIUS = 0.22           # Physical radius of the robot body
     SAFETY_CLEARANCE = 0.0001      # Extra safety buffer around obstacles
                                   # Total inflation = ROBOT_RADIUS + SAFETY_CLEARANCE
+    NAMESPACE = '/don'
 
     # -------- Lidar Obstacle Detection (meters) --------
     LIDAR_MIN_RANGE = 0.1         # Ignore readings closer than this (robot body/noise)
@@ -87,14 +88,14 @@ class PlannerConstants:
     INFLATION_DIVISOR = 5         # Reduce inflation for dynamic obstacles
 
     # Publishing/Subscribing Paths
-    CMD_VEL = '/don/cmd_vel'
-    ODOMETRY = '/don/odom'
-    SCAN = '/don/scan'
-    OCCUPANCY_GRID = '/don/map'
-    PATH = '/don/path'
-    DYNAMIC_GRID = '/don/dynamic_grid'
-    GOAL_POSE = '/don/goal_pose'
-    GRID_MARKERS = '/don/grid_markers'
+    CMD_VEL = f'{NAMESPACE}/cmd_vel'
+    ODOMETRY = f'{NAMESPACE}/odom'
+    SCAN = f'{NAMESPACE}/scan'
+    OCCUPANCY_GRID = f'{NAMESPACE}/map'
+    PATH = f'{NAMESPACE}/path'
+    DYNAMIC_GRID = f'{NAMESPACE}/dynamic_grid'
+    GOAL_POSE = f'{NAMESPACE}/goal_pose'
+    GRID_MARKERS = f'{NAMESPACE}/grid_markers'
 
     # Pgm and yaml paths
     SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olin304.yaml'
@@ -734,18 +735,18 @@ class DStarNavigator(Node):
         self.grid_slam = slam_grid.copy()
         self.grid_unknown = np.zeros_like(self.grid_original, dtype=np.int8)
 
-        # Detect new obstacles from SLAM
-        new_obstacles, newly_discovered = self._detect_slam_obstacles(
+        # Detect ALL current SLAM obstacles and track changes
+        current_slam_obstacles, newly_discovered = self._detect_slam_obstacles(
             slam_grid, unknown_mask, slam_resolution, slam_origin,
             height, width, previous_unknown
         )
 
-        # Update grid_base with SLAM obstacles (accumulate, don't replace)
-        self._update_dynamic_grid_with_slam(new_obstacles)
+        # Update grid_base to reflect current SLAM state (add AND remove)
+        self._update_dynamic_grid_with_slam(current_slam_obstacles)
 
         # Check if replanning needed
         if newly_discovered > 0 and self.optimistic_planning and self.path:
-            if self._check_path_blocked_by_obstacles(new_obstacles):
+            if self._check_path_blocked_by_obstacles(current_slam_obstacles):
                 # Clear known obstacles - new SLAM discoveries
                 self.known_obstacles.clear()
                 self._log_replanning_trigger('Newly discovered SLAM obstacles', newly_discovered)
@@ -754,7 +755,7 @@ class DStarNavigator(Node):
         self.map_received = True
 
         if is_first_map:
-            self.get_logger().info(f'SLAM map integrated: {new_obstacles.sum()} new obstacles detected')
+            self.get_logger().info(f'SLAM map integrated: {current_slam_obstacles.sum()} obstacles detected')
 
     # ========================================================================
     # SLAM OBSTACLE DETECTION
@@ -811,39 +812,53 @@ class DStarNavigator(Node):
 
         return new_obstacles_grid, newly_discovered_count
 
-    def _update_dynamic_grid_with_slam(self, new_obstacles_grid):
+    def _update_dynamic_grid_with_slam(self, current_slam_obstacles):
         """
-        Update grid_base with SLAM obstacles (persistent accumulation).
+        Update grid_base to reflect current SLAM obstacle state.
 
-        IMPORTANT: Accumulates SLAM obstacles instead of replacing them.
-        This prevents the "massive grid changes" bug where obstacles were
-        being lost between SLAM updates.
+        IMPORTANT: This now SYNCS with SLAM state - both adding new obstacles
+        AND removing obstacles that SLAM no longer reports. This ensures the
+        grid reflects reality when obstacles move or disappear.
 
         Also keeps D* Lite planner's internal graph in sync with SLAM
         discoveries, even if they don't block the current path.
 
         Args:
-            new_obstacles_grid: Binary grid of new obstacles from SLAM
+            current_slam_obstacles: Binary grid of ALL current SLAM obstacles
+                                   (not just new ones)
         """
-        if new_obstacles_grid.sum() > 0:
-            total_inflation = self.robot_radius + self.safety_clearance
-            new_obstacles_inflated = self._inflate_obstacles(new_obstacles_grid, total_inflation)
+        # Store previous state to detect changes
+        previous_grid_base = self.grid_base.copy() if self.grid_base is not None else None
 
-            # ACCUMULATE obstacles - don't replace!
-            self.grid_base = np.maximum(self.grid_base, new_obstacles_inflated)
-        # Don't reset to grid.copy() - keep accumulated obstacles!
+        # Start with inflated static map as base
+        self.grid_base = self.grid.copy()
+
+        # Add current SLAM obstacles (inflated)
+        if current_slam_obstacles.sum() > 0:
+            total_inflation = self.robot_radius + self.safety_clearance
+            slam_obstacles_inflated = self._inflate_obstacles(current_slam_obstacles, total_inflation)
+
+            # Merge SLAM obstacles with static map
+            self.grid_base = np.maximum(self.grid_base, slam_obstacles_inflated)
 
         # Update dynamic grid to match base (lidar will add on top)
         self.grid_dynamic = self.grid_base.copy()
 
-        # Always update D* Lite planner with SLAM changes to keep graph in sync
-        if self.dstar_planner is not None:
-            changed_cells = self._find_changed_cells()
-            if changed_cells:
-                self.get_logger().info(f'Syncing {len(changed_cells)} SLAM changes to D* planner')
-                self.dstar_planner.grid = self.grid_dynamic.copy()
-                self.dstar_planner.update_obstacles(changed_cells)
-                self.planner_grid_snapshot = self.grid_base.copy()
+        # Find changed cells (both additions AND removals)
+        changed_cells = []
+        if previous_grid_base is not None:
+            rows, cols = self.grid_base.shape
+            for y in range(rows):
+                for x in range(cols):
+                    if previous_grid_base[y, x] != self.grid_base[y, x]:
+                        changed_cells.append((x, y))
+
+        # Update D* Lite planner with all changes
+        if self.dstar_planner is not None and changed_cells:
+            self.get_logger().info(f'Syncing {len(changed_cells)} SLAM changes to D* planner (adds & removes)')
+            self.dstar_planner.grid = self.grid_dynamic.copy()
+            self.dstar_planner.update_obstacles(changed_cells)
+            self.planner_grid_snapshot = self.grid_base.copy()
 
         # Publish updated dynamic grid for visualization
         self.publish_dynamic_grid()
