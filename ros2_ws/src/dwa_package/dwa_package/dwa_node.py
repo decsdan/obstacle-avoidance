@@ -20,14 +20,14 @@ class DWA(Node):
 
 #relevant hyperparams,,,, can edit here or test diff with command line
 #twist
-        self.declare_parameter('max_velocity', 1.0)
+        self.declare_parameter('max_velocity', 0.4)
         self.declare_parameter('min_velocity', 0.0)
-        self.declare_parameter('max_angular_velocity', 2.5)
-        self.declare_parameter('min_angular_velocity', -2.5)
+        self.declare_parameter('max_angular_velocity', 1.8)
+        self.declare_parameter('min_angular_velocity', -1.8)
         self.declare_parameter('max_linear_acceleration', 0.5)
-        self.declare_parameter('max_angular_acceleration', 2.0)
+        self.declare_parameter('max_angular_acceleration', 1.5)
         self.declare_parameter('v_samples', 10) 
-        self.declare_parameter('w_samples', 10)
+        self.declare_parameter('w_samples', 20)
         self.declare_parameter('lidar_angle_offset', 1.5708) # for whatever reason, the real life turtlebot needs to be shifted 90 degrees
 
         self.max_v = self.get_parameter('max_velocity').value
@@ -43,8 +43,8 @@ class DWA(Node):
         
 # planning
         self.declare_parameter('dt', 0.1)
-        self.declare_parameter('prediction_steps', 30)
-        self.declare_parameter('window_steps', 5)
+        self.declare_parameter('prediction_steps', 50)
+        self.declare_parameter('window_steps', 8)
         self.declare_parameter('LIDAR_downsample', 1)
 
         self.dt = self.get_parameter('dt').value
@@ -53,9 +53,9 @@ class DWA(Node):
         self.LIDAR_downsample = self.get_parameter('LIDAR_downsample').value
         
 # bubbles
-        self.declare_parameter('critical_radius', 0.30)
+        self.declare_parameter('critical_radius', 0.20)
         self.declare_parameter('safe_distance', 0.50)
-        self.declare_parameter('emergency_stop_distance', 0.25)
+        self.declare_parameter('emergency_stop_distance', 0.18)
         self.declare_parameter('max_lidar_range', 8.0)
 
         self.critical_radius = self.get_parameter('critical_radius').value
@@ -64,10 +64,10 @@ class DWA(Node):
         self.max_lidar_range = self.get_parameter('max_lidar_range').value
         
 # cost weights
-        self.declare_parameter('weights.goal', 0.3)
-        self.declare_parameter('weights.heading', 0.02)
-        self.declare_parameter('weights.velocity', 0.3)
-        self.declare_parameter('weights.smoothness', 0.02)
+        self.declare_parameter('weights.goal', 0.5)
+        self.declare_parameter('weights.heading', 0.05)
+        self.declare_parameter('weights.velocity', 0.2)
+        self.declare_parameter('weights.smoothness', 0.05)
         self.declare_parameter('weights.obstacle', 0.1)
 
         self.w_goal = self.get_parameter('weights.goal').value
