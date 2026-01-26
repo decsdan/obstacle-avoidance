@@ -29,9 +29,11 @@ Authors: Devin Dennis, Assisted with Claude Code
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
+from geometry_msgs.msg import Twist, TwistStamped, PoseStamped, Point
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from sensor_msgs.msg import LaserScan
+from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import ColorRGBA
 import numpy as np
 import yaml
 from PIL import Image
@@ -92,6 +94,7 @@ class PlannerConstants:
     PATH = '/don/path'
     DYNAMIC_GRID = '/don/dynamic_grid'
     GOAL_POSE = '/don/goal_pose'
+    GRID_MARKERS = '/don/grid_markers'
 
     # Pgm and yaml paths
     SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olinmaze.yaml'
@@ -468,6 +471,7 @@ class DStarNavigator(Node):
         self.cmd_vel_pub = self.create_publisher(TwistStamped, PlannerConstants.CMD_VEL, 10)
         self.path_pub = self.create_publisher(Path, PlannerConstants.PATH, 10)
         self.dynamic_grid_pub = self.create_publisher(OccupancyGrid, PlannerConstants.DYNAMIC_GRID, 10)
+        self.grid_markers_pub = self.create_publisher(MarkerArray, PlannerConstants.GRID_MARKERS, 10)
 
         # ROS2 subscribers
         self._setup_subscribers()
@@ -1827,6 +1831,127 @@ class DStarNavigator(Node):
         grid_msg.data = occupancy_data
 
         self.dynamic_grid_pub.publish(grid_msg)
+
+        # Also publish markers for better visualization
+        self.publish_grid_markers()
+
+    def publish_grid_markers(self):
+        """
+        Publish grid obstacles as MarkerArray for RViz visualization.
+
+        Color coding:
+        - Red: Static obstacles (from original map)
+        - Orange: Inflated static obstacles
+        - Purple: SLAM-discovered obstacles
+        - Cyan: Lidar-detected dynamic obstacles
+
+        Subscribe to /don/grid_markers in RViz to see this.
+        """
+        if self.grid_dynamic is None or self.resolution is None:
+            return
+
+        marker_array = MarkerArray()
+        stamp = self.get_clock().now().to_msg()
+
+        # Create separate markers for different obstacle types
+        # Using CUBE_LIST for efficiency (one marker with many cubes)
+
+        # 1. Static obstacles (red)
+        static_marker = Marker()
+        static_marker.header.stamp = stamp
+        static_marker.header.frame_id = 'map'
+        static_marker.ns = 'static_obstacles'
+        static_marker.id = 0
+        static_marker.type = Marker.CUBE_LIST
+        static_marker.action = Marker.ADD
+        static_marker.scale.x = self.resolution * 0.9
+        static_marker.scale.y = self.resolution * 0.9
+        static_marker.scale.z = 0.1
+        static_marker.color = ColorRGBA(r=0.8, g=0.0, b=0.0, a=0.8)  # Red
+        static_marker.pose.orientation.w = 1.0
+
+        # 2. Inflated static obstacles (orange)
+        inflated_marker = Marker()
+        inflated_marker.header.stamp = stamp
+        inflated_marker.header.frame_id = 'map'
+        inflated_marker.ns = 'inflated_obstacles'
+        inflated_marker.id = 1
+        inflated_marker.type = Marker.CUBE_LIST
+        inflated_marker.action = Marker.ADD
+        inflated_marker.scale.x = self.resolution * 0.9
+        inflated_marker.scale.y = self.resolution * 0.9
+        inflated_marker.scale.z = 0.05
+        inflated_marker.color = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.5)  # Orange
+        inflated_marker.pose.orientation.w = 1.0
+
+        # 3. SLAM obstacles (purple) - in grid_base but not in grid
+        slam_marker = Marker()
+        slam_marker.header.stamp = stamp
+        slam_marker.header.frame_id = 'map'
+        slam_marker.ns = 'slam_obstacles'
+        slam_marker.id = 2
+        slam_marker.type = Marker.CUBE_LIST
+        slam_marker.action = Marker.ADD
+        slam_marker.scale.x = self.resolution * 0.9
+        slam_marker.scale.y = self.resolution * 0.9
+        slam_marker.scale.z = 0.15
+        slam_marker.color = ColorRGBA(r=0.6, g=0.0, b=0.8, a=0.8)  # Purple
+        slam_marker.pose.orientation.w = 1.0
+
+        # 4. Lidar/dynamic obstacles (cyan) - in grid_dynamic but not in grid_base
+        lidar_marker = Marker()
+        lidar_marker.header.stamp = stamp
+        lidar_marker.header.frame_id = 'map'
+        lidar_marker.ns = 'lidar_obstacles'
+        lidar_marker.id = 3
+        lidar_marker.type = Marker.CUBE_LIST
+        lidar_marker.action = Marker.ADD
+        lidar_marker.scale.x = self.resolution * 0.9
+        lidar_marker.scale.y = self.resolution * 0.9
+        lidar_marker.scale.z = 0.2
+        lidar_marker.color = ColorRGBA(r=0.0, g=0.8, b=0.8, a=0.9)  # Cyan
+        lidar_marker.pose.orientation.w = 1.0
+
+        # Iterate through grid and categorize obstacles
+        rows, cols = self.grid_dynamic.shape
+        for gy in range(rows):
+            for gx in range(cols):
+                # Convert to world coordinates
+                world_x = gx * self.resolution + self.origin[0]
+                world_y = gy * self.resolution + self.origin[1]
+                point = Point(x=world_x, y=world_y, z=0.0)
+
+                # Check what type of obstacle this is
+                is_original = self.grid_original[gy, gx] != 0 if self.grid_original is not None else False
+                is_inflated = self.grid[gy, gx] != 0 if self.grid is not None else False
+                is_base = self.grid_base[gy, gx] != 0 if self.grid_base is not None else False
+                is_dynamic = self.grid_dynamic[gy, gx] != 0
+
+                if is_original:
+                    # Original static obstacle
+                    static_marker.points.append(point)
+                elif is_inflated:
+                    # Inflated zone around static
+                    inflated_marker.points.append(point)
+                elif is_base and not is_inflated:
+                    # SLAM-discovered obstacle
+                    slam_marker.points.append(point)
+                elif is_dynamic and not is_base:
+                    # Lidar-detected dynamic obstacle
+                    lidar_marker.points.append(point)
+
+        # Add markers to array (only if they have points)
+        if static_marker.points:
+            marker_array.markers.append(static_marker)
+        if inflated_marker.points:
+            marker_array.markers.append(inflated_marker)
+        if slam_marker.points:
+            marker_array.markers.append(slam_marker)
+        if lidar_marker.points:
+            marker_array.markers.append(lidar_marker)
+
+        # Publish marker array
+        self.grid_markers_pub.publish(marker_array)
 
     def _is_valid_in_inflated_grid(self, grid_pos):
         """
