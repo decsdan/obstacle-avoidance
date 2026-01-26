@@ -97,8 +97,8 @@ class PlannerConstants:
     GRID_MARKERS = '/don/grid_markers'
 
     # Pgm and yaml paths
-    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olinmaze.yaml'
-    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/olinmaze.pgm'
+    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olin304.yaml'
+    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/olin304.pgm'
 
 
 
