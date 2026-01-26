@@ -815,6 +815,9 @@ class DStarNavigator(Node):
         This prevents the "massive grid changes" bug where obstacles were
         being lost between SLAM updates.
 
+        Also keeps D* Lite planner's internal graph in sync with SLAM
+        discoveries, even if they don't block the current path.
+
         Args:
             new_obstacles_grid: Binary grid of new obstacles from SLAM
         """
@@ -828,6 +831,15 @@ class DStarNavigator(Node):
 
         # Update dynamic grid to match base (lidar will add on top)
         self.grid_dynamic = self.grid_base.copy()
+
+        # Always update D* Lite planner with SLAM changes to keep graph in sync
+        if self.dstar_planner is not None:
+            changed_cells = self._find_changed_cells()
+            if changed_cells:
+                self.get_logger().info(f'Syncing {len(changed_cells)} SLAM changes to D* planner')
+                self.dstar_planner.grid = self.grid_dynamic.copy()
+                self.dstar_planner.update_obstacles(changed_cells)
+                self.planner_grid_snapshot = self.grid_base.copy()
 
         # Publish updated dynamic grid for visualization
         self.publish_dynamic_grid()
