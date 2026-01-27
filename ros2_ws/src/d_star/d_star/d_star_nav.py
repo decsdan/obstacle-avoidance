@@ -1061,13 +1061,16 @@ class DStarNavigator(Node):
 
     def _process_lidar_scan(self, scan_msg, robot_gx, robot_gy, robot_theta):
         """
-        Process lidar scan to detect valid obstacles.
+        Process lidar scan to detect valid obstacles within 1 meter radius area.
+
+        Detection method:
+        - Scans all grid cells within 1 meter radius of robot
+        - Checks lidar readings to confirm/detect obstacles in that area
+        - Returns all obstacles found in the circular area
 
         Filters out:
-        - Invalid/infinite readings
         - Robot body detections
         - Static map obstacles
-        - Corridor walls in free space
 
         Args:
             scan_msg: LaserScan message
@@ -1078,49 +1081,71 @@ class DStarNavigator(Node):
             List of obstacle positions [(gx, gy), ...]
         """
         detected_obstacles = []
+        detected_set = set()  # Avoid duplicates
+
+        # Detection radius in meters and cells
+        detection_radius_meters = 1.0
+        detection_radius_cells = int(detection_radius_meters / self.resolution)
+
+        # First, process lidar hits within the detection radius
         angle = scan_msg.angle_min
-
-        # Debug counters
-        total_readings = 0
-        invalid_range_count = 0
-        filtered_by_validation = 0
-        front_angle_detections = 0  # Track front-facing detections
-
         for range_val in scan_msg.ranges:
-            total_readings += 1
+            # Only process readings within our detection radius
+            if (self._is_valid_lidar_reading(range_val, scan_msg) and
+                range_val <= detection_radius_meters):
 
-            # Check if this is a front-facing reading (within ~30 degrees of forward)
-            is_front = abs(angle) < 0.52  # ~30 degrees in radians
+                # Convert to world coordinates
+                obstacle_world = self._lidar_to_world(
+                    range_val, angle, self.current_pose['x'],
+                    self.current_pose['y'], robot_theta
+                )
 
-            # Validate reading
-            if not self._is_valid_lidar_reading(range_val, scan_msg):
-                invalid_range_count += 1
-                angle += scan_msg.angle_increment
-                continue
+                # Convert to grid coordinates
+                grid_pos = self.world_to_grid(obstacle_world[0], obstacle_world[1])
+                gx, gy = grid_pos
 
-            # Convert to world coordinates
-            obstacle_world = self._lidar_to_world(
-                range_val, angle, self.current_pose['x'],
-                self.current_pose['y'], robot_theta
-            )
-
-            # Convert to grid coordinates
-            grid_pos = self.world_to_grid(obstacle_world[0], obstacle_world[1])
-
-            # Filter out false positives
-            if self._is_valid_obstacle(grid_pos, robot_gx, robot_gy):
-                detected_obstacles.append(grid_pos)
-                if is_front:
-                    front_angle_detections += 1
-            else:
-                filtered_by_validation += 1
-                # Debug: log why front obstacles are being filtered
-                if is_front and range_val < 1.0:
-                    self._debug_obstacle_filter(grid_pos, robot_gx, robot_gy, range_val, angle)
+                # Check bounds and not robot body
+                if (0 <= gx < self.grid_dynamic.shape[1] and
+                    0 <= gy < self.grid_dynamic.shape[0]):
+                    dist_from_robot = math.sqrt((gx - robot_gx)**2 + (gy - robot_gy)**2)
+                    if dist_from_robot >= PlannerConstants.ROBOT_BODY_RADIUS_CELLS:
+                        if grid_pos not in detected_set:
+                            detected_set.add(grid_pos)
+                            detected_obstacles.append(grid_pos)
 
             angle += scan_msg.angle_increment
 
-        # Periodic debug logging (every ~50 scans to avoid spam)
+        # Second, scan the grid area within detection radius for any obstacles
+        # This catches obstacles from SLAM/previous scans that lidar might not currently see
+        for dy in range(-detection_radius_cells, detection_radius_cells + 1):
+            for dx in range(-detection_radius_cells, detection_radius_cells + 1):
+                gx = robot_gx + dx
+                gy = robot_gy + dy
+
+                # Check if within circular radius (not just square)
+                dist_from_robot = math.sqrt(dx**2 + dy**2)
+                if dist_from_robot > detection_radius_cells:
+                    continue
+
+                # Filter robot body
+                if dist_from_robot < PlannerConstants.ROBOT_BODY_RADIUS_CELLS:
+                    continue
+
+                # Check bounds
+                if not (0 <= gx < self.grid_dynamic.shape[1] and
+                        0 <= gy < self.grid_dynamic.shape[0]):
+                    continue
+
+                # Check if obstacle in dynamic grid (but not in original static map)
+                grid_pos = (gx, gy)
+                if grid_pos not in detected_set:
+                    if self.grid_dynamic[gy, gx] != 0:
+                        # Only add if it's a dynamic obstacle (not static)
+                        if not self._is_near_static_obstacle(gx, gy, PlannerConstants.STATIC_OBSTACLE_TOLERANCE):
+                            detected_set.add(grid_pos)
+                            detected_obstacles.append(grid_pos)
+
+        # Periodic debug logging
         if hasattr(self, '_lidar_debug_counter'):
             self._lidar_debug_counter += 1
         else:
@@ -1128,9 +1153,7 @@ class DStarNavigator(Node):
 
         if self._lidar_debug_counter % 50 == 0:
             self.get_logger().debug(
-                f'Lidar scan: {total_readings} readings, {invalid_range_count} invalid range, '
-                f'{filtered_by_validation} filtered, {len(detected_obstacles)} detected, '
-                f'{front_angle_detections} front'
+                f'Area scan (r={detection_radius_meters}m): {len(detected_obstacles)} obstacles detected'
             )
 
         return detected_obstacles
