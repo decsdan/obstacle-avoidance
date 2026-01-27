@@ -512,6 +512,7 @@ class DStarNavigator(Node):
         self.angle_tolerance = 0.1
         self.replanning_needed = False
         self.last_replan_time = self.get_clock().now()
+        self.blocked_waypoint_idx = None  # Track which waypoint is blocked by obstacle
 
         # Control loop timer (10 Hz)
         self.control_timer = self.create_timer(0.1, self.control_loop)
@@ -994,7 +995,11 @@ class DStarNavigator(Node):
         if not self.path:
             return False
 
-        for waypoint in self.path:
+        for waypoint_idx, waypoint in enumerate(self.path):
+            # Skip waypoints we've already passed
+            if waypoint_idx < self.current_waypoint_idx:
+                continue
+
             gx, gy = self.world_to_grid(waypoint[0], waypoint[1])
 
             if not (0 <= gx < obstacles_grid.shape[1] and 0 <= gy < obstacles_grid.shape[0]):
@@ -1009,6 +1014,8 @@ class DStarNavigator(Node):
                     if (0 <= nx < obstacles_grid.shape[1] and
                         0 <= ny < obstacles_grid.shape[0] and
                         obstacles_grid[ny, nx] != 0):
+                        # Store blocked waypoint index for partial path preservation
+                        self.blocked_waypoint_idx = waypoint_idx
                         return True
 
         return False
@@ -1466,6 +1473,8 @@ class DStarNavigator(Node):
                     self.known_obstacles.add((obs_gx, obs_gy))
                     self._log_obstacle_detection(obs_gx, obs_gy, dist_to_segment,
                                                  blocking_threshold, len(detected_obstacles))
+                    # Store which waypoint is blocked for partial path preservation
+                    self.blocked_waypoint_idx = i
                     return True
 
         return False
@@ -1841,25 +1850,59 @@ class DStarNavigator(Node):
         """
         Handle replanning request.
 
-        Stops robot, replans path from current position to original goal.
+        Stops robot, preserves valid waypoints up to the obstacle, and replans
+        from the last valid waypoint to the original goal.
         """
         self.get_logger().info('Stopping robot for replanning...')
         self.stop_robot()
 
         if self.goal_grid is not None:
             goal_x, goal_y = self.grid_to_world(self.goal_grid[0], self.goal_grid[1])
-            new_path = self.plan_path(self.current_pose['x'], self.current_pose['y'],
-                                     goal_x, goal_y)
+
+            # Preserve valid waypoints up to the blocked segment
+            preserved_waypoints = []
+            replan_start_x = self.current_pose['x']
+            replan_start_y = self.current_pose['y']
+
+            if (self.blocked_waypoint_idx is not None and
+                self.blocked_waypoint_idx > self.current_waypoint_idx and
+                self.path):
+                # Preserve waypoints from current position up to (not including) the blocked one
+                preserved_waypoints = self.path[self.current_waypoint_idx:self.blocked_waypoint_idx]
+
+                if preserved_waypoints:
+                    # Replan from the last preserved waypoint
+                    replan_start_x, replan_start_y = preserved_waypoints[-1]
+                    self.get_logger().info(
+                        f'Preserving {len(preserved_waypoints)} waypoints before obstacle at index {self.blocked_waypoint_idx}'
+                    )
+
+            # Plan new path from replan start point to goal
+            new_path = self.plan_path(replan_start_x, replan_start_y, goal_x, goal_y)
 
             if new_path:
-                self.path = new_path
-                self.current_waypoint_idx = 0
-                self.get_logger().info(f'Replanning successful! New path: {len(self.path)} waypoints')
+                if preserved_waypoints:
+                    # Merge preserved waypoints with new path
+                    # Skip first point of new_path if it's the same as last preserved waypoint
+                    if (new_path and len(preserved_waypoints) > 0 and
+                        abs(new_path[0][0] - preserved_waypoints[-1][0]) < 0.05 and
+                        abs(new_path[0][1] - preserved_waypoints[-1][1]) < 0.05):
+                        new_path = new_path[1:]
+                    self.path = preserved_waypoints + new_path
+                    # Keep current waypoint index since we preserved from there
+                else:
+                    self.path = new_path
+                    self.current_waypoint_idx = 0
+
+                self.get_logger().info(f'Replanning successful! Path: {len(self.path)} waypoints '
+                                      f'({len(preserved_waypoints)} preserved + {len(new_path)} new)')
                 self.publish_path()
             else:
                 self.get_logger().error('Replanning failed! Stopping navigation.')
                 self.path = []
 
+        # Reset blocked waypoint tracker
+        self.blocked_waypoint_idx = None
         self.replanning_needed = False
 
     def _follow_waypoint(self):
