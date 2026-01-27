@@ -1658,6 +1658,18 @@ class DStarNavigator(Node):
         """
         self.get_logger().info('Replanning with D* Lite...')
 
+        # Debug: Check if start position is occupied
+        start_x, start_y = start_grid
+        if (0 <= start_x < self.grid_dynamic.shape[1] and
+            0 <= start_y < self.grid_dynamic.shape[0]):
+            is_occupied = self.grid_dynamic[start_y, start_x] != 0
+            self.get_logger().info(f'Start grid position: ({start_x}, {start_y}), occupied: {is_occupied}')
+
+            if is_occupied:
+                self.get_logger().warn('Start position is marked as occupied! Clearing robot area...')
+                # Clear area around robot before replanning
+                self._clear_robot_area(start_x, start_y)
+
         # Update start position (robot has moved)
         self.dstar_planner.update_start(start_grid)
 
@@ -1684,6 +1696,7 @@ class DStarNavigator(Node):
         # Check if start is reachable
         if self.dstar_planner.g[start_grid] == float('inf'):
             self.get_logger().error('Start position unreachable after replanning')
+            self._debug_unreachable_start(start_grid, goal_grid)
             return []
 
         # Extract new path
@@ -1721,6 +1734,72 @@ class DStarNavigator(Node):
                     changed_cells.append((x, y))
 
         return changed_cells
+
+    def _debug_unreachable_start(self, start_grid, goal_grid):
+        """Debug helper to understand why start is unreachable."""
+        start_x, start_y = start_grid
+        goal_x, goal_y = goal_grid
+
+        self.get_logger().error(f'  Start: ({start_x}, {start_y}), Goal: ({goal_x}, {goal_y})')
+
+        # Check start neighborhood
+        obstacles_around_start = []
+        for dy in range(-3, 4):
+            for dx in range(-3, 4):
+                nx, ny = start_x + dx, start_y + dy
+                if (0 <= nx < self.grid_dynamic.shape[1] and
+                    0 <= ny < self.grid_dynamic.shape[0]):
+                    if self.grid_dynamic[ny, nx] != 0:
+                        obstacles_around_start.append((nx, ny))
+
+        self.get_logger().error(f'  Obstacles within 3 cells of start: {len(obstacles_around_start)}')
+        if obstacles_around_start and len(obstacles_around_start) <= 10:
+            self.get_logger().error(f'  Obstacle positions: {obstacles_around_start}')
+
+        # Check goal
+        if (0 <= goal_x < self.grid_dynamic.shape[1] and
+            0 <= goal_y < self.grid_dynamic.shape[0]):
+            goal_occupied = self.grid_dynamic[goal_y, goal_x] != 0
+            self.get_logger().error(f'  Goal occupied: {goal_occupied}')
+
+        # Check g-value at goal
+        goal_g = self.dstar_planner.g[goal_grid]
+        self.get_logger().error(f'  Goal g-value: {goal_g}')
+
+    def _clear_robot_area(self, robot_gx, robot_gy):
+        """
+        Clear the area around the robot in all grids.
+
+        This fixes the issue where SLAM inflation or noise marks the robot's
+        current position as occupied, making replanning fail.
+
+        Args:
+            robot_gx, robot_gy: Robot position in grid coordinates
+        """
+        clearance = PlannerConstants.ROBOT_CLEARANCE_CELLS
+        changed_cells = []
+
+        for dy in range(-clearance, clearance + 1):
+            for dx in range(-clearance, clearance + 1):
+                clear_x, clear_y = robot_gx + dx, robot_gy + dy
+
+                if (0 <= clear_x < self.grid_dynamic.shape[1] and
+                    0 <= clear_y < self.grid_dynamic.shape[0]):
+
+                    # Only clear if it was occupied (track for D* update)
+                    if self.grid_dynamic[clear_y, clear_x] != 0:
+                        changed_cells.append((clear_x, clear_y))
+
+                    # Clear in all grids
+                    self.grid_dynamic[clear_y, clear_x] = 0
+                    if self.grid_base is not None:
+                        self.grid_base[clear_y, clear_x] = 0
+
+        # Update D* planner's grid and notify of changes
+        if self.dstar_planner is not None and changed_cells:
+            self.dstar_planner.grid = self.grid_dynamic.copy()
+            self.dstar_planner.update_obstacles(changed_cells)
+            self.get_logger().info(f'Cleared {len(changed_cells)} cells around robot')
 
     # ========================================================================
     # ROBOT CONTROL
