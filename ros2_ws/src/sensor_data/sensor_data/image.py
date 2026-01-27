@@ -26,6 +26,7 @@ def main():
     node = ImageSubscriber()
 
     rclpy.spin(node)
+    print("hello camera")
 
     node.destroy_node()
     rclpy.shutdown()
