@@ -9,7 +9,8 @@ from message_filters import Subscriber, ApproximateTimeSynchronizer
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
-from tf2_ros import Buffer, TransformListener
+from tf2_ros import Buffer, TransformListener                  
+#import nav2_amcl #TODO need to sudo import nav2 for this, to get properly localized x y coords (not just odometry)                                   
 
 class DWA(Node):
     
@@ -53,9 +54,9 @@ class DWA(Node):
         self.LIDAR_downsample = self.get_parameter('LIDAR_downsample').value
         
 # bubbles
-        self.declare_parameter('critical_radius', 0.20)
-        self.declare_parameter('safe_distance', 0.50)
-        self.declare_parameter('emergency_stop_distance', 0.18)
+        self.declare_parameter('critical_radius', 0.18)
+        self.declare_parameter('safe_distance', 0.60)
+        self.declare_parameter('emergency_stop_distance', 0.17)
         self.declare_parameter('max_lidar_range', 8.0)
 
         self.critical_radius = self.get_parameter('critical_radius').value
