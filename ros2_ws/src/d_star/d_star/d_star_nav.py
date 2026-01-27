@@ -1770,6 +1770,21 @@ class DStarNavigator(Node):
         start_x, start_y = start_grid
         self._clear_robot_area(start_x, start_y)
 
+        # Check if goal is occupied and find nearest free cell if so
+        goal_x, goal_y = goal_grid
+        if (0 <= goal_x < self.grid_dynamic.shape[1] and
+            0 <= goal_y < self.grid_dynamic.shape[0] and
+            self.grid_dynamic[goal_y, goal_x] != 0):
+            self.get_logger().warn(f'Goal ({goal_x}, {goal_y}) is occupied, finding nearest free cell...')
+            new_goal = self._find_nearest_free_cell(goal_x, goal_y)
+            if new_goal:
+                goal_grid = new_goal
+                self.goal_grid = new_goal  # Update stored goal
+                self.get_logger().info(f'Using alternative goal: {new_goal}')
+            else:
+                self.get_logger().error('Could not find free cell near goal')
+                return []
+
         # Create fresh planner
         self.dstar_planner = DStarLite(self.grid_dynamic.copy(), start_grid, goal_grid)
         self.planner_grid_snapshot = self.grid_base.copy() if self.grid_base is not None else self.grid.copy()
@@ -1791,6 +1806,35 @@ class DStarNavigator(Node):
             self.get_logger().error('Fresh D* Lite also failed to extract path')
 
         return path
+
+    def _find_nearest_free_cell(self, gx, gy, max_radius=10):
+        """
+        Find the nearest free cell to the given position.
+
+        Searches in expanding circles until a free cell is found.
+
+        Args:
+            gx, gy: Center position in grid coordinates
+            max_radius: Maximum search radius in cells
+
+        Returns:
+            Tuple (x, y) of nearest free cell, or None if not found
+        """
+        for radius in range(1, max_radius + 1):
+            # Search in a square ring at this radius
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    # Only check cells on the ring perimeter
+                    if abs(dx) != radius and abs(dy) != radius:
+                        continue
+
+                    nx, ny = gx + dx, gy + dy
+                    if (0 <= nx < self.grid_dynamic.shape[1] and
+                        0 <= ny < self.grid_dynamic.shape[0] and
+                        self.grid_dynamic[ny, nx] == 0):
+                        return (nx, ny)
+
+        return None
 
     def _debug_unreachable_start(self, start_grid, goal_grid):
         """Debug helper to understand why start is unreachable."""
