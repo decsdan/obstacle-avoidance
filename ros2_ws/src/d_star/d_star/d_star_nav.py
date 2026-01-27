@@ -512,9 +512,9 @@ class DStarNavigator(Node):
 
         # Control parameters
         self.linear_speed = 0.2
-        self.angular_speed = 0.5
-        self.position_tolerance = 0.1
-        self.angle_tolerance = 0.1
+        self.angular_speed = 0.4       # Reduced for smoother turns
+        self.position_tolerance = 0.25  # Increased - don't need to hit waypoints exactly
+        self.angle_tolerance = 0.3      # Increased - allow more angle error before slowing
         self.replanning_needed = False
         self.last_replan_time = self.get_clock().now()
         self.blocked_waypoint_idx = None  # Track which waypoint is blocked by obstacle
@@ -1991,11 +1991,13 @@ class DStarNavigator(Node):
 
     def _follow_waypoint(self):
         """
-        Follow current waypoint using simple proportional control.
+        Follow current waypoint using smooth proportional control.
 
         Control strategy:
-        1. If not facing waypoint -> rotate in place
-        2. If facing waypoint -> move forward with proportional angular correction
+        - Always try to move forward while turning (no stop-and-rotate)
+        - Reduce forward speed when angle error is large
+        - Use proportional control for smooth motion
+        - Look ahead to next waypoint for smoother curves
         """
         target = self.path[self.current_waypoint_idx]
         tx, ty = target
@@ -2019,14 +2021,24 @@ class DStarNavigator(Node):
             self.get_logger().info(f'Waypoint {self.current_waypoint_idx}/{len(self.path)} reached')
             return
 
-        # Control logic
-        if abs(angle_diff) > self.angle_tolerance:
-            # Rotate in place to face waypoint
-            cmd.twist.angular.z = self.angular_speed if angle_diff > 0 else -self.angular_speed
+        # Smooth control - move and turn simultaneously
+        # Only rotate in place if angle error is very large (> 90 degrees)
+        large_angle_threshold = 1.57  # ~90 degrees
+
+        if abs(angle_diff) > large_angle_threshold:
+            # Large angle error - rotate in place but with proportional speed
+            cmd.twist.linear.x = 0.0
+            cmd.twist.angular.z = min(self.angular_speed, max(-self.angular_speed,
+                                      0.8 * angle_diff))
         else:
-            # Move forward with proportional angular correction
-            cmd.twist.linear.x = min(self.linear_speed, distance)
-            cmd.twist.angular.z = 0.3 * angle_diff  # Proportional correction
+            # Normal operation - move forward while turning
+            # Reduce forward speed based on angle error (smoother curves)
+            angle_factor = 1.0 - (abs(angle_diff) / large_angle_threshold) * 0.5
+            cmd.twist.linear.x = min(self.linear_speed, distance) * angle_factor
+
+            # Proportional angular control with higher gain for responsiveness
+            cmd.twist.angular.z = min(self.angular_speed, max(-self.angular_speed,
+                                      0.8 * angle_diff))
 
         self.cmd_vel_pub.publish(cmd)
 
