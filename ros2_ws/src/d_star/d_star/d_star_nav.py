@@ -67,21 +67,22 @@ class PlannerConstants:
     LIDAR_MAX_RANGE = 3.0         # Only detect obstacles up to this distance
 
     # -------- Grid Cell Tolerances (cells) --------
-    KNOWN_OBSTACLE_TOLERANCE = 2     # Cells to check for known SLAM obstacle filtering
-    NEARBY_OBSTACLE_TOLERANCE = 2     # Tolerance for coordinate transform errors
-    PATH_CHECK_RADIUS = 3             # Cells around waypoint to check
-    ROBOT_BODY_RADIUS_CELLS = 3       # Min distance from robot (self-detection filter)
+    KNOWN_OBSTACLE_TOLERANCE = 3     # Cells to check for known SLAM obstacle filtering (increased)
+    NEARBY_OBSTACLE_TOLERANCE = 3     # Tolerance for coordinate transform errors (increased)
+    PATH_CHECK_RADIUS = 2             # Cells around waypoint to check (reduced)
+    ROBOT_BODY_RADIUS_CELLS = 4       # Min distance from robot (self-detection filter, increased)
     CLOSE_OBSTACLE_CELLS = 12         # Threshold for "very close" obstacles
     EMERGENCY_OBSTACLE_CELLS = 15      # Max distance to immediately mark in grid
 
     # -------- Path Planning Parameters --------
     MAX_PATH_ITERATIONS = 10000000      # Max D* Lite iterations before timeout
-    PATH_BLOCKING_BUFFER = 5          # Extra buffer for blocking detection
-    LOOKAHEAD_SEGMENTS = 20           # Path segments to check ahead for obstacles
-    MAX_OBSTACLE_CHECK_DISTANCE = 40  # Max cells to check (prevents false triggers)
+    PATH_BLOCKING_BUFFER = 3          # Extra buffer for blocking detection (reduced)
+    LOOKAHEAD_SEGMENTS = 5            # Path segments to check ahead (reduced from 20)
+    MAX_OBSTACLE_CHECK_DISTANCE = 20  # Max cells to check (reduced from 40)
 
     # -------- Control Parameters --------
-    REPLAN_COOLDOWN = 1.0         # Minimum seconds between replans
+    REPLAN_COOLDOWN = 3.0         # Minimum seconds between replans (increased from 1.0)
+    MIN_OBSTACLES_TO_REPLAN = 3   # Minimum obstacles needed to trigger replan
     ROBOT_CLEARANCE_CELLS = 3     # Cells around robot to keep free
     INFLATION_DIVISOR = 5         # Reduce inflation for dynamic obstacles
     MAX_WAYPOINTS = 10
@@ -649,7 +650,7 @@ class DStarNavigator(Node):
         Process lidar scan and check for obstacles in path.
 
         Detects obstacles using lidar and triggers replanning if they block
-        the current path (with cooldown to prevent rapid replanning).
+        the current path (with cooldown and minimum count to prevent false triggers).
 
         Args:
             msg: LaserScan message
@@ -663,14 +664,25 @@ class DStarNavigator(Node):
         obstacles_detected = self.detect_obstacles_in_path(msg)
 
         if obstacles_detected:
-            current_time = self.get_clock().now()
-            time_since_last_replan = (current_time - self.last_replan_time).nanoseconds / 1e9
+            # Count consecutive detections to filter noise
+            if not hasattr(self, '_obstacle_detection_count'):
+                self._obstacle_detection_count = 0
+            self._obstacle_detection_count += 1
 
-            # Respect cooldown period
-            if time_since_last_replan > PlannerConstants.REPLAN_COOLDOWN:
-                self.get_logger().warn(f'Obstacle in path ahead! Triggering replanning...')
-                self.replanning_needed = True
-                self.last_replan_time = current_time
+            # Only trigger if we've detected obstacles multiple times consecutively
+            if self._obstacle_detection_count >= PlannerConstants.MIN_OBSTACLES_TO_REPLAN:
+                current_time = self.get_clock().now()
+                time_since_last_replan = (current_time - self.last_replan_time).nanoseconds / 1e9
+
+                # Respect cooldown period
+                if time_since_last_replan > PlannerConstants.REPLAN_COOLDOWN:
+                    self.get_logger().warn(f'Obstacle in path ahead! Triggering replanning...')
+                    self.replanning_needed = True
+                    self.last_replan_time = current_time
+                    self._obstacle_detection_count = 0
+        else:
+            # Reset counter when no obstacles detected
+            self._obstacle_detection_count = 0
 
     def map_callback(self, msg: OccupancyGrid):
         """
@@ -729,13 +741,20 @@ class DStarNavigator(Node):
         # Update grid_base to reflect current SLAM state (add AND remove)
         self._update_dynamic_grid_with_slam(current_slam_obstacles)
 
-        # Check if replanning needed
-        if newly_discovered > 0 and self.optimistic_planning and self.path:
-            if self._check_path_blocked_by_obstacles(current_slam_obstacles):
-                # Clear known obstacles - new SLAM discoveries
-                self.known_obstacles.clear()
-                self._log_replanning_trigger('Newly discovered SLAM obstacles', newly_discovered)
-                self.replanning_needed = True
+        # Check if replanning needed - require significant new discoveries
+        min_new_obstacles = 5  # Require at least this many new obstacles to consider replanning
+        if newly_discovered >= min_new_obstacles and self.optimistic_planning and self.path:
+            # Also check cooldown for SLAM-triggered replanning
+            current_time = self.get_clock().now()
+            time_since_last_replan = (current_time - self.last_replan_time).nanoseconds / 1e9
+
+            if time_since_last_replan > PlannerConstants.REPLAN_COOLDOWN:
+                if self._check_path_blocked_by_obstacles(current_slam_obstacles):
+                    # Clear known obstacles - new SLAM discoveries
+                    self.known_obstacles.clear()
+                    self._log_replanning_trigger('Newly discovered SLAM obstacles', newly_discovered)
+                    self.replanning_needed = True
+                    self.last_replan_time = current_time
 
         self.map_received = True
 
