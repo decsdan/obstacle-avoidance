@@ -316,7 +316,7 @@ class DStarLite:
         """
         return k1[0] < k2[0] or (k1[0] == k2[0] and k1[1] < k2[1])
 
-    def extract_path(self):
+    def extract_path(self, debug=False):
         """
         Extract path from start to goal by following gradient of g-values.
 
@@ -327,6 +327,8 @@ class DStarLite:
             List of states [(x, y), ...] from start to goal, or [] if no path
         """
         if self.g[self.start] == float('inf'):
+            if debug:
+                print(f'[DEBUG] extract_path failed: g[start] = inf')
             return []  # No path exists
 
         path = [self.start]
@@ -336,10 +338,14 @@ class DStarLite:
 
         while current != self.goal:
             if len(path) > max_iterations:
+                if debug:
+                    print(f'[DEBUG] extract_path failed: loop detected at {current}')
                 return []  # Loop detected
 
             neighbors = self.get_neighbors(current)
             if not neighbors:
+                if debug:
+                    print(f'[DEBUG] extract_path failed: dead end at {current}, no valid neighbors')
                 return []  # Dead end
 
             # Find valid neighbors not yet visited
@@ -349,6 +355,11 @@ class DStarLite:
             ]
 
             if not valid_neighbors:
+                if debug:
+                    all_neighbor_g = [(n, self.g[n]) for n in neighbors]
+                    print(f'[DEBUG] extract_path failed: no valid moves from {current}')
+                    print(f'[DEBUG]   All neighbors and g-values: {all_neighbor_g}')
+                    print(f'[DEBUG]   Already visited: {[n for n in neighbors if n in visited]}')
                 return []  # No valid moves
 
             # Move to neighbor with lowest g-value
@@ -356,6 +367,8 @@ class DStarLite:
 
             # Safety: don't go uphill (except for floating point errors)
             if min_g > self.g[current] + 0.01 and next_state != self.goal:
+                if debug:
+                    print(f'[DEBUG] extract_path failed: going uphill from {current} (g={self.g[current]}) to {next_state} (g={min_g})')
                 return []  # Path is not optimal
 
             visited.add(next_state)
@@ -1699,11 +1712,12 @@ class DStarNavigator(Node):
             self._debug_unreachable_start(start_grid, goal_grid)
             return []
 
-        # Extract new path
-        path = self.dstar_planner.extract_path()
+        # Extract new path (with debug logging)
+        path = self.dstar_planner.extract_path(debug=True)
         if not path:
-            self.get_logger().error('D* Lite failed to extract path - path is blocked')
-            return []
+            self.get_logger().warn('D* Lite incremental extract failed - trying fresh reinitialization...')
+            # Fallback: reinitialize D* Lite completely
+            return self._reinitialize_dstar(start_grid, goal_grid)
 
         self.get_logger().info(f'D* Lite replanning successful: {len(path)} waypoints')
         return path
@@ -1734,6 +1748,48 @@ class DStarNavigator(Node):
                     changed_cells.append((x, y))
 
         return changed_cells
+
+    def _reinitialize_dstar(self, start_grid, goal_grid):
+        """
+        Reinitialize D* Lite planner from scratch.
+
+        This is a fallback when incremental replanning fails due to
+        corrupted internal state. Creates a fresh planner with current grid.
+
+        Args:
+            start_grid: Start position
+            goal_grid: Goal position
+
+        Returns:
+            Path or [] if still fails
+        """
+        self.get_logger().info('Reinitializing D* Lite planner from scratch...')
+
+        # Clear robot area in grid first
+        start_x, start_y = start_grid
+        self._clear_robot_area(start_x, start_y)
+
+        # Create fresh planner
+        self.dstar_planner = DStarLite(self.grid_dynamic.copy(), start_grid, goal_grid)
+        self.planner_grid_snapshot = self.grid_base.copy() if self.grid_base is not None else self.grid.copy()
+
+        # Compute path
+        if not self.dstar_planner.compute_shortest_path():
+            self.get_logger().error('Fresh D* Lite also failed to find path')
+            return []
+
+        if self.dstar_planner.g[start_grid] == float('inf'):
+            self.get_logger().error('Start still unreachable after reinitialization')
+            self._debug_unreachable_start(start_grid, goal_grid)
+            return []
+
+        path = self.dstar_planner.extract_path(debug=True)
+        if path:
+            self.get_logger().info(f'Fresh D* Lite found path with {len(path)} waypoints')
+        else:
+            self.get_logger().error('Fresh D* Lite also failed to extract path')
+
+        return path
 
     def _debug_unreachable_start(self, start_grid, goal_grid):
         """Debug helper to understand why start is unreachable."""
