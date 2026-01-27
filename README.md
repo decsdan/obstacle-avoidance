@@ -43,8 +43,17 @@ In terminal 1 run:
 ```bash
 ros2 launch turtlebot4_navigation slam.launch.py namespace:=/don
 ```
+### 4. Running Rviz on Physical Robot
 
 In terminal 2 run:
+
+```bash
+ros2 launch turtlebot4_navigation nav2.launch.py namespace:=/don
+```
+
+### 5. Running Rviz on Physical Robot
+
+In terminal 3 run:
 
 ```bash
 ros2 launch turtlebot4_viz view_navigation.launch.py namespace:=/don
