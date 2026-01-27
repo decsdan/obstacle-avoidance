@@ -505,6 +505,7 @@ class DStarNavigator(Node):
         self.goal_grid = None
         self.planner_grid_snapshot = None  # Snapshot for change detection
         self.known_obstacles = set()       # Track obstacles already replanned for
+        self.lidar_obstacles_along_path = []  # Lidar detections that are along the path (for visualization)
 
         # Control parameters
         self.linear_speed = 0.2
@@ -1030,9 +1031,10 @@ class DStarNavigator(Node):
         Detect obstacles using lidar and check if they block the path.
 
         Processing pipeline:
-        1. Process lidar scan to get obstacle positions
-        2. Update grid_dynamic with lidar obstacles at actual positions
-        3. Check if obstacles block upcoming path segments
+        1. Process lidar scan to get obstacles along the path
+        2. Store for visualization
+        3. Update grid_dynamic with lidar obstacles
+        4. Check if obstacles block upcoming path segments
 
         Args:
             scan_msg: LaserScan message
@@ -1041,14 +1043,18 @@ class DStarNavigator(Node):
             True if obstacles block the path, False otherwise
         """
         if self.current_waypoint_idx >= len(self.path):
+            self.lidar_obstacles_along_path = []  # Clear when no path
             return False
 
         robot_grid = self.world_to_grid(self.current_pose['x'], self.current_pose['y'])
         robot_gx, robot_gy = robot_grid
         robot_theta = self.current_pose['theta']
 
-        # Process lidar scan to detect valid obstacles
+        # Process lidar scan to detect obstacles along the path
         detected_obstacles = self._process_lidar_scan(scan_msg, robot_gx, robot_gy, robot_theta)
+
+        # Store for visualization (these are specifically obstacles along the path)
+        self.lidar_obstacles_along_path = detected_obstacles.copy()
 
         if not detected_obstacles:
             return False
@@ -1061,16 +1067,14 @@ class DStarNavigator(Node):
 
     def _process_lidar_scan(self, scan_msg, robot_gx, robot_gy, robot_theta):
         """
-        Process lidar scan to detect valid obstacles within 1 meter radius area.
+        Process lidar scan using ray-marching to detect obstacles along the path.
 
-        Detection method:
-        - Scans all grid cells within 1 meter radius of robot
-        - Checks lidar readings to confirm/detect obstacles in that area
-        - Returns all obstacles found in the circular area
+        For each lidar ray, marches along the ray checking all grid cells to see if:
+        1. The cell contains an obstacle in grid_dynamic (from SLAM or previous detection)
+        2. The cell is along the planned path
 
-        Filters out:
-        - Robot body detections
-        - Static map obstacles
+        This detects SLAM obstacles that the lidar ray passes through, even if the
+        lidar didn't physically hit them at that exact point.
 
         Args:
             scan_msg: LaserScan message
@@ -1078,85 +1082,189 @@ class DStarNavigator(Node):
             robot_theta: Robot orientation in radians
 
         Returns:
-            List of obstacle positions [(gx, gy), ...]
+            List of obstacle positions [(gx, gy), ...] that are along the path
         """
-        detected_obstacles = []
+        obstacles_along_path = []
         detected_set = set()  # Avoid duplicates
 
-        # Detection radius in meters and cells
-        detection_radius_meters = 1.0
-        detection_radius_cells = int(detection_radius_meters / self.resolution)
+        # Get path segments to check against
+        path_segments = self._get_upcoming_path_segments(robot_gx, robot_gy)
+        if not path_segments:
+            return []
 
-        # First, process lidar hits within the detection radius
+        # Process each lidar reading with ray-marching
         angle = scan_msg.angle_min
         for range_val in scan_msg.ranges:
-            # Only process readings within our detection radius
-            if (self._is_valid_lidar_reading(range_val, scan_msg) and
-                range_val <= detection_radius_meters):
+            # Get the ray length (use max range if invalid reading)
+            if self._is_valid_lidar_reading(range_val, scan_msg):
+                ray_length = range_val
+            else:
+                # Skip invalid readings entirely
+                angle += scan_msg.angle_increment
+                continue
 
-                # Convert to world coordinates
-                obstacle_world = self._lidar_to_world(
-                    range_val, angle, self.current_pose['x'],
-                    self.current_pose['y'], robot_theta
-                )
+            # Ray-march along this lidar ray
+            ray_obstacles = self._ray_march_for_obstacles(
+                robot_gx, robot_gy, robot_theta, angle, ray_length,
+                path_segments, detected_set
+            )
 
-                # Convert to grid coordinates
-                grid_pos = self.world_to_grid(obstacle_world[0], obstacle_world[1])
-                gx, gy = grid_pos
-
-                # Check bounds and not robot body
-                if (0 <= gx < self.grid_dynamic.shape[1] and
-                    0 <= gy < self.grid_dynamic.shape[0]):
-                    dist_from_robot = math.sqrt((gx - robot_gx)**2 + (gy - robot_gy)**2)
-                    if dist_from_robot >= PlannerConstants.ROBOT_BODY_RADIUS_CELLS:
-                        if grid_pos not in detected_set:
-                            detected_set.add(grid_pos)
-                            detected_obstacles.append(grid_pos)
+            for obs in ray_obstacles:
+                if obs not in detected_set:
+                    detected_set.add(obs)
+                    obstacles_along_path.append(obs)
 
             angle += scan_msg.angle_increment
 
-        # Second, scan the grid area within detection radius for any obstacles
-        # This catches obstacles from SLAM/previous scans that lidar might not currently see
-        for dy in range(-detection_radius_cells, detection_radius_cells + 1):
-            for dx in range(-detection_radius_cells, detection_radius_cells + 1):
-                gx = robot_gx + dx
-                gy = robot_gy + dy
-
-                # Check if within circular radius (not just square)
-                dist_from_robot = math.sqrt(dx**2 + dy**2)
-                if dist_from_robot > detection_radius_cells:
-                    continue
-
-                # Filter robot body
-                if dist_from_robot < PlannerConstants.ROBOT_BODY_RADIUS_CELLS:
-                    continue
-
-                # Check bounds
-                if not (0 <= gx < self.grid_dynamic.shape[1] and
-                        0 <= gy < self.grid_dynamic.shape[0]):
-                    continue
-
-                # Check if obstacle in dynamic grid (but not in original static map)
-                grid_pos = (gx, gy)
-                if grid_pos not in detected_set:
-                    if self.grid_dynamic[gy, gx] != 0:
-                        # Only add if it's a dynamic obstacle (not static)
-                        if not self._is_near_static_obstacle(gx, gy, PlannerConstants.STATIC_OBSTACLE_TOLERANCE):
-                            detected_set.add(grid_pos)
-                            detected_obstacles.append(grid_pos)
-
-        # Periodic debug logging
+        # Debug logging
         if hasattr(self, '_lidar_debug_counter'):
             self._lidar_debug_counter += 1
         else:
             self._lidar_debug_counter = 0
 
-        if self._lidar_debug_counter % 50 == 0:
+        if self._lidar_debug_counter % 50 == 0 and obstacles_along_path:
             self.get_logger().debug(
-                f'Area scan (r={detection_radius_meters}m): {len(detected_obstacles)} obstacles detected'
+                f'Ray-march detected {len(obstacles_along_path)} obstacles along path'
             )
 
-        return detected_obstacles
+        return obstacles_along_path
+
+    def _ray_march_for_obstacles(self, robot_gx, robot_gy, robot_theta, angle, ray_length, path_segments, detected_set):
+        """
+        March along a lidar ray checking for obstacles in grid_dynamic that are along the path.
+
+        Uses Bresenham-style stepping to check each grid cell along the ray.
+
+        Args:
+            robot_gx, robot_gy: Robot position in grid
+            robot_theta: Robot orientation
+            angle: Lidar ray angle (relative to robot)
+            ray_length: Length of ray in meters
+            path_segments: Path segments to check against
+            detected_set: Set of already detected obstacles (to avoid duplicates)
+
+        Returns:
+            List of obstacle positions [(gx, gy), ...] found along this ray
+        """
+        obstacles_found = []
+
+        # Calculate ray direction in world frame
+        world_angle = robot_theta + angle
+
+        # Step size in meters (use resolution for grid-aligned stepping)
+        step_size = self.resolution * 0.5  # Half-cell steps for better coverage
+        num_steps = int(ray_length / step_size)
+
+        # March along the ray
+        for step in range(1, num_steps + 1):  # Start at 1 to skip robot position
+            distance = step * step_size
+
+            # Calculate world position along ray
+            world_x = self.current_pose['x'] + distance * math.cos(world_angle)
+            world_y = self.current_pose['y'] + distance * math.sin(world_angle)
+
+            # Convert to grid
+            gx, gy = self.world_to_grid(world_x, world_y)
+
+            # Check bounds
+            if not (0 <= gx < self.grid_dynamic.shape[1] and
+                    0 <= gy < self.grid_dynamic.shape[0]):
+                continue
+
+            # Skip cells too close to robot (robot body)
+            dist_from_robot = math.sqrt((gx - robot_gx)**2 + (gy - robot_gy)**2)
+            if dist_from_robot < PlannerConstants.ROBOT_BODY_RADIUS_CELLS:
+                continue
+
+            # Skip static obstacles from original map
+            if self._is_near_static_obstacle(gx, gy, PlannerConstants.STATIC_OBSTACLE_TOLERANCE):
+                continue
+
+            grid_pos = (gx, gy)
+
+            # Check if this cell has an obstacle in dynamic grid AND is along the path
+            if grid_pos not in detected_set:
+                if self.grid_dynamic[gy, gx] != 0 and self._is_point_along_path(gx, gy, path_segments):
+                    obstacles_found.append(grid_pos)
+                    # Once we find an obstacle along this ray, we can stop
+                    # (the ray would be blocked by it)
+                    break
+
+        # Also check the endpoint (where lidar actually hit)
+        end_world = self._lidar_to_world(
+            ray_length, angle, self.current_pose['x'],
+            self.current_pose['y'], robot_theta
+        )
+        end_gx, end_gy = self.world_to_grid(end_world[0], end_world[1])
+
+        if (0 <= end_gx < self.grid_dynamic.shape[1] and
+            0 <= end_gy < self.grid_dynamic.shape[0]):
+            dist_from_robot = math.sqrt((end_gx - robot_gx)**2 + (end_gy - robot_gy)**2)
+            end_pos = (end_gx, end_gy)
+
+            if (dist_from_robot >= PlannerConstants.ROBOT_BODY_RADIUS_CELLS and
+                not self._is_near_static_obstacle(end_gx, end_gy, PlannerConstants.STATIC_OBSTACLE_TOLERANCE) and
+                end_pos not in detected_set and
+                self._is_point_along_path(end_gx, end_gy, path_segments)):
+                obstacles_found.append(end_pos)
+
+        return obstacles_found
+
+    def _get_upcoming_path_segments(self, robot_gx, robot_gy):
+        """
+        Get the upcoming path segments to check for obstacles.
+
+        Returns:
+            List of segment tuples: [((start_gx, start_gy), (end_gx, end_gy)), ...]
+        """
+        if not self.path or self.current_waypoint_idx >= len(self.path):
+            return []
+
+        segments = []
+        num_segments = min(PlannerConstants.LOOKAHEAD_SEGMENTS,
+                          len(self.path) - self.current_waypoint_idx)
+
+        for i in range(self.current_waypoint_idx, self.current_waypoint_idx + num_segments):
+            if i >= len(self.path):
+                break
+
+            # Get segment start
+            if i == self.current_waypoint_idx:
+                start_gx, start_gy = robot_gx, robot_gy
+            else:
+                prev_wp = self.path[i - 1]
+                start_gx, start_gy = self.world_to_grid(prev_wp[0], prev_wp[1])
+
+            # Get segment end
+            end_wp = self.path[i]
+            end_gx, end_gy = self.world_to_grid(end_wp[0], end_wp[1])
+
+            segments.append(((start_gx, start_gy), (end_gx, end_gy)))
+
+        return segments
+
+    def _is_point_along_path(self, gx, gy, path_segments):
+        """
+        Check if a point is along any of the path segments.
+
+        Uses the robot footprint as the threshold for "along the path".
+
+        Args:
+            gx, gy: Point to check
+            path_segments: List of ((start_gx, start_gy), (end_gx, end_gy)) tuples
+
+        Returns:
+            True if point is within blocking threshold of any segment
+        """
+        # Use robot footprint as threshold
+        blocking_threshold = int((self.robot_radius + self.safety_clearance) / self.resolution)
+
+        for (start_gx, start_gy), (end_gx, end_gy) in path_segments:
+            dist = self._point_to_segment_distance(gx, gy, start_gx, start_gy, end_gx, end_gy)
+            if dist <= blocking_threshold:
+                return True
+
+        return False
 
     def _is_valid_lidar_reading(self, range_val, scan_msg):
         """
@@ -2126,6 +2234,20 @@ class DStarNavigator(Node):
         unknown_marker.color = ColorRGBA(r=0.5, g=0.5, b=0.5, a=0.3)  # Gray, semi-transparent
         unknown_marker.pose.orientation.w = 1.0
 
+        # 6. Lidar obstacles along path (bright green) - what lidar sees on the path
+        path_obstacle_marker = Marker()
+        path_obstacle_marker.header.stamp = stamp
+        path_obstacle_marker.header.frame_id = 'map'
+        path_obstacle_marker.ns = 'lidar_along_path'
+        path_obstacle_marker.id = 5
+        path_obstacle_marker.type = Marker.CUBE_LIST
+        path_obstacle_marker.action = Marker.ADD
+        path_obstacle_marker.scale.x = self.resolution * 1.2  # Slightly larger to stand out
+        path_obstacle_marker.scale.y = self.resolution * 1.2
+        path_obstacle_marker.scale.z = 0.3  # Taller to stand out
+        path_obstacle_marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)  # Bright green
+        path_obstacle_marker.pose.orientation.w = 1.0
+
         # Iterate through grid and categorize obstacles
         rows, cols = self.grid_dynamic.shape
         for gy in range(rows):
@@ -2158,6 +2280,13 @@ class DStarNavigator(Node):
                     # Unknown/unexplored area (shown as passable but unexplored)
                     unknown_marker.points.append(point)
 
+        # Add lidar obstacles along path (stored separately from grid scan)
+        for gx, gy in self.lidar_obstacles_along_path:
+            world_x = gx * self.resolution + self.origin[0]
+            world_y = gy * self.resolution + self.origin[1]
+            point = Point(x=world_x, y=world_y, z=0.0)
+            path_obstacle_marker.points.append(point)
+
         # Add markers to array (only if they have points)
         if static_marker.points:
             marker_array.markers.append(static_marker)
@@ -2169,6 +2298,8 @@ class DStarNavigator(Node):
             marker_array.markers.append(lidar_marker)
         if unknown_marker.points:
             marker_array.markers.append(unknown_marker)
+        if path_obstacle_marker.points:
+            marker_array.markers.append(path_obstacle_marker)
 
         # Publish marker array
         self.grid_markers_pub.publish(marker_array)
