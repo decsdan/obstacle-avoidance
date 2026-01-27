@@ -44,6 +44,8 @@ class LidarSubscriber(Node):
             self.initialize_screen(len(msg.ranges))
         for i in range(len(msg.ranges)):
             color = tuple([round((msg.ranges[i] - msg.range_min) / msg.range_max * 255) if msg.ranges[i] < msg.range_max else 255] * 3)
+            self.get_logger().info(str(color))
+            
             pygame.draw.rect(self.window, color, pygame.rect.Rect(i, 0, 1, 100))
         pygame.display.flip()
         
