@@ -34,7 +34,7 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p stamped:=true
 
 ```
 
-### 3. Running Slam on Physical Robot
+### 4. Running Slam on Physical Robot
 
 Open two terminals and follow the previous step (configure) in each.
 
@@ -43,7 +43,7 @@ In terminal 1 run:
 ```bash
 ros2 launch turtlebot4_navigation slam.launch.py namespace:=/don
 ```
-### 4. Running Rviz on Physical Robot
+### 5. Running Nav2 on Physical Robot
 
 In terminal 2 run:
 
@@ -51,7 +51,7 @@ In terminal 2 run:
 ros2 launch turtlebot4_navigation nav2.launch.py namespace:=/don
 ```
 
-### 5. Running Rviz on Physical Robot
+### 6. Running Rviz on Physical Robot
 
 In terminal 3 run:
 
