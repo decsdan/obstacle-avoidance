@@ -170,6 +170,29 @@ ros2 run d_star live_visualizer
 Autonomous navigation using Jump Point Search algorithm with optimized pathfinding through uniform-cost grids.
 
 
+```bash
+cd ~/obstacle-avoidance-comps/ros2_ws
+colcon build --packages-select jps
+source /opt/ros/jazzy/setup.bash
+source install/local_setup.bash
+
+# Run JPS navigator (gazebo prompts for goal coordinates)
+ros2 run jps jps_nav
+
+# With custom safety parameters
+ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.20 ros2 run jps jps_nav
+
+# Run interactive visualizer
+ros2 run jps jps_visualizer
+
+# Monitor robot position
+ros2 run jps odom
+```
+
+**Features:**
+- Interactive goal input via terminal
+- Jump Point Search optimization for uniform-cost grids
+- Hybrid obstacle validation (tight spaces + safety margins)
 
 
 ### DWA Navigator
@@ -272,54 +295,6 @@ ros2 run dwa_package dwa_node --ros-args \
     -p weights.obstacle:=0.5 \
     -p max_velocity:=0.5
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-```bash
-cd ~/obstacle-avoidance-comps/ros2_ws
-colcon build --packages-select jps
-source /opt/ros/jazzy/setup.bash
-source install/local_setup.bash
-
-# Run JPS navigator (gazebo prompts for goal coordinates)
-ros2 run jps jps_nav
-
-# With custom safety parameters
-ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.20 ros2 run jps jps_nav
-
-# Run interactive visualizer
-ros2 run jps jps_visualizer
-
-# Monitor robot position
-ros2 run jps odom
-```
-
-**Features:**
-- Interactive goal input via terminal
-- Jump Point Search optimization for uniform-cost grids
-- Hybrid obstacle validation (tight spaces + safety margins)
-```
-
 ---
 ## Using Saved Maps with Localization and Navigation
 
