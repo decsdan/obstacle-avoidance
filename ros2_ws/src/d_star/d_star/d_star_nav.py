@@ -18,9 +18,9 @@ Architecture:
     - DStarNavigator: ROS2 node integrating planning, sensing, and control
 
 Grid Hierarchy:
-    - grid_original: Raw static map (no inflation)
-    - grid: Inflated static map (static obstacles + safety buffer)
-    - grid_base: Accumulated SLAM obstacles + static map (persistent)
+    - grid_original: Raw SLAM map (no inflation)
+    - grid: Inflated SLAM map (obstacles + safety buffer)
+    - grid_base: Accumulated SLAM obstacles (persistent)
     - grid_dynamic: Current planning grid = base + lidar obstacles (temporary)
 
 Authors: Devin Dennis, Assisted with Claude Code
@@ -35,8 +35,6 @@ from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA
 import numpy as np
-import yaml
-from PIL import Image
 import heapq
 import math
 import os
@@ -59,17 +57,17 @@ class PlannerConstants:
     """
 
     # -------- Robot Physical Parameters (meters) --------
+    NAMESPACE = '/don'          # Name of the physical robot
     ROBOT_RADIUS = 0.22           # Physical radius of the robot body
     SAFETY_CLEARANCE = 0.0001      # Extra safety buffer around obstacles
                                   # Total inflation = ROBOT_RADIUS + SAFETY_CLEARANCE
-    NAMESPACE = '/don'
 
     # -------- Lidar Obstacle Detection (meters) --------
     LIDAR_MIN_RANGE = 0.1         # Ignore readings closer than this (robot body/noise)
     LIDAR_MAX_RANGE = 3.0         # Only detect obstacles up to this distance
 
     # -------- Grid Cell Tolerances (cells) --------
-    STATIC_OBSTACLE_TOLERANCE = 2     # Cells to check for static obstacle filtering
+    KNOWN_OBSTACLE_TOLERANCE = 2     # Cells to check for known SLAM obstacle filtering
     NEARBY_OBSTACLE_TOLERANCE = 2     # Tolerance for coordinate transform errors
     PATH_CHECK_RADIUS = 3             # Cells around waypoint to check
     ROBOT_BODY_RADIUS_CELLS = 3       # Min distance from robot (self-detection filter)
@@ -88,10 +86,6 @@ class PlannerConstants:
     INFLATION_DIVISOR = 5         # Reduce inflation for dynamic obstacles
     MAX_WAYPOINTS = 10
 
-    # -------- Map Mode --------
-    USE_STATIC_MAP = False        # If False, only use SLAM data (no pre-built map)
-                                  # Unknown areas treated as free for exploration
-
     # Publishing/Subscribing Paths
     CMD_VEL = f'{NAMESPACE}/cmd_vel'
     ODOMETRY = f'{NAMESPACE}/odom'
@@ -101,10 +95,6 @@ class PlannerConstants:
     DYNAMIC_GRID = f'{NAMESPACE}/dynamic_grid'
     GOAL_POSE = f'{NAMESPACE}/goal_pose'
     GRID_MARKERS = f'{NAMESPACE}/grid_markers'
-
-    # Pgm and yaml paths
-    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olin304.yaml'
-    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/olin304.pgm'
 
 
 
@@ -442,9 +432,9 @@ class DStarNavigator(Node):
         CONSERVATIVE: Only plans through known free space - good for navigation
 
     Grid Hierarchy:
-        1. grid_original: Raw static map (0=free, 1=occupied, no inflation)
-        2. grid: Static map with safety inflation (planning baseline)
-        3. grid_base: Accumulated SLAM obstacles + static (persistent)
+        1. grid_original: Raw SLAM map (0=free, 1=occupied, no inflation)
+        2. grid: SLAM map with safety inflation (planning baseline)
+        3. grid_base: Accumulated SLAM obstacles (persistent)
         4. grid_dynamic: grid_base + lidar obstacles (current planning grid)
 
     Replanning Triggers:
@@ -483,9 +473,9 @@ class DStarNavigator(Node):
         self._setup_subscribers()
 
         # Map data - Grid hierarchy (see class docstring)
-        self.grid = None              # Inflated static map
-        self.grid_original = None     # Original uninflated map
-        self.grid_base = None         # Static + SLAM obstacles (persistent)
+        self.grid = None              # Inflated SLAM map
+        self.grid_original = None     # Original uninflated SLAM map
+        self.grid_base = None         # SLAM obstacles (persistent)
         self.grid_dynamic = None      # grid_base + lidar obstacles (current)
         self.grid_slam = None         # SLAM map for comparison
         self.grid_unknown = None      # Track unexplored cells
@@ -519,15 +509,8 @@ class DStarNavigator(Node):
         # Control loop timer (10 Hz)
         self.control_timer = self.create_timer(0.1, self.control_loop)
 
-        # Load static map only if enabled
-        self.use_static_map = PlannerConstants.USE_STATIC_MAP
-        if self.use_static_map:
-            yaml_file = os.path.expanduser(PlannerConstants.SLAM_MAP_YAML)
-            pgm_file = os.path.expanduser(PlannerConstants.SLAM_MAP_PGM)
-            self.load_map(yaml_file, pgm_file)
-        else:
-            self.get_logger().info('Static map DISABLED - using SLAM-only mode')
-            self.get_logger().info('Grid will be initialized from first SLAM message')
+        self.get_logger().info('Using SLAM-only mode')
+        self.get_logger().info('Grid will be initialized from first SLAM message')
 
         self._log_initialization()
 
@@ -601,12 +584,8 @@ class DStarNavigator(Node):
         self.get_logger().info(f'Robot radius: {self.robot_radius}m, Safety: {self.safety_clearance}m, Total: {total_inflation}m')
         self.get_logger().info(f'Listening for goal poses on: {PlannerConstants.GOAL_POSE}')
 
-        # Log map mode
-        if self.use_static_map:
-            self.get_logger().info('MAP MODE: Static map + SLAM overlay')
-        else:
-            self.get_logger().info('MAP MODE: SLAM-only (no static map)')
-            self.get_logger().info('  -> Unknown areas treated as FREE for exploration')
+        self.get_logger().info('MAP MODE: SLAM-only')
+        self.get_logger().info('  -> Unknown areas treated as FREE for exploration')
 
         if self.use_live_slam:
             self.get_logger().info('Using LIVE SLAM map from /map topic')
@@ -614,50 +593,8 @@ class DStarNavigator(Node):
             self.get_logger().info(f'{mode} PLANNING enabled')
 
     # ========================================================================
-    # MAP LOADING AND PROCESSING
+    # MAP PROCESSING
     # ========================================================================
-
-    def load_map(self, yaml_file, pgm_file):
-        """
-        Load static map from YAML and PGM files.
-
-        Args:
-            yaml_file: Path to YAML metadata file
-            pgm_file: Path to PGM image file
-        """
-        try:
-            # Load map metadata
-            with open(yaml_file, 'r') as f:
-                map_data = yaml.safe_load(f)
-
-            self.resolution = map_data['resolution']
-            self.origin = map_data['origin']
-
-            # Load occupancy grid image
-            img = Image.open(pgm_file)
-            occupancy_grid = np.array(img)
-
-            # Convert to binary (0=free, 1=occupied)
-            self.grid = np.zeros_like(occupancy_grid)
-            self.grid[occupancy_grid < 250] = 1  # Dark pixels = occupied
-            self.grid[occupancy_grid >= 250] = 0  # Light pixels = free
-            self.grid = np.flipud(self.grid)  # Flip Y-axis for ROS convention
-
-            # Save original for validation
-            self.grid_original = self.grid.copy()
-
-            # Inflate obstacles for safety
-            total_inflation = self.robot_radius + self.safety_clearance
-            self.grid = self._inflate_obstacles(self.grid_original, total_inflation)
-
-            # Initialize grid hierarchy
-            self.grid_base = self.grid.copy()      # Start with inflated static
-            self.grid_dynamic = self.grid.copy()   # Dynamic starts same as base
-
-            self.get_logger().info(f'Map loaded: {self.grid.shape}, resolution: {self.resolution}m')
-            self.get_logger().info(f'Obstacles inflated by {total_inflation}m')
-        except Exception as e:
-            self.get_logger().error(f'Failed to load map: {e}')
 
     def _inflate_obstacles(self, grid, inflation_radius):
         """
@@ -729,8 +666,8 @@ class DStarNavigator(Node):
         Integrates SLAM-discovered obstacles into the planning grid and
         triggers replanning if they block the current path.
 
-        When USE_STATIC_MAP is False, this initializes and maintains the
-        entire grid from SLAM data, treating unknown areas as free.
+        Initializes and maintains the entire grid from SLAM data,
+        treating unknown areas as free.
 
         Args:
             msg: OccupancyGrid message from SLAM
@@ -753,8 +690,8 @@ class DStarNavigator(Node):
         slam_grid = np.zeros((height, width), dtype=np.int8)
         slam_grid[occupancy_data >= 50] = 1  # Occupied if >50% probability
 
-        # SLAM-only mode: Initialize grids from SLAM on first message
-        if not self.use_static_map and self.grid_original is None:
+        # Initialize grids from SLAM on first message
+        if self.grid_original is None:
             self._initialize_grids_from_slam(height, width, slam_resolution, slam_origin)
             self.get_logger().info(
                 f'Initialized grid from SLAM: {width}x{height}, '
@@ -770,19 +707,11 @@ class DStarNavigator(Node):
         self.grid_slam = slam_grid.copy()
         self.grid_unknown = np.zeros_like(self.grid_original, dtype=np.int8)
 
-        # Handle SLAM-only mode vs static map mode
-        if self.use_static_map:
-            # Detect obstacles not in static map
-            current_slam_obstacles, newly_discovered = self._detect_slam_obstacles(
-                slam_grid, unknown_mask, slam_resolution, slam_origin,
-                height, width, previous_unknown
-            )
-        else:
-            # SLAM-only mode: Use SLAM obstacles directly (mapped to our grid)
-            current_slam_obstacles, newly_discovered = self._map_slam_to_grid(
-                slam_grid, unknown_mask, slam_resolution, slam_origin,
-                height, width, previous_unknown
-            )
+        # Use SLAM obstacles directly (mapped to our grid)
+        current_slam_obstacles, newly_discovered = self._map_slam_to_grid(
+            slam_grid, unknown_mask, slam_resolution, slam_origin,
+            height, width, previous_unknown
+        )
 
         # Update grid_base to reflect current SLAM state (add AND remove)
         self._update_dynamic_grid_with_slam(current_slam_obstacles)
@@ -829,10 +758,9 @@ class DStarNavigator(Node):
     def _map_slam_to_grid(self, slam_grid, unknown_mask, slam_resolution, slam_origin,
                           height, width, previous_unknown):
         """
-        Map SLAM obstacles directly to our grid (SLAM-only mode).
+        Map SLAM obstacles directly to our grid.
 
-        Unlike _detect_slam_obstacles which filters against static map,
-        this directly maps all SLAM obstacles. Unknown areas remain free
+        Maps all SLAM obstacles to the planning grid. Unknown areas remain free
         to allow exploration pathfinding.
 
         Args:
@@ -876,57 +804,6 @@ class DStarNavigator(Node):
 
         return obstacles_grid, newly_discovered_count
 
-    def _detect_slam_obstacles(self, slam_grid, unknown_mask, slam_resolution, slam_origin,
-                                height, width, previous_unknown):
-        """
-        Detect new obstacles from SLAM map.
-
-        Compares SLAM map with static map to find obstacles that weren't in
-        the original map. Tracks which ones are newly discovered from unknown
-        areas.
-
-        Args:
-            slam_grid: SLAM occupancy grid (0=free, 1=occupied)
-            unknown_mask: Boolean mask of unknown cells
-            slam_resolution: SLAM map resolution
-            slam_origin: SLAM map origin [x, y]
-            height, width: SLAM map dimensions
-            previous_unknown: Previous unknown mask (for tracking discoveries)
-
-        Returns:
-            Tuple (new_obstacles_grid, newly_discovered_count)
-        """
-        new_obstacles_grid = np.zeros_like(self.grid_original, dtype=np.int8)
-        newly_discovered_count = 0
-
-        for slam_y in range(height):
-            for slam_x in range(width):
-                # Convert SLAM coordinates to static grid coordinates
-                world_x = slam_x * slam_resolution + slam_origin[0]
-                world_y = slam_y * slam_resolution + slam_origin[1]
-                static_gx = int((world_x - self.origin[0]) / self.resolution)
-                static_gy = int((world_y - self.origin[1]) / self.resolution)
-
-                # Check bounds
-                if not (0 <= static_gx < self.grid_original.shape[1] and
-                        0 <= static_gy < self.grid_original.shape[0]):
-                    continue
-
-                # Track unknown cells
-                if unknown_mask[slam_y, slam_x]:
-                    self.grid_unknown[static_gy, static_gx] = 1
-
-                # Check for new obstacles (not in static map)
-                if slam_grid[slam_y, slam_x] == 1:
-                    if self.grid_original[static_gy, static_gx] == 0:
-                        new_obstacles_grid[static_gy, static_gx] = 1
-
-                        # Check if newly discovered (was unknown before)
-                        if previous_unknown is not None and previous_unknown[static_gy, static_gx] == 1:
-                            newly_discovered_count += 1
-
-        return new_obstacles_grid, newly_discovered_count
-
     def _update_dynamic_grid_with_slam(self, current_slam_obstacles):
         """
         Update grid_base to reflect current SLAM obstacle state.
@@ -935,14 +812,9 @@ class DStarNavigator(Node):
         AND removing obstacles that SLAM no longer reports. This ensures the
         grid reflects reality when obstacles move or disappear.
 
-        In SLAM-only mode (USE_STATIC_MAP=False):
         - Starts with empty grid (all free)
         - Only SLAM obstacles are marked
         - Unknown areas remain FREE for exploration pathfinding
-
-        In static map mode (USE_STATIC_MAP=True):
-        - Starts with inflated static map
-        - SLAM obstacles are added on top
 
         Args:
             current_slam_obstacles: Binary grid of ALL current SLAM obstacles
@@ -950,8 +822,7 @@ class DStarNavigator(Node):
         # Store previous state to detect changes
         previous_grid_base = self.grid_base.copy() if self.grid_base is not None else None
 
-        # Start with base grid (inflated static map, or empty in SLAM-only mode)
-        # In SLAM-only mode, self.grid is all zeros (free), allowing exploration
+        # Start with base grid (empty initially, allowing exploration)
         self.grid_base = self.grid.copy()
 
         # Add current SLAM obstacles (inflated)
@@ -1176,8 +1047,8 @@ class DStarNavigator(Node):
             if dist_from_robot < PlannerConstants.ROBOT_BODY_RADIUS_CELLS:
                 continue
 
-            # Skip static obstacles from original map
-            if self._is_near_static_obstacle(gx, gy, PlannerConstants.STATIC_OBSTACLE_TOLERANCE):
+            # Skip known SLAM obstacles
+            if self._is_near_known_obstacle(gx, gy, PlannerConstants.KNOWN_OBSTACLE_TOLERANCE):
                 continue
 
             grid_pos = (gx, gy)
@@ -1203,7 +1074,7 @@ class DStarNavigator(Node):
             end_pos = (end_gx, end_gy)
 
             if (dist_from_robot >= PlannerConstants.ROBOT_BODY_RADIUS_CELLS and
-                not self._is_near_static_obstacle(end_gx, end_gy, PlannerConstants.STATIC_OBSTACLE_TOLERANCE) and
+                not self._is_near_known_obstacle(end_gx, end_gy, PlannerConstants.KNOWN_OBSTACLE_TOLERANCE) and
                 end_pos not in detected_set and
                 self._is_point_along_path(end_gx, end_gy, path_segments)):
                 obstacles_found.append(end_pos)
@@ -1313,12 +1184,12 @@ class DStarNavigator(Node):
 
     def _is_valid_obstacle(self, grid_pos, robot_gx, robot_gy):
         """
-        Check if detected obstacle is valid (not noise/static/robot body).
+        Check if detected obstacle is valid (not noise/known/robot body).
 
         Filtering logic:
         1. Check bounds
         2. Filter robot body (too close)
-        3. Filter static obstacles (already in map)
+        3. Filter known SLAM obstacles (already in map)
         4. Special case: Free corridor walls need SLAM confirmation
 
         Args:
@@ -1340,8 +1211,8 @@ class DStarNavigator(Node):
         if dist_from_robot < PlannerConstants.ROBOT_BODY_RADIUS_CELLS:
             return False
 
-        # Filter static obstacles (already in map)
-        if self._is_near_static_obstacle(gx, gy, PlannerConstants.STATIC_OBSTACLE_TOLERANCE):
+        # Filter known SLAM obstacles (already in map)
+        if self._is_near_known_obstacle(gx, gy, PlannerConstants.KNOWN_OBSTACLE_TOLERANCE):
             return False
 
         # Check if completely free in all grids (likely corridor wall)
@@ -1380,9 +1251,9 @@ class DStarNavigator(Node):
             if dist_from_robot < PlannerConstants.ROBOT_BODY_RADIUS_CELLS:
                 reasons.append(f'ROBOT_BODY(dist={dist_from_robot:.1f}<{PlannerConstants.ROBOT_BODY_RADIUS_CELLS})')
 
-            # Check static obstacle filter
-            if self._is_near_static_obstacle(gx, gy, PlannerConstants.STATIC_OBSTACLE_TOLERANCE):
-                reasons.append(f'NEAR_STATIC(tol={PlannerConstants.STATIC_OBSTACLE_TOLERANCE})')
+            # Check known obstacle filter
+            if self._is_near_known_obstacle(gx, gy, PlannerConstants.KNOWN_OBSTACLE_TOLERANCE):
+                reasons.append(f'NEAR_KNOWN(tol={PlannerConstants.KNOWN_OBSTACLE_TOLERANCE})')
 
             # Check completely free filter
             if (0 <= gx < self.grid_original.shape[1] and 0 <= gy < self.grid_original.shape[0]):
@@ -1404,19 +1275,19 @@ class DStarNavigator(Node):
             #     f'angle={angle_deg:.1f}deg, reasons={reasons}'
             # )
 
-    def _is_near_static_obstacle(self, gx, gy, tolerance):
+    def _is_near_known_obstacle(self, gx, gy, tolerance):
         """
-        Check if position is near a static obstacle.
+        Check if position is near a known SLAM obstacle.
 
-        Used to filter out lidar detections that are just seeing static
-        obstacles already in the map.
+        Used to filter out lidar detections that are just seeing obstacles
+        already known from SLAM.
 
         Args:
             gx, gy: Position to check
             tolerance: Search radius in cells
 
         Returns:
-            True if near static obstacle, False otherwise
+            True if near known obstacle, False otherwise
         """
         rows, cols = self.grid_original.shape
 
@@ -1510,7 +1381,7 @@ class DStarNavigator(Node):
                     inflate_x, inflate_y = gx + dx, gy + dy
                     if (0 <= inflate_x < self.grid_dynamic.shape[1] and
                         0 <= inflate_y < self.grid_dynamic.shape[0] and
-                        self.grid[inflate_y, inflate_x] == 0):  # Don't overwrite static
+                        self.grid[inflate_y, inflate_x] == 0):  # Don't overwrite SLAM obstacles
                         # Track if this is a new obstacle
                         if self.grid_dynamic[inflate_y, inflate_x] == 0:
                             changed_cells.append((inflate_x, inflate_y))
@@ -1524,7 +1395,7 @@ class DStarNavigator(Node):
                 free_x, free_y = robot_gx + dx, robot_gy + dy
                 if (0 <= free_x < self.grid_dynamic.shape[1] and
                     0 <= free_y < self.grid_dynamic.shape[0] and
-                    self.grid[free_y, free_x] == 0):  # Don't clear static obstacles
+                    self.grid[free_y, free_x] == 0):  # Don't clear SLAM obstacles
                     self.grid_dynamic[free_y, free_x] = 0
 
         # Update D* Lite planner with lidar changes to keep graph in sync
@@ -1807,8 +1678,8 @@ class DStarNavigator(Node):
 
         # Recompute shortest path (incrementally)
         if not self.dstar_planner.compute_shortest_path():
-            self.get_logger().error('D* Lite replanning failed')
-            return self._fallback_to_astar(start_grid, goal_grid)
+            self.get_logger().error('D* Lite replanning failed - path is blocked')
+            return []
 
         # Check if start is reachable
         if self.dstar_planner.g[start_grid] == float('inf'):
@@ -1818,7 +1689,8 @@ class DStarNavigator(Node):
         # Extract new path
         path = self.dstar_planner.extract_path()
         if not path:
-            return self._fallback_to_astar(start_grid, goal_grid)
+            self.get_logger().error('D* Lite failed to extract path - path is blocked')
+            return []
 
         self.get_logger().info(f'D* Lite replanning successful: {len(path)} waypoints')
         return path
@@ -1849,106 +1721,6 @@ class DStarNavigator(Node):
                     changed_cells.append((x, y))
 
         return changed_cells
-
-    def _fallback_to_astar(self, start_grid, goal_grid):
-        """
-        Fallback to A* if D* Lite fails.
-
-        Sometimes D* Lite can fail with complex obstacle configurations.
-        A* provides a reliable backup.
-
-        Args:
-            start_grid: Start position
-            goal_grid: Goal position
-
-        Returns:
-            Path from A* or [] if also failed
-        """
-        self.get_logger().info('Attempting fallback to A*...')
-
-        fallback_path = self.astar(start_grid, goal_grid, use_dynamic_grid=True)
-
-        if fallback_path:
-            self.get_logger().info(f'A* found alternative path with {len(fallback_path)} waypoints')
-        else:
-            self.get_logger().error('A* also failed - path is blocked')
-
-        return fallback_path
-
-    def astar(self, start, goal, use_dynamic_grid=False):
-        """
-        A* pathfinding algorithm (fallback planner).
-
-        Standard A* implementation with 8-connected grid and Euclidean heuristic.
-
-        Args:
-            start: Start position (gx, gy)
-            goal: Goal position (gx, gy)
-            use_dynamic_grid: If True, use grid_dynamic; else use static grid
-
-        Returns:
-            Path as list of grid positions, or [] if no path
-        """
-        def heuristic(a, b):
-            return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
-
-        grid = self.grid_dynamic if use_dynamic_grid else self.grid
-        rows, cols = grid.shape
-
-        open_set = []
-        heapq.heappush(open_set, (0, start))
-
-        came_from = {}
-        g_score = {start: 0}
-        f_score = {start: heuristic(start, goal)}
-
-        while open_set:
-            _, current = heapq.heappop(open_set)
-
-            # Goal reached - reconstruct path
-            if current == goal:
-                path = []
-                while current in came_from:
-                    path.append(current)
-                    current = came_from[current]
-                path.append(start)
-                return path[::-1]
-
-            # Explore neighbors
-            for dx, dy in [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]:
-                neighbor = (current[0] + dx, current[1] + dy)
-                gx, gy = neighbor
-
-                # Check bounds
-                if gx < 0 or gx >= cols or gy < 0 or gy >= rows:
-                    continue
-
-                # Check occupancy
-                if use_dynamic_grid:
-                    if grid[gy, gx] != 0:
-                        continue
-                else:
-                    # Use original grid near start, inflated elsewhere
-                    distance_from_start = abs(neighbor[0] - start[0]) + abs(neighbor[1] - start[1])
-                    if distance_from_start <= 3:
-                        if not self._is_valid_in_original_grid(neighbor):
-                            continue
-                    else:
-                        if not self._is_valid_in_inflated_grid(neighbor):
-                            continue
-
-                # Calculate cost
-                move_cost = 1.414 if dx != 0 and dy != 0 else 1.0
-                tentative_g = g_score[current] + move_cost
-
-                # Update if better path found
-                if neighbor not in g_score or tentative_g < g_score[neighbor]:
-                    came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g
-                    f_score[neighbor] = tentative_g + heuristic(neighbor, goal)
-                    heapq.heappush(open_set, (f_score[neighbor], neighbor))
-
-        return []  # No path found
 
     # ========================================================================
     # ROBOT CONTROL
@@ -2115,7 +1887,6 @@ class DStarNavigator(Node):
         Publish the dynamic grid for visualization.
 
         The dynamic grid shows the current planning grid including:
-        - Static obstacles (from map)
         - SLAM-discovered obstacles
         - Lidar-detected obstacles (temporary)
         """
@@ -2148,9 +1919,9 @@ class DStarNavigator(Node):
         Publish grid obstacles as MarkerArray for RViz visualization.
 
         Color coding:
-        - Red: Static obstacles (from original map)
-        - Orange: Inflated static obstacles
-        - Purple: SLAM-discovered obstacles
+        - Red: Original SLAM obstacles (raw detections)
+        - Orange: Inflated obstacle zones (safety buffer)
+        - Purple: SLAM base obstacles
         - Cyan: Lidar-detected dynamic obstacles
 
         Subscribe to /don/grid_markers in RViz to see this.
@@ -2164,21 +1935,21 @@ class DStarNavigator(Node):
         # Create separate markers for different obstacle types
         # Using CUBE_LIST for efficiency (one marker with many cubes)
 
-        # 1. Static obstacles (red)
-        static_marker = Marker()
-        static_marker.header.stamp = stamp
-        static_marker.header.frame_id = 'map'
-        static_marker.ns = 'static_obstacles'
-        static_marker.id = 0
-        static_marker.type = Marker.CUBE_LIST
-        static_marker.action = Marker.ADD
-        static_marker.scale.x = self.resolution * 0.9
-        static_marker.scale.y = self.resolution * 0.9
-        static_marker.scale.z = 0.1
-        static_marker.color = ColorRGBA(r=0.8, g=0.0, b=0.0, a=0.8)  # Red
-        static_marker.pose.orientation.w = 1.0
+        # 1. Original SLAM obstacles (red) - raw detected obstacles
+        original_marker = Marker()
+        original_marker.header.stamp = stamp
+        original_marker.header.frame_id = 'map'
+        original_marker.ns = 'slam_original'
+        original_marker.id = 0
+        original_marker.type = Marker.CUBE_LIST
+        original_marker.action = Marker.ADD
+        original_marker.scale.x = self.resolution * 0.9
+        original_marker.scale.y = self.resolution * 0.9
+        original_marker.scale.z = 0.1
+        original_marker.color = ColorRGBA(r=0.8, g=0.0, b=0.0, a=0.8)  # Red
+        original_marker.pose.orientation.w = 1.0
 
-        # 2. Inflated static obstacles (orange)
+        # 2. Inflated SLAM obstacles (orange) - safety buffer around obstacles
         inflated_marker = Marker()
         inflated_marker.header.stamp = stamp
         inflated_marker.header.frame_id = 'map'
@@ -2192,7 +1963,7 @@ class DStarNavigator(Node):
         inflated_marker.color = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.5)  # Orange
         inflated_marker.pose.orientation.w = 1.0
 
-        # 3. SLAM obstacles (purple) - in grid_base but not in grid
+        # 3. SLAM base obstacles (purple) - in grid_base but not in grid
         slam_marker = Marker()
         slam_marker.header.stamp = stamp
         slam_marker.header.frame_id = 'map'
@@ -2220,7 +1991,7 @@ class DStarNavigator(Node):
         lidar_marker.color = ColorRGBA(r=0.0, g=0.8, b=0.8, a=0.9)  # Cyan
         lidar_marker.pose.orientation.w = 1.0
 
-        # 5. Unknown/unexplored areas (gray) - only in SLAM-only mode
+        # 5. Unknown/unexplored areas (gray)
         unknown_marker = Marker()
         unknown_marker.header.stamp = stamp
         unknown_marker.header.frame_id = 'map'
@@ -2265,10 +2036,10 @@ class DStarNavigator(Node):
                 is_unknown = self.grid_unknown[gy, gx] != 0 if self.grid_unknown is not None else False
 
                 if is_original:
-                    # Original static obstacle
-                    static_marker.points.append(point)
+                    # Original SLAM obstacle
+                    original_marker.points.append(point)
                 elif is_inflated:
-                    # Inflated zone around static
+                    # Inflated safety zone
                     inflated_marker.points.append(point)
                 elif is_base and not is_inflated:
                     # SLAM-discovered obstacle
@@ -2288,8 +2059,8 @@ class DStarNavigator(Node):
             path_obstacle_marker.points.append(point)
 
         # Add markers to array (only if they have points)
-        if static_marker.points:
-            marker_array.markers.append(static_marker)
+        if original_marker.points:
+            marker_array.markers.append(original_marker)
         if inflated_marker.points:
             marker_array.markers.append(inflated_marker)
         if slam_marker.points:
