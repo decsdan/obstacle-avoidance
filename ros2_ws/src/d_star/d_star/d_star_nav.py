@@ -1708,9 +1708,10 @@ class DStarNavigator(Node):
 
         # Check if start is reachable
         if self.dstar_planner.g[start_grid] == float('inf'):
-            self.get_logger().error('Start position unreachable after replanning')
+            self.get_logger().warn('Start position unreachable after incremental replan - trying fresh reinitialization...')
             self._debug_unreachable_start(start_grid, goal_grid)
-            return []
+            # Fallback: reinitialize D* Lite completely
+            return self._reinitialize_dstar(start_grid, goal_grid)
 
         # Extract new path (with debug logging)
         path = self.dstar_planner.extract_path(debug=True)
