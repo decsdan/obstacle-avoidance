@@ -86,6 +86,7 @@ class PlannerConstants:
     REPLAN_COOLDOWN = 1.0         # Minimum seconds between replans
     ROBOT_CLEARANCE_CELLS = 3     # Cells around robot to keep free
     INFLATION_DIVISOR = 5         # Reduce inflation for dynamic obstacles
+    MAX_WAYPOINTS = 10
 
     # -------- Map Mode --------
     USE_STATIC_MAP = False        # If False, only use SLAM data (no pre-built map)
@@ -1267,10 +1268,10 @@ class DStarNavigator(Node):
 
         if reasons:
             angle_deg = math.degrees(angle)
-            self.get_logger().warn(
-                f'FILTERED front obstacle: pos=({gx},{gy}), range={range_val:.2f}m, '
-                f'angle={angle_deg:.1f}deg, reasons={reasons}'
-            )
+            # self.get_logger().warn(
+            #     f'FILTERED front obstacle: pos=({gx},{gy}), range={range_val:.2f}m, '
+            #     f'angle={angle_deg:.1f}deg, reasons={reasons}'
+            # )
 
     def _is_near_static_obstacle(self, gx, gy, tolerance):
         """
@@ -1587,7 +1588,7 @@ class DStarNavigator(Node):
         path_world = [self.grid_to_world(gx, gy) for gx, gy in path_grid]
 
         # Simplify for smoother motion
-        return self._simplify_path(path_world)
+        return self._simplify_path(path_world, max_points=PlannerConstants.MAX_WAYPOINTS)
 
     def dstar_plan(self, start_grid, goal_grid):
         """
