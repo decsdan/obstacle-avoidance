@@ -653,9 +653,9 @@ class DStarNavigator(Node):
         """
         Receive full local costmap from Nav2.
 
-        Stores the costmap data and metadata for use with incremental updates.
-        The local costmap provides real-time obstacle detection with automatic
-        clearing when obstacles are removed.
+        Stores the costmap data and metadata, then immediately processes all
+        cells for obstacles. This ensures obstacles appear in the dynamic grid
+        as soon as Nav2 detects them, without waiting for incremental updates.
 
         Args:
             msg: OccupancyGrid message from Nav2 local costmap
@@ -668,6 +668,64 @@ class DStarNavigator(Node):
             f'Received local costmap: {msg.info.width}x{msg.info.height}, '
             f'resolution: {msg.info.resolution}m'
         )
+
+        # Process full costmap for obstacles immediately
+        if self.grid_dynamic is None or self.resolution is None:
+            return
+
+        changed_cells = []
+        costmap_resolution = msg.info.resolution
+        costmap_origin_x = msg.info.origin.position.x
+        costmap_origin_y = msg.info.origin.position.y
+
+        for cy in range(msg.info.height):
+            for cx in range(msg.info.width):
+                cost = self.local_costmap[cy, cx]
+
+                # Convert costmap cell to world coordinates
+                world_x = costmap_origin_x + cx * costmap_resolution
+                world_y = costmap_origin_y + cy * costmap_resolution
+
+                # Convert to planning grid coordinates
+                grid_x, grid_y = self.world_to_grid(world_x, world_y)
+
+                if not self._in_bounds(grid_x, grid_y):
+                    continue
+
+                is_obstacle = 1 if cost > PlannerConstants.LOCAL_COSTMAP_OBSTACLE_THRESHOLD else 0
+
+                # Update local costmap layer
+                if self.grid_local_costmap is not None:
+                    self.grid_local_costmap[grid_y, grid_x] = is_obstacle
+
+                # Track changes to dynamic grid
+                if self.grid_dynamic[grid_y, grid_x] != is_obstacle:
+                    self.grid_dynamic[grid_y, grid_x] = is_obstacle
+                    changed_cells.append((grid_x, grid_y))
+
+        if changed_cells and self.dstar_planner:
+            self.dstar_planner.update_obstacles(changed_cells)
+            self.get_logger().debug(
+                f'Full local costmap processed: {len(changed_cells)} cells changed')
+
+            self.publish_dynamic_grid()
+
+            if self.path:
+                current_time = self.get_clock().now()
+                time_since_last_replan = (current_time - self.last_replan_time).nanoseconds / 1e9
+
+                if time_since_last_replan > PlannerConstants.REPLAN_COOLDOWN:
+                    path_blocked = self._check_path_blocked_by_costmap_changes(changed_cells)
+                    if path_blocked:
+                        self.get_logger().warn(
+                            f'Full costmap detected obstacle in path, triggering replan '
+                            f'({len(changed_cells)} cells changed)')
+                    else:
+                        self.get_logger().info(
+                            f'Full costmap grid changed ({len(changed_cells)} cells), '
+                            f'replanning for potentially better route')
+                    self.replanning_needed = True
+                    self.last_replan_time = current_time
 
     def local_costmap_update_callback(self, msg: OccupancyGridUpdate):
         """
