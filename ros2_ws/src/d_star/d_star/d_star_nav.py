@@ -504,6 +504,7 @@ class DStarNavigator(Node):
         # Local costmap state (Nav2 integration)
         self.local_costmap = None           # Full local costmap data
         self.local_costmap_info = None      # Costmap metadata (origin, resolution, size)
+        self.grid_local_costmap = None      # Separate layer for local costmap obstacles
 
         # Control parameters
         self.linear_speed = 0.2
@@ -708,6 +709,10 @@ class DStarNavigator(Node):
             # Convert Nav2 cost (0-254) to binary obstacle (0 or 1)
             is_obstacle = 1 if cost > PlannerConstants.LOCAL_COSTMAP_OBSTACLE_THRESHOLD else 0
 
+            # Update the local costmap layer (survives SLAM resets)
+            if self.grid_local_costmap is not None:
+                self.grid_local_costmap[grid_y, grid_x] = is_obstacle
+
             # Track changes for D* Lite incremental update
             if self.grid_dynamic[grid_y, grid_x] != is_obstacle:
                 self.grid_dynamic[grid_y, grid_x] = is_obstacle
@@ -717,6 +722,9 @@ class DStarNavigator(Node):
         if changed_cells and self.dstar_planner:
             self.dstar_planner.update_obstacles(changed_cells)
             self.get_logger().debug(f'Local costmap update: {len(changed_cells)} cells changed')
+
+            # Republish dynamic grid and markers so visualization reflects the changes
+            self.publish_dynamic_grid()
 
             if self.path:
                 current_time = self.get_clock().now()
@@ -876,6 +884,7 @@ class DStarNavigator(Node):
         self.grid_base = np.zeros((height, width), dtype=np.int8)
         self.grid_dynamic = np.zeros((height, width), dtype=np.int8)
         self.grid_unknown = np.zeros((height, width), dtype=np.int8)
+        self.grid_local_costmap = np.zeros((height, width), dtype=np.int8)
 
     def _map_slam_to_grid(self, slam_grid, unknown_mask, slam_resolution, slam_origin,
                           height, width, previous_unknown):
@@ -955,8 +964,10 @@ class DStarNavigator(Node):
             # Merge SLAM obstacles with base
             self.grid_base = np.maximum(self.grid_base, slam_obstacles_inflated)
 
-        # Update dynamic grid to match base (lidar will add on top)
+        # Update dynamic grid to match base, then merge local costmap obstacles back in
         self.grid_dynamic = self.grid_base.copy()
+        if self.grid_local_costmap is not None:
+            self.grid_dynamic = np.maximum(self.grid_dynamic, self.grid_local_costmap)
 
         # Find changed cells (both additions AND removals)
         changed_cells = []
