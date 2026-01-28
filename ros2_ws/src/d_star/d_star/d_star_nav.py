@@ -713,18 +713,26 @@ class DStarNavigator(Node):
                 self.grid_dynamic[grid_y, grid_x] = is_obstacle
                 changed_cells.append((grid_x, grid_y))
 
-        # Update D* Lite planner with changed cells
+        # Update D* Lite planner with changed cells and trigger replan
         if changed_cells and self.dstar_planner:
             self.dstar_planner.update_obstacles(changed_cells)
             self.get_logger().debug(f'Local costmap update: {len(changed_cells)} cells changed')
 
-            # Check if path is now blocked and trigger replanning if needed
-            if self.path and self._check_path_blocked_by_costmap_changes(changed_cells):
+            if self.path:
                 current_time = self.get_clock().now()
                 time_since_last_replan = (current_time - self.last_replan_time).nanoseconds / 1e9
 
                 if time_since_last_replan > PlannerConstants.REPLAN_COOLDOWN:
-                    self.get_logger().warn('Local costmap detected obstacle in path, triggering replan')
+                    # Check if changes directly block the path
+                    path_blocked = self._check_path_blocked_by_costmap_changes(changed_cells)
+                    if path_blocked:
+                        self.get_logger().warn(
+                            f'Local costmap detected obstacle in path, triggering replan '
+                            f'({len(changed_cells)} cells changed)')
+                    else:
+                        self.get_logger().info(
+                            f'Dynamic grid changed ({len(changed_cells)} cells), '
+                            f'replanning for potentially better route')
                     self.replanning_needed = True
                     self.last_replan_time = current_time
 
