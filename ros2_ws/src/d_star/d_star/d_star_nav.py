@@ -1885,7 +1885,6 @@ def main(args=None):
     print(f"\nTopics:")
     print(f"  Goal pose input: {PlannerConstants.GOAL_POSE}")
     print(f"  Odometry: {PlannerConstants.ODOMETRY}")
-    print(f"  Scan: {PlannerConstants.SCAN}")
     print(f"  Map: {PlannerConstants.OCCUPANCY_GRID}")
     print(f"\nUsage:")
     print(f"  ros2 topic pub {PlannerConstants.GOAL_POSE} geometry_msgs/PoseStamped '{{pose: {{position: {{x: 1.0, y: 2.0}}}}}}' --once")
@@ -1906,7 +1905,7 @@ def main(args=None):
             rclpy.spin_once(navigator, timeout_sec=0.1)
 
     print(f"\nReady! Waiting for goal poses on {PlannerConstants.GOAL_POSE}...")
-
+    
     try:
         rclpy.spin(navigator)
     except KeyboardInterrupt:
