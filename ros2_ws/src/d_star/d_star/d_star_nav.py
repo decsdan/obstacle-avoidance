@@ -33,6 +33,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped, Point
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from map_msgs.msg import OccupancyGridUpdate
+from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA
 import numpy as np
@@ -88,6 +89,10 @@ class PlannerConstants:
 
     # Local costmap configuration
     LOCAL_COSTMAP_OBSTACLE_THRESHOLD = 50  # Cost value above which cell is considered obstacle (0-254)
+
+    # Lidar configuration
+    SCAN = f'{NAMESPACE}/scan'
+    LIDAR_MAX_RANGE = 3.5  # Max range to consider for obstacle detection (meters)
 
 
 
@@ -553,13 +558,18 @@ class DStarNavigator(Node):
             PoseStamped, PlannerConstants.GOAL_POSE, self.goal_pose_callback, 10
         )
 
-        # Local costmap subscribers (Nav2 integration for obstacle detection and clearing)
-        self.local_costmap_sub = self.create_subscription(
-            OccupancyGrid, PlannerConstants.LOCAL_COSTMAP, self.local_costmap_callback, 10
-        )
-        self.local_costmap_update_sub = self.create_subscription(
-            OccupancyGridUpdate, PlannerConstants.LOCAL_COSTMAP_UPDATES,
-            self.local_costmap_update_callback, 10
+        # Local costmap subscribers (Nav2 integration - disabled, using direct lidar instead)
+        # self.local_costmap_sub = self.create_subscription(
+        #     OccupancyGrid, PlannerConstants.LOCAL_COSTMAP, self.local_costmap_callback, 10
+        # )
+        # self.local_costmap_update_sub = self.create_subscription(
+        #     OccupancyGridUpdate, PlannerConstants.LOCAL_COSTMAP_UPDATES,
+        #     self.local_costmap_update_callback, 10
+        # )
+
+        # Direct lidar subscriber for real-time obstacle detection
+        self.scan_sub = self.create_subscription(
+            LaserScan, PlannerConstants.SCAN, self.scan_callback, qos_best_effort
         )
 
     def goal_pose_callback(self, msg: PoseStamped):
@@ -646,7 +656,129 @@ class DStarNavigator(Node):
         }
 
     # ========================================================================
-    # LOCAL COSTMAP CALLBACKS (Nav2 Integration)
+    # LIDAR SCAN CALLBACK (Direct obstacle detection)
+    # ========================================================================
+
+    def scan_callback(self, msg: LaserScan):
+        """
+        Process raw lidar scan for real-time obstacle detection.
+
+        Converts each lidar range reading to world coordinates, then maps
+        it onto the planning grid. Updates grid_local_costmap and grid_dynamic
+        immediately so obstacles appear as soon as lidar sees them.
+
+        Args:
+            msg: LaserScan message with lidar data
+        """
+        if self.current_pose is None:
+            return
+        if self.grid_dynamic is None or self.resolution is None:
+            return
+
+        robot_x = self.current_pose['x']
+        robot_y = self.current_pose['y']
+        robot_theta = self.current_pose['theta']
+
+        max_range = min(msg.range_max, PlannerConstants.LIDAR_MAX_RANGE)
+
+        # Collect all grid cells currently covered by the scan's field of view
+        # so we can clear cells that no longer have obstacles
+        scanned_cells = set()
+        obstacle_cells = set()
+
+        angle = msg.angle_min
+        for range_val in msg.ranges:
+            if (not math.isinf(range_val) and not math.isnan(range_val) and
+                    range_val >= msg.range_min):
+
+                if range_val <= max_range:
+                    # Valid hit — compute obstacle world position
+                    local_x = range_val * math.cos(angle)
+                    local_y = range_val * math.sin(angle)
+                    world_x = (robot_x +
+                               local_x * math.cos(robot_theta) -
+                               local_y * math.sin(robot_theta))
+                    world_y = (robot_y +
+                               local_x * math.sin(robot_theta) +
+                               local_y * math.cos(robot_theta))
+
+                    grid_x, grid_y = self.world_to_grid(world_x, world_y)
+                    if self._in_bounds(grid_x, grid_y):
+                        obstacle_cells.add((grid_x, grid_y))
+
+                # Mark cells along the ray as scanned (free) for clearing
+                # Sample points along the ray up to the hit (or max_range)
+                clear_dist = min(range_val, max_range)
+                num_samples = max(2, int(clear_dist / self.resolution))
+                for s in range(num_samples):
+                    frac = s / num_samples
+                    sample_range = frac * clear_dist
+                    local_x = sample_range * math.cos(angle)
+                    local_y = sample_range * math.sin(angle)
+                    wx = (robot_x +
+                          local_x * math.cos(robot_theta) -
+                          local_y * math.sin(robot_theta))
+                    wy = (robot_y +
+                          local_x * math.sin(robot_theta) +
+                          local_y * math.cos(robot_theta))
+                    gx, gy = self.world_to_grid(wx, wy)
+                    if self._in_bounds(gx, gy):
+                        scanned_cells.add((gx, gy))
+
+            angle += msg.angle_increment
+
+        # Apply updates to grids
+        changed_cells = []
+
+        # Clear scanned cells that are no longer obstacles
+        for cell in scanned_cells:
+            gx, gy = cell
+            if cell not in obstacle_cells:
+                if self.grid_local_costmap is not None and self.grid_local_costmap[gy, gx] == 1:
+                    self.grid_local_costmap[gy, gx] = 0
+                # Only clear dynamic grid if the cell isn't a SLAM obstacle
+                if (self.grid_base is not None and self.grid_base[gy, gx] == 0 and
+                        self.grid_dynamic[gy, gx] != 0):
+                    self.grid_dynamic[gy, gx] = 0
+                    changed_cells.append(cell)
+
+        # Mark obstacle cells
+        for cell in obstacle_cells:
+            gx, gy = cell
+            if self.grid_local_costmap is not None:
+                self.grid_local_costmap[gy, gx] = 1
+            if self.grid_dynamic[gy, gx] != 1:
+                self.grid_dynamic[gy, gx] = 1
+                changed_cells.append(cell)
+
+        # Feed changes to D* Lite and publish
+        if changed_cells and self.dstar_planner:
+            self.dstar_planner.update_obstacles(changed_cells)
+            self.get_logger().debug(
+                f'Lidar scan: {len(obstacle_cells)} obstacles, '
+                f'{len(changed_cells)} grid cells changed')
+
+            self.publish_dynamic_grid()
+
+            if self.path:
+                current_time = self.get_clock().now()
+                time_since_last_replan = (current_time - self.last_replan_time).nanoseconds / 1e9
+
+                if time_since_last_replan > PlannerConstants.REPLAN_COOLDOWN:
+                    path_blocked = self._check_path_blocked_by_costmap_changes(changed_cells)
+                    if path_blocked:
+                        self.get_logger().warn(
+                            f'Lidar detected obstacle in path, triggering replan '
+                            f'({len(changed_cells)} cells changed)')
+                    else:
+                        self.get_logger().info(
+                            f'Lidar grid changed ({len(changed_cells)} cells), '
+                            f'replanning for potentially better route')
+                    self.replanning_needed = True
+                    self.last_replan_time = current_time
+
+    # ========================================================================
+    # LOCAL COSTMAP CALLBACKS (Nav2 Integration - currently disabled)
     # ========================================================================
 
     def local_costmap_callback(self, msg: OccupancyGrid):
