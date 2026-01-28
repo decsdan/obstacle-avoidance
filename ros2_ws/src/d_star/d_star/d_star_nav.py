@@ -59,7 +59,7 @@ class PlannerConstants:
     # -------- Robot Physical Parameters (meters) --------
     NAMESPACE = '/don'          # Name of the physical robot
     ROBOT_RADIUS = 0.22           # Physical radius of the robot body
-    SAFETY_CLEARANCE = 0.0001      # Extra safety buffer around obstacles
+    SAFETY_CLEARANCE = 0.1      # Extra safety buffer around obstacles
                                   # Total inflation = ROBOT_RADIUS + SAFETY_CLEARANCE
 
     # -------- Grid Cell Tolerances (cells) --------
@@ -79,7 +79,7 @@ class PlannerConstants:
     OCCUPANCY_GRID = f'{NAMESPACE}/map'
     PATH = f'{NAMESPACE}/path'
     DYNAMIC_GRID = f'{NAMESPACE}/dynamic_grid'
-    GOAL_POSE = f'{NAMESPACE}/goal_pose'
+    GOAL_POSE = f'{NAMESPACE}/d_star_goal_pose'
     GRID_MARKERS = f'{NAMESPACE}/grid_markers'
 
     # Local costmap topics (Nav2)
