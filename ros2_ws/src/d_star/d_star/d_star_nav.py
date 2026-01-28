@@ -4,12 +4,13 @@ D* Lite Navigator with Dynamic Replanning for ROS2 TurtleBot4
 
 This module implements a complete navigation system using D* Lite pathfinding
 algorithm with dynamic replanning capabilities. It integrates with SLAM for
-real-time obstacle discovery and uses lidar for immediate obstacle detection.
+persistent obstacle tracking and Nav2 local costmap for real-time obstacle
+detection with automatic clearing.
 
 Key Features:
     - D* Lite incremental pathfinding (efficient replanning)
     - SLAM integration for persistent obstacle tracking
-    - Lidar-based dynamic obstacle avoidance
+    - Nav2 local costmap integration for dynamic obstacle detection and clearing
     - Optimistic planning mode for exploration
     - Obstacle inflation for safety margins
 
@@ -21,7 +22,7 @@ Grid Hierarchy:
     - grid_original: Raw SLAM map (no inflation)
     - grid: Inflated SLAM map (obstacles + safety buffer)
     - grid_base: Accumulated SLAM obstacles (persistent)
-    - grid_dynamic: Current planning grid = base + lidar obstacles (temporary)
+    - grid_dynamic: Current planning grid (updated by SLAM and local costmap)
 
 Authors: Devin Dennis, Assisted with Claude Code
 """
@@ -31,7 +32,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped, Point
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
-from sensor_msgs.msg import LaserScan
+from map_msgs.msg import OccupancyGridUpdate
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA
 import numpy as np
@@ -52,8 +53,7 @@ class PlannerConstants:
 
     Adjust these values to tune robot behavior:
     - Increase SAFETY_CLEARANCE for more cautious navigation
-    - Decrease LIDAR_MAX_RANGE to ignore distant obstacles
-    - Increase MAX_OBSTACLE_CHECK_DISTANCE to trigger replanning earlier
+    - Adjust LOCAL_COSTMAP_OBSTACLE_THRESHOLD for obstacle sensitivity
     """
 
     # -------- Robot Physical Parameters (meters) --------
@@ -62,40 +62,32 @@ class PlannerConstants:
     SAFETY_CLEARANCE = 0.0001      # Extra safety buffer around obstacles
                                   # Total inflation = ROBOT_RADIUS + SAFETY_CLEARANCE
 
-    # -------- Lidar Obstacle Detection (meters) --------
-    LIDAR_MIN_RANGE = 0.1         # Ignore readings closer than this (robot body/noise)
-    LIDAR_MAX_RANGE = 3.0         # Only detect obstacles up to this distance
-
     # -------- Grid Cell Tolerances (cells) --------
-    KNOWN_OBSTACLE_TOLERANCE = 3     # Cells to check for known SLAM obstacle filtering (increased)
-    NEARBY_OBSTACLE_TOLERANCE = 3     # Tolerance for coordinate transform errors (increased)
-    PATH_CHECK_RADIUS = 2             # Cells around waypoint to check (reduced)
-    ROBOT_BODY_RADIUS_CELLS = 4       # Min distance from robot (self-detection filter, increased)
-    CLOSE_OBSTACLE_CELLS = 12         # Threshold for "very close" obstacles
-    EMERGENCY_OBSTACLE_CELLS = 15      # Max distance to immediately mark in grid
+    PATH_CHECK_RADIUS = 2             # Cells around waypoint to check for obstacles
 
     # -------- Path Planning Parameters --------
-    MAX_PATH_ITERATIONS = 10000000      # Max D* Lite iterations before timeout
-    PATH_BLOCKING_BUFFER = 3          # Extra buffer for blocking detection (reduced)
-    LOOKAHEAD_SEGMENTS = 5            # Path segments to check ahead (reduced from 20)
-    MAX_OBSTACLE_CHECK_DISTANCE = 20  # Max cells to check (reduced from 40)
-
-    # -------- Control Parameters --------
-    REPLAN_COOLDOWN = 3.0         # Minimum seconds between replans (increased from 1.0)
-    MIN_OBSTACLES_TO_REPLAN = 3   # Minimum obstacles needed to trigger replan
-    ROBOT_CLEARANCE_CELLS = 3     # Cells around robot to keep free
-    INFLATION_DIVISOR = 5         # Reduce inflation for dynamic obstacles
+    MAX_PATH_ITERATIONS = 10000000    # Max D* Lite iterations before timeout
     MAX_WAYPOINTS = 10
 
-    # Publishing/Subscribing Paths
+    # -------- Control Parameters --------
+    REPLAN_COOLDOWN = 3.0         # Minimum seconds between replans
+    ROBOT_CLEARANCE_CELLS = 3     # Cells around robot to keep free
+
+    # -------- Topic Names --------
     CMD_VEL = f'{NAMESPACE}/cmd_vel'
     ODOMETRY = f'{NAMESPACE}/odom'
-    SCAN = f'{NAMESPACE}/scan'
     OCCUPANCY_GRID = f'{NAMESPACE}/map'
     PATH = f'{NAMESPACE}/path'
     DYNAMIC_GRID = f'{NAMESPACE}/dynamic_grid'
     GOAL_POSE = f'{NAMESPACE}/goal_pose'
     GRID_MARKERS = f'{NAMESPACE}/grid_markers'
+
+    # Local costmap topics (Nav2)
+    LOCAL_COSTMAP = f'{NAMESPACE}/local_costmap/costmap'
+    LOCAL_COSTMAP_UPDATES = f'{NAMESPACE}/local_costmap/costmap_updates'
+
+    # Local costmap configuration
+    LOCAL_COSTMAP_OBSTACLE_THRESHOLD = 50  # Cost value above which cell is considered obstacle (0-254)
 
 
 
@@ -432,12 +424,12 @@ class DStarLite:
 
 class DStarNavigator(Node):
     """
-    Complete navigation system using D* Lite with SLAM and lidar integration.
+    Complete navigation system using D* Lite with SLAM and Nav2 local costmap.
 
     This node manages:
     - Path planning with D* Lite
     - SLAM map integration for persistent obstacles
-    - Lidar-based dynamic obstacle detection
+    - Nav2 local costmap for dynamic obstacle detection and clearing
     - Robot motion control
     - Automatic replanning when obstacles block the path
 
@@ -449,12 +441,12 @@ class DStarNavigator(Node):
         1. grid_original: Raw SLAM map (0=free, 1=occupied, no inflation)
         2. grid: SLAM map with safety inflation (planning baseline)
         3. grid_base: Accumulated SLAM obstacles (persistent)
-        4. grid_dynamic: grid_base + lidar obstacles (current planning grid)
+        4. grid_dynamic: Current planning grid (updated by SLAM and local costmap)
 
     Replanning Triggers:
         - SLAM discovers obstacles blocking current path
-        - Lidar detects new obstacles near path (not already known)
-        - Cooldown prevents rapid replanning (1 second default)
+        - Local costmap detects obstacle changes near path
+        - Cooldown prevents rapid replanning
     """
 
     # ========================================================================
@@ -469,7 +461,7 @@ class DStarNavigator(Node):
             robot_radius: Physical radius of robot in meters
             safety_clearance: Extra safety buffer around obstacles in meters
             optimistic_planning: If True, treat unknown areas as free
-        """'/scan'
+        """
         super().__init__('dstar_navigator')
 
         # Robot configuration
@@ -502,14 +494,16 @@ class DStarNavigator(Node):
         self.current_pose = None      # {'x': float, 'y': float, 'theta': float}
         self.path = []                # List of waypoints [(x, y), ...]
         self.current_waypoint_idx = 0
-        self.latest_scan = None
 
         # D* Lite planner state
         self.dstar_planner = None
         self.goal_grid = None
         self.planner_grid_snapshot = None  # Snapshot for change detection
         self.known_obstacles = set()       # Track obstacles already replanned for
-        self.lidar_obstacles_along_path = []  # Lidar detections that are along the path (for visualization)
+
+        # Local costmap state (Nav2 integration)
+        self.local_costmap = None           # Full local costmap data
+        self.local_costmap_info = None      # Costmap metadata (origin, resolution, size)
 
         # Control parameters
         self.linear_speed = 0.2
@@ -530,7 +524,7 @@ class DStarNavigator(Node):
 
     def _setup_subscribers(self):
         """Setup ROS2 subscribers with appropriate QoS profiles."""
-        # Best-effort QoS for real-time data (odometry, lidar)
+        # Best-effort QoS for real-time data (odometry)
         qos_best_effort = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -539,10 +533,6 @@ class DStarNavigator(Node):
 
         self.odom_sub = self.create_subscription(
             Odometry, PlannerConstants.ODOMETRY, self.odom_callback, qos_best_effort
-        )
-
-        self.scan_sub = self.create_subscription(
-            LaserScan, PlannerConstants.SCAN, self.scan_callback, 10
         )
 
         # Reliable + transient-local QoS for maps (latched topic)
@@ -560,6 +550,15 @@ class DStarNavigator(Node):
         # Goal pose subscriber for receiving navigation goals
         self.goal_pose_sub = self.create_subscription(
             PoseStamped, PlannerConstants.GOAL_POSE, self.goal_pose_callback, 10
+        )
+
+        # Local costmap subscribers (Nav2 integration for obstacle detection and clearing)
+        self.local_costmap_sub = self.create_subscription(
+            OccupancyGrid, PlannerConstants.LOCAL_COSTMAP, self.local_costmap_callback, 10
+        )
+        self.local_costmap_update_sub = self.create_subscription(
+            OccupancyGridUpdate, PlannerConstants.LOCAL_COSTMAP_UPDATES,
+            self.local_costmap_update_callback, 10
         )
 
     def goal_pose_callback(self, msg: PoseStamped):
@@ -645,44 +644,127 @@ class DStarNavigator(Node):
             'theta': self.quaternion_to_yaw(msg.pose.pose.orientation)
         }
 
-    def scan_callback(self, msg):
-        """
-        Process lidar scan and check for obstacles in path.
+    # ========================================================================
+    # LOCAL COSTMAP CALLBACKS (Nav2 Integration)
+    # ========================================================================
 
-        Detects obstacles using lidar and triggers replanning if they block
-        the current path (with cooldown and minimum count to prevent false triggers).
+    def local_costmap_callback(self, msg: OccupancyGrid):
+        """
+        Receive full local costmap from Nav2.
+
+        Stores the costmap data and metadata for use with incremental updates.
+        The local costmap provides real-time obstacle detection with automatic
+        clearing when obstacles are removed.
 
         Args:
-            msg: LaserScan message
+            msg: OccupancyGrid message from Nav2 local costmap
         """
-        self.latest_scan = msg
+        self.local_costmap = np.array(msg.data, dtype=np.int8).reshape(
+            (msg.info.height, msg.info.width)
+        )
+        self.local_costmap_info = msg.info
+        self.get_logger().debug(
+            f'Received local costmap: {msg.info.width}x{msg.info.height}, '
+            f'resolution: {msg.info.resolution}m'
+        )
 
-        if not self.path or self.current_pose is None:
+    def local_costmap_update_callback(self, msg: OccupancyGridUpdate):
+        """
+        Process incremental local costmap updates from Nav2.
+
+        Updates the dynamic grid with obstacle changes detected by Nav2's
+        costmap layers. This handles both obstacle detection AND clearing,
+        solving the problem where SLAM doesn't clear removed obstacles quickly.
+
+        Args:
+            msg: OccupancyGridUpdate message containing changed cells
+        """
+        if self.local_costmap is None or self.local_costmap_info is None:
             return
 
-        # Check if obstacles block the path
-        obstacles_detected = self.detect_obstacles_in_path(msg)
+        if self.grid_dynamic is None or self.resolution is None:
+            return
 
-        if obstacles_detected:
-            # Count consecutive detections to filter noise
-            if not hasattr(self, '_obstacle_detection_count'):
-                self._obstacle_detection_count = 0
-            self._obstacle_detection_count += 1
+        changed_cells = []
 
-            # Only trigger if we've detected obstacles multiple times consecutively
-            if self._obstacle_detection_count >= PlannerConstants.MIN_OBSTACLES_TO_REPLAN:
+        for i, cost in enumerate(msg.data):
+            # Calculate position in local costmap
+            local_x = msg.x + (i % msg.width)
+            local_y = msg.y + (i // msg.width)
+
+            # Convert local costmap coordinates to world coordinates
+            world_x = (self.local_costmap_info.origin.position.x +
+                      local_x * self.local_costmap_info.resolution)
+            world_y = (self.local_costmap_info.origin.position.y +
+                      local_y * self.local_costmap_info.resolution)
+
+            # Convert world coordinates to our grid coordinates
+            grid_x, grid_y = self.world_to_grid(world_x, world_y)
+
+            # Check bounds
+            if not self._in_bounds(grid_x, grid_y):
+                continue
+
+            # Convert Nav2 cost (0-254) to binary obstacle (0 or 1)
+            is_obstacle = 1 if cost > PlannerConstants.LOCAL_COSTMAP_OBSTACLE_THRESHOLD else 0
+
+            # Track changes for D* Lite incremental update
+            if self.grid_dynamic[grid_y, grid_x] != is_obstacle:
+                self.grid_dynamic[grid_y, grid_x] = is_obstacle
+                changed_cells.append((grid_x, grid_y))
+
+        # Update D* Lite planner with changed cells
+        if changed_cells and self.dstar_planner:
+            self.dstar_planner.update_obstacles(changed_cells)
+            self.get_logger().debug(f'Local costmap update: {len(changed_cells)} cells changed')
+
+            # Check if path is now blocked and trigger replanning if needed
+            if self.path and self._check_path_blocked_by_costmap_changes(changed_cells):
                 current_time = self.get_clock().now()
                 time_since_last_replan = (current_time - self.last_replan_time).nanoseconds / 1e9
 
-                # Respect cooldown period
                 if time_since_last_replan > PlannerConstants.REPLAN_COOLDOWN:
-                    self.get_logger().warn(f'Obstacle in path ahead! Triggering replanning...')
+                    self.get_logger().warn('Local costmap detected obstacle in path, triggering replan')
                     self.replanning_needed = True
                     self.last_replan_time = current_time
-                    self._obstacle_detection_count = 0
-        else:
-            # Reset counter when no obstacles detected
-            self._obstacle_detection_count = 0
+
+    def _check_path_blocked_by_costmap_changes(self, changed_cells):
+        """
+        Check if any changed cells block the current path.
+
+        Args:
+            changed_cells: List of (grid_x, grid_y) tuples that changed
+
+        Returns:
+            True if any changed cell is an obstacle near the path
+        """
+        if not self.path or self.current_waypoint_idx >= len(self.path):
+            return False
+
+        changed_set = set(changed_cells)
+
+        # Check upcoming waypoints
+        for i in range(self.current_waypoint_idx, min(self.current_waypoint_idx + 5, len(self.path))):
+            waypoint = self.path[i]
+            wp_grid = self.world_to_grid(waypoint[0], waypoint[1])
+
+            # Check cells around waypoint
+            for dx in range(-PlannerConstants.PATH_CHECK_RADIUS, PlannerConstants.PATH_CHECK_RADIUS + 1):
+                for dy in range(-PlannerConstants.PATH_CHECK_RADIUS, PlannerConstants.PATH_CHECK_RADIUS + 1):
+                    check_cell = (wp_grid[0] + dx, wp_grid[1] + dy)
+                    if check_cell in changed_set:
+                        if self._in_bounds(check_cell[0], check_cell[1]):
+                            if self.grid_dynamic[check_cell[1], check_cell[0]] == 1:
+                                self.blocked_waypoint_idx = i
+                                return True
+        return False
+
+    def _in_bounds(self, grid_x, grid_y):
+        """Check if grid coordinates are within bounds."""
+        if self.grid_dynamic is None:
+            return False
+        return (0 <= grid_x < self.grid_dynamic.shape[1] and
+                0 <= grid_y < self.grid_dynamic.shape[0])
 
     def map_callback(self, msg: OccupancyGrid):
         """
@@ -924,625 +1006,6 @@ class DStarNavigator(Node):
                         return True
 
         return False
-
-    # ========================================================================
-    # LIDAR OBSTACLE DETECTION
-    # ========================================================================
-
-    def detect_obstacles_in_path(self, scan_msg):
-        """
-        Detect obstacles using lidar and check if they block the path.
-
-        Processing pipeline:
-        1. Process lidar scan to get obstacles along the path
-        2. Store for visualization
-        3. Update grid_dynamic with lidar obstacles
-        4. Check if obstacles block upcoming path segments
-
-        Args:
-            scan_msg: LaserScan message
-
-        Returns:
-            True if obstacles block the path, False otherwise
-        """
-        if self.current_waypoint_idx >= len(self.path):
-            self.lidar_obstacles_along_path = []  # Clear when no path
-            return False
-
-        robot_grid = self.world_to_grid(self.current_pose['x'], self.current_pose['y'])
-        robot_gx, robot_gy = robot_grid
-        robot_theta = self.current_pose['theta']
-
-        # Process lidar scan to detect obstacles along the path
-        detected_obstacles = self._process_lidar_scan(scan_msg, robot_gx, robot_gy, robot_theta)
-
-        # Store for visualization (these are specifically obstacles along the path)
-        self.lidar_obstacles_along_path = detected_obstacles.copy()
-
-        if not detected_obstacles:
-            return False
-
-        # Update grid_dynamic with detected obstacles at their actual positions
-        self._update_dynamic_grid_with_lidar(detected_obstacles, robot_gx, robot_gy)
-
-        # Check if obstacles block the planned path
-        return self._check_obstacles_block_path(detected_obstacles, robot_gx, robot_gy, detected_obstacles)
-
-    def _process_lidar_scan(self, scan_msg, robot_gx, robot_gy, robot_theta):
-        """
-        Process lidar scan using ray-marching to detect obstacles along the path.
-
-        For each lidar ray, marches along the ray checking all grid cells to see if:
-        1. The cell contains an obstacle in grid_dynamic (from SLAM or previous detection)
-        2. The cell is along the planned path
-
-        This detects SLAM obstacles that the lidar ray passes through, even if the
-        lidar didn't physically hit them at that exact point.
-
-        Args:
-            scan_msg: LaserScan message
-            robot_gx, robot_gy: Robot position in grid coordinates
-            robot_theta: Robot orientation in radians
-
-        Returns:
-            List of obstacle positions [(gx, gy), ...] that are along the path
-        """
-        obstacles_along_path = []
-        detected_set = set()  # Avoid duplicates
-
-        # Get path segments to check against
-        path_segments = self._get_upcoming_path_segments(robot_gx, robot_gy)
-        if not path_segments:
-            return []
-
-        # Process each lidar reading with ray-marching
-        angle = scan_msg.angle_min
-        for range_val in scan_msg.ranges:
-            # Get the ray length (use max range if invalid reading)
-            if self._is_valid_lidar_reading(range_val, scan_msg):
-                ray_length = range_val
-            else:
-                # Skip invalid readings entirely
-                angle += scan_msg.angle_increment
-                continue
-
-            # Ray-march along this lidar ray
-            ray_obstacles = self._ray_march_for_obstacles(
-                robot_gx, robot_gy, robot_theta, angle, ray_length,
-                path_segments, detected_set
-            )
-
-            for obs in ray_obstacles:
-                if obs not in detected_set:
-                    detected_set.add(obs)
-                    obstacles_along_path.append(obs)
-
-            angle += scan_msg.angle_increment
-
-        # Debug logging
-        if hasattr(self, '_lidar_debug_counter'):
-            self._lidar_debug_counter += 1
-        else:
-            self._lidar_debug_counter = 0
-
-        if self._lidar_debug_counter % 50 == 0 and obstacles_along_path:
-            self.get_logger().debug(
-                f'Ray-march detected {len(obstacles_along_path)} obstacles along path'
-            )
-
-        return obstacles_along_path
-
-    def _ray_march_for_obstacles(self, robot_gx, robot_gy, robot_theta, angle, ray_length, path_segments, detected_set):
-        """
-        March along a lidar ray checking for obstacles in grid_dynamic that are along the path.
-
-        Uses Bresenham-style stepping to check each grid cell along the ray.
-
-        Args:
-            robot_gx, robot_gy: Robot position in grid
-            robot_theta: Robot orientation
-            angle: Lidar ray angle (relative to robot)
-            ray_length: Length of ray in meters
-            path_segments: Path segments to check against
-            detected_set: Set of already detected obstacles (to avoid duplicates)
-
-        Returns:
-            List of obstacle positions [(gx, gy), ...] found along this ray
-        """
-        obstacles_found = []
-
-        # Calculate ray direction in world frame
-        world_angle = robot_theta + angle
-
-        # Step size in meters (use resolution for grid-aligned stepping)
-        step_size = self.resolution * 0.5  # Half-cell steps for better coverage
-        num_steps = int(ray_length / step_size)
-
-        # March along the ray
-        for step in range(1, num_steps + 1):  # Start at 1 to skip robot position
-            distance = step * step_size
-
-            # Calculate world position along ray
-            world_x = self.current_pose['x'] + distance * math.cos(world_angle)
-            world_y = self.current_pose['y'] + distance * math.sin(world_angle)
-
-            # Convert to grid
-            gx, gy = self.world_to_grid(world_x, world_y)
-
-            # Check bounds
-            if not (0 <= gx < self.grid_dynamic.shape[1] and
-                    0 <= gy < self.grid_dynamic.shape[0]):
-                continue
-
-            # Skip cells too close to robot (robot body)
-            dist_from_robot = math.sqrt((gx - robot_gx)**2 + (gy - robot_gy)**2)
-            if dist_from_robot < PlannerConstants.ROBOT_BODY_RADIUS_CELLS:
-                continue
-
-            # Skip known SLAM obstacles
-            if self._is_near_known_obstacle(gx, gy, PlannerConstants.KNOWN_OBSTACLE_TOLERANCE):
-                continue
-
-            grid_pos = (gx, gy)
-
-            # Check if this cell has an obstacle in dynamic grid AND is along the path
-            if grid_pos not in detected_set:
-                if self.grid_dynamic[gy, gx] != 0 and self._is_point_along_path(gx, gy, path_segments):
-                    obstacles_found.append(grid_pos)
-                    # Once we find an obstacle along this ray, we can stop
-                    # (the ray would be blocked by it)
-                    break
-
-        # Also check the endpoint (where lidar actually hit)
-        end_world = self._lidar_to_world(
-            ray_length, angle, self.current_pose['x'],
-            self.current_pose['y'], robot_theta
-        )
-        end_gx, end_gy = self.world_to_grid(end_world[0], end_world[1])
-
-        if (0 <= end_gx < self.grid_dynamic.shape[1] and
-            0 <= end_gy < self.grid_dynamic.shape[0]):
-            dist_from_robot = math.sqrt((end_gx - robot_gx)**2 + (end_gy - robot_gy)**2)
-            end_pos = (end_gx, end_gy)
-
-            if (dist_from_robot >= PlannerConstants.ROBOT_BODY_RADIUS_CELLS and
-                not self._is_near_known_obstacle(end_gx, end_gy, PlannerConstants.KNOWN_OBSTACLE_TOLERANCE) and
-                end_pos not in detected_set and
-                self._is_point_along_path(end_gx, end_gy, path_segments)):
-                obstacles_found.append(end_pos)
-
-        return obstacles_found
-
-    def _get_upcoming_path_segments(self, robot_gx, robot_gy):
-        """
-        Get the upcoming path segments to check for obstacles.
-
-        Returns:
-            List of segment tuples: [((start_gx, start_gy), (end_gx, end_gy)), ...]
-        """
-        if not self.path or self.current_waypoint_idx >= len(self.path):
-            return []
-
-        segments = []
-        num_segments = min(PlannerConstants.LOOKAHEAD_SEGMENTS,
-                          len(self.path) - self.current_waypoint_idx)
-
-        for i in range(self.current_waypoint_idx, self.current_waypoint_idx + num_segments):
-            if i >= len(self.path):
-                break
-
-            # Get segment start
-            if i == self.current_waypoint_idx:
-                start_gx, start_gy = robot_gx, robot_gy
-            else:
-                prev_wp = self.path[i - 1]
-                start_gx, start_gy = self.world_to_grid(prev_wp[0], prev_wp[1])
-
-            # Get segment end
-            end_wp = self.path[i]
-            end_gx, end_gy = self.world_to_grid(end_wp[0], end_wp[1])
-
-            segments.append(((start_gx, start_gy), (end_gx, end_gy)))
-
-        return segments
-
-    def _is_point_along_path(self, gx, gy, path_segments):
-        """
-        Check if a point is along any of the path segments.
-
-        Uses the robot footprint as the threshold for "along the path".
-
-        Args:
-            gx, gy: Point to check
-            path_segments: List of ((start_gx, start_gy), (end_gx, end_gy)) tuples
-
-        Returns:
-            True if point is within blocking threshold of any segment
-        """
-        # Use robot footprint as threshold
-        blocking_threshold = int((self.robot_radius + self.safety_clearance) / self.resolution)
-
-        for (start_gx, start_gy), (end_gx, end_gy) in path_segments:
-            dist = self._point_to_segment_distance(gx, gy, start_gx, start_gy, end_gx, end_gy)
-            if dist <= blocking_threshold:
-                return True
-
-        return False
-
-    def _is_valid_lidar_reading(self, range_val, scan_msg):
-        """
-        Check if lidar reading is valid.
-
-        Args:
-            range_val: Range value in meters
-            scan_msg: LaserScan message (for min/max range)
-
-        Returns:
-            True if valid reading, False otherwise
-        """
-        return (range_val >= scan_msg.range_min and
-                range_val <= scan_msg.range_max and
-                not math.isinf(range_val) and
-                PlannerConstants.LIDAR_MIN_RANGE <= range_val <= PlannerConstants.LIDAR_MAX_RANGE)
-
-    def _lidar_to_world(self, range_val, angle, robot_x, robot_y, robot_theta):
-        """
-        Convert lidar reading to world coordinates.
-
-        Transforms from robot-local polar coordinates to world Cartesian.
-
-        Args:
-            range_val: Range in meters
-            angle: Angle in radians (relative to robot)
-            robot_x, robot_y: Robot position in world
-            robot_theta: Robot orientation in world
-
-        Returns:
-            Tuple (world_x, world_y)
-        """
-        # Convert polar to Cartesian in robot frame
-        obstacle_x_local = range_val * math.cos(angle)
-        obstacle_y_local = range_val * math.sin(angle)
-
-        # Rotate and translate to world frame
-        obstacle_x_world = (robot_x +
-                           obstacle_x_local * math.cos(robot_theta) -
-                           obstacle_y_local * math.sin(robot_theta))
-        obstacle_y_world = (robot_y +
-                           obstacle_x_local * math.sin(robot_theta) +
-                           obstacle_y_local * math.cos(robot_theta))
-
-        return (obstacle_x_world, obstacle_y_world)
-
-    def _is_valid_obstacle(self, grid_pos, robot_gx, robot_gy):
-        """
-        Check if detected obstacle is valid (not noise/known/robot body).
-
-        Filtering logic:
-        1. Check bounds
-        2. Filter robot body (too close)
-        3. Filter known SLAM obstacles (already in map)
-        4. Special case: Free corridor walls need SLAM confirmation
-
-        Args:
-            grid_pos: Obstacle position (gx, gy)
-            robot_gx, robot_gy: Robot position in grid
-
-        Returns:
-            True if valid obstacle, False if filtered out
-        """
-        gx, gy = grid_pos
-
-        # Check bounds
-        if not (0 <= gx < self.grid_original.shape[1] and
-                0 <= gy < self.grid_original.shape[0]):
-            return False
-
-        # Filter robot body detections
-        dist_from_robot = math.sqrt((gx - robot_gx)**2 + (gy - robot_gy)**2)
-        if dist_from_robot < PlannerConstants.ROBOT_BODY_RADIUS_CELLS:
-            return False
-
-        # Filter known SLAM obstacles (already in map)
-        if self._is_near_known_obstacle(gx, gy, PlannerConstants.KNOWN_OBSTACLE_TOLERANCE):
-            return False
-
-        # Check if completely free in all grids (likely corridor wall)
-        is_completely_free = (self.grid_original[gy, gx] == 0 and
-                             self.grid[gy, gx] == 0 and
-                             self.grid_dynamic[gy, gx] == 0)
-
-        if is_completely_free:
-            # Only keep if confirmed by SLAM or very close to robot
-            if (self.grid_slam is not None and
-                0 <= gx < self.grid_slam.shape[1] and
-                0 <= gy < self.grid_slam.shape[0] and
-                self.grid_slam[gy, gx] != 0):
-                return True
-            return dist_from_robot <= PlannerConstants.CLOSE_OBSTACLE_CELLS
-
-        return True
-
-    def _debug_obstacle_filter(self, grid_pos, robot_gx, robot_gy, range_val, angle):
-        """
-        Debug helper to log why a front-facing obstacle was filtered.
-
-        Only called for close front obstacles that were rejected.
-        """
-        gx, gy = grid_pos
-        dist_from_robot = math.sqrt((gx - robot_gx)**2 + (gy - robot_gy)**2)
-
-        reasons = []
-
-        # Check bounds
-        if not (0 <= gx < self.grid_original.shape[1] and
-                0 <= gy < self.grid_original.shape[0]):
-            reasons.append('OUT_OF_BOUNDS')
-        else:
-            # Check robot body filter
-            if dist_from_robot < PlannerConstants.ROBOT_BODY_RADIUS_CELLS:
-                reasons.append(f'ROBOT_BODY(dist={dist_from_robot:.1f}<{PlannerConstants.ROBOT_BODY_RADIUS_CELLS})')
-
-            # Check known obstacle filter
-            if self._is_near_known_obstacle(gx, gy, PlannerConstants.KNOWN_OBSTACLE_TOLERANCE):
-                reasons.append(f'NEAR_KNOWN(tol={PlannerConstants.KNOWN_OBSTACLE_TOLERANCE})')
-
-            # Check completely free filter
-            if (0 <= gx < self.grid_original.shape[1] and 0 <= gy < self.grid_original.shape[0]):
-                is_completely_free = (self.grid_original[gy, gx] == 0 and
-                                     self.grid[gy, gx] == 0 and
-                                     self.grid_dynamic[gy, gx] == 0)
-                if is_completely_free:
-                    slam_confirmed = (self.grid_slam is not None and
-                                    0 <= gx < self.grid_slam.shape[1] and
-                                    0 <= gy < self.grid_slam.shape[0] and
-                                    self.grid_slam[gy, gx] != 0)
-                    if not slam_confirmed and dist_from_robot > PlannerConstants.CLOSE_OBSTACLE_CELLS:
-                        reasons.append(f'FREE_NO_SLAM(dist={dist_from_robot:.1f}>{PlannerConstants.CLOSE_OBSTACLE_CELLS})')
-
-        if reasons:
-            angle_deg = math.degrees(angle)
-            # self.get_logger().warn(
-            #     f'FILTERED front obstacle: pos=({gx},{gy}), range={range_val:.2f}m, '
-            #     f'angle={angle_deg:.1f}deg, reasons={reasons}'
-            # )
-
-    def _is_near_known_obstacle(self, gx, gy, tolerance):
-        """
-        Check if position is near a known SLAM obstacle.
-
-        Used to filter out lidar detections that are just seeing obstacles
-        already known from SLAM.
-
-        Args:
-            gx, gy: Position to check
-            tolerance: Search radius in cells
-
-        Returns:
-            True if near known obstacle, False otherwise
-        """
-        rows, cols = self.grid_original.shape
-
-        if not (0 <= gx < cols and 0 <= gy < rows):
-            return False
-
-        # Check neighborhood
-        for dx in range(-tolerance, tolerance + 1):
-            for dy in range(-tolerance, tolerance + 1):
-                check_x, check_y = gx + dx, gy + dy
-                if (0 <= check_x < cols and 0 <= check_y < rows and
-                    self.grid_original[check_y, check_x] != 0):
-                    return True
-
-        return False
-
-    def _map_obstacles_to_neighbors(self, detected_obstacles, robot_gx, robot_gy):
-        """
-        Map detected obstacles to robot's 8-connected neighbor cells.
-
-        For marking in the grid, obstacles are mapped to the robot's immediate
-        neighbors for safety and control purposes.
-
-        Args:
-            detected_obstacles: List of obstacle positions [(gx, gy), ...]
-            robot_gx, robot_gy: Robot position
-
-        Returns:
-            List of neighbor cells [(gx, gy), ...] with obstacles
-        """
-        # Get robot's 8-connected neighbors
-        neighbors = []
-        for dx in range(-1, 2):
-            for dy in range(-1, 2):
-                if dx == 0 and dy == 0:
-                    continue
-                nx, ny = robot_gx + dx, robot_gy + dy
-                if 0 <= nx < self.grid.shape[1] and 0 <= ny < self.grid.shape[0]:
-                    neighbors.append((nx, ny))
-
-        # Map obstacles to nearest neighbors
-        obst_neighbors = []
-        for obs_gx, obs_gy in detected_obstacles:
-            dist_to_robot = math.sqrt((obs_gx - robot_gx)**2 + (obs_gy - robot_gy)**2)
-
-            # Find closest neighbor to this obstacle
-            min_dist = float('inf')
-            closest_neighbor = None
-            for neighbor in neighbors:
-                dist = (neighbor[0] - obs_gx)**2 + (neighbor[1] - obs_gy)**2
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_neighbor = neighbor
-
-            # Only mark if close enough (emergency threshold)
-            if closest_neighbor and dist_to_robot <= PlannerConstants.EMERGENCY_OBSTACLE_CELLS:
-                if closest_neighbor not in obst_neighbors:
-                    obst_neighbors.append(closest_neighbor)
-
-        return obst_neighbors
-
-    def _update_dynamic_grid_with_lidar(self, detected_obstacles, robot_gx, robot_gy):
-        """
-        Update grid_dynamic with lidar-detected obstacles at their actual positions.
-
-        Starts from grid_base (persistent SLAM obstacles) and adds
-        lidar obstacles on top. Also updates D* Lite planner's graph
-        to keep it in sync with all detected obstacles.
-
-        Args:
-            detected_obstacles: List of obstacle positions [(gx, gy), ...] at actual locations
-            robot_gx, robot_gy: Robot position
-        """
-        # Store previous grid state to detect changes
-        previous_grid = self.grid_dynamic.copy() if self.grid_dynamic is not None else None
-
-        # Start from base grid (preserves SLAM obstacles)
-        self.grid_dynamic = self.grid_base.copy() if self.grid_base is not None else self.grid.copy()
-
-        # Use reduced inflation for dynamic obstacles
-        inflation_cells = max(3, int((self.robot_radius + self.safety_clearance) /
-                                    self.resolution) // PlannerConstants.INFLATION_DIVISOR)
-
-        # Track cells that changed for D* update
-        changed_cells = []
-
-        # Inflate and mark obstacles at their actual detected positions
-        for gx, gy in detected_obstacles:
-            for dy in range(-inflation_cells, inflation_cells + 1):
-                for dx in range(-inflation_cells, inflation_cells + 1):
-                    inflate_x, inflate_y = gx + dx, gy + dy
-                    if (0 <= inflate_x < self.grid_dynamic.shape[1] and
-                        0 <= inflate_y < self.grid_dynamic.shape[0] and
-                        self.grid[inflate_y, inflate_x] == 0):  # Don't overwrite SLAM obstacles
-                        # Track if this is a new obstacle
-                        if self.grid_dynamic[inflate_y, inflate_x] == 0:
-                            changed_cells.append((inflate_x, inflate_y))
-                        self.grid_dynamic[inflate_y, inflate_x] = 1
-
-        # Keep robot's immediate position free
-        for dy in range(-PlannerConstants.ROBOT_CLEARANCE_CELLS,
-                       PlannerConstants.ROBOT_CLEARANCE_CELLS + 1):
-            for dx in range(-PlannerConstants.ROBOT_CLEARANCE_CELLS,
-                          PlannerConstants.ROBOT_CLEARANCE_CELLS + 1):
-                free_x, free_y = robot_gx + dx, robot_gy + dy
-                if (0 <= free_x < self.grid_dynamic.shape[1] and
-                    0 <= free_y < self.grid_dynamic.shape[0] and
-                    self.grid[free_y, free_x] == 0):  # Don't clear SLAM obstacles
-                    self.grid_dynamic[free_y, free_x] = 0
-
-        # Update D* Lite planner with lidar changes to keep graph in sync
-        if self.dstar_planner is not None and changed_cells:
-            self.dstar_planner.grid = self.grid_dynamic.copy()
-            self.dstar_planner.update_obstacles(changed_cells)
-
-        # Publish updated dynamic grid for visualization
-        self.publish_dynamic_grid()
-
-    def _check_obstacles_block_path(self, detected_obstacles, robot_gx, robot_gy, _unused=None):
-        """
-        Check if detected obstacles block the planned path.
-
-        Key features:
-        - Only checks obstacles within MAX_OBSTACLE_CHECK_DISTANCE
-        - Skips obstacles we've already replanned for (prevents loops)
-        - Only checks next few path segments (not entire path)
-        - Uses robot footprint as blocking threshold
-
-        Args:
-            detected_obstacles: Actual obstacle positions [(gx, gy), ...]
-            robot_gx, robot_gy: Robot position
-            _unused: Deprecated parameter, kept for compatibility
-
-        Returns:
-            True if obstacles block path, False otherwise
-        """
-        # Use robot's actual footprint as threshold
-        robot_footprint_cells = int((self.robot_radius + self.safety_clearance) / self.resolution)
-        blocking_threshold = robot_footprint_cells
-
-        max_check_distance = PlannerConstants.MAX_OBSTACLE_CHECK_DISTANCE
-
-        # Check actual detected obstacles, not neighbor cells
-        for obs_gx, obs_gy in detected_obstacles:
-            # Filter distant obstacles
-            dist_from_robot = math.sqrt((obs_gx - robot_gx)**2 + (obs_gy - robot_gy)**2)
-            if dist_from_robot > max_check_distance:
-                continue
-
-            # CRITICAL: Skip obstacles we've already replanned for
-            # This prevents replanning loops
-            if (obs_gx, obs_gy) in self.known_obstacles:
-                continue
-
-            # Check if in planner's grid snapshot (already considered)
-            if (self.planner_grid_snapshot is not None and
-                0 <= obs_gx < self.planner_grid_snapshot.shape[1] and
-                0 <= obs_gy < self.planner_grid_snapshot.shape[0] and
-                self.planner_grid_snapshot[obs_gy, obs_gx] != 0):
-                # Already considered - add to known set
-                self.known_obstacles.add((obs_gx, obs_gy))
-                continue
-
-            # Check if obstacle blocks next few path segments
-            for i in range(self.current_waypoint_idx,
-                          min(self.current_waypoint_idx + 3, len(self.path))):
-
-                # Get segment endpoints
-                if i == self.current_waypoint_idx:
-                    start_gx, start_gy = robot_gx, robot_gy
-                else:
-                    prev_wp = self.path[i-1]
-                    start_gx, start_gy = self.world_to_grid(prev_wp[0], prev_wp[1])
-
-                end_wp = self.path[i]
-                end_gx, end_gy = self.world_to_grid(end_wp[0], end_wp[1])
-
-                # Calculate distance from obstacle to path segment
-                dist_to_segment = self._point_to_segment_distance(
-                    obs_gx, obs_gy, start_gx, start_gy, end_gx, end_gy
-                )
-
-                # Check if obstacle blocks path
-                if dist_to_segment <= blocking_threshold:
-                    # Add to known obstacles to prevent re-triggering
-                    self.known_obstacles.add((obs_gx, obs_gy))
-                    self._log_obstacle_detection(obs_gx, obs_gy, dist_to_segment,
-                                                 blocking_threshold, len(detected_obstacles))
-                    # Store which waypoint is blocked for partial path preservation
-                    self.blocked_waypoint_idx = i
-                    return True
-
-        return False
-
-    def _point_to_segment_distance(self, px, py, x1, y1, x2, y2):
-        """
-        Calculate minimum distance from point to line segment.
-
-        Uses projection to find closest point on segment, then Euclidean distance.
-
-        Args:
-            px, py: Point coordinates
-            x1, y1: Segment start
-            x2, y2: Segment end
-
-        Returns:
-            Minimum distance in cells
-        """
-        dx = x2 - x1
-        dy = y2 - y1
-
-        # Degenerate case: segment is a point
-        if dx == 0 and dy == 0:
-            return math.sqrt((px - x1)**2 + (py - y1)**2)
-
-        # Project point onto line, clamped to segment
-        t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
-
-        # Find closest point on segment
-        closest_x = x1 + t * dx
-        closest_y = y1 + t * dy
-
-        return math.sqrt((px - closest_x)**2 + (py - closest_y)**2)
 
     # ========================================================================
     # PATH PLANNING
@@ -2176,19 +1639,19 @@ class DStarNavigator(Node):
         slam_marker.color = ColorRGBA(r=0.6, g=0.0, b=0.8, a=0.8)  # Purple
         slam_marker.pose.orientation.w = 1.0
 
-        # 4. Lidar/dynamic obstacles (cyan) - in grid_dynamic but not in grid_base
-        lidar_marker = Marker()
-        lidar_marker.header.stamp = stamp
-        lidar_marker.header.frame_id = 'map'
-        lidar_marker.ns = 'lidar_obstacles'
-        lidar_marker.id = 3
-        lidar_marker.type = Marker.CUBE_LIST
-        lidar_marker.action = Marker.ADD
-        lidar_marker.scale.x = self.resolution * 0.9
-        lidar_marker.scale.y = self.resolution * 0.9
-        lidar_marker.scale.z = 0.2
-        lidar_marker.color = ColorRGBA(r=0.0, g=0.8, b=0.8, a=0.9)  # Cyan
-        lidar_marker.pose.orientation.w = 1.0
+        # 4. Dynamic obstacles (cyan) - in grid_dynamic but not in grid_base (from local costmap)
+        dynamic_marker = Marker()
+        dynamic_marker.header.stamp = stamp
+        dynamic_marker.header.frame_id = 'map'
+        dynamic_marker.ns = 'dynamic_obstacles'
+        dynamic_marker.id = 3
+        dynamic_marker.type = Marker.CUBE_LIST
+        dynamic_marker.action = Marker.ADD
+        dynamic_marker.scale.x = self.resolution * 0.9
+        dynamic_marker.scale.y = self.resolution * 0.9
+        dynamic_marker.scale.z = 0.2
+        dynamic_marker.color = ColorRGBA(r=0.0, g=0.8, b=0.8, a=0.9)  # Cyan
+        dynamic_marker.pose.orientation.w = 1.0
 
         # 5. Unknown/unexplored areas (gray)
         unknown_marker = Marker()
@@ -2203,20 +1666,6 @@ class DStarNavigator(Node):
         unknown_marker.scale.z = 0.02
         unknown_marker.color = ColorRGBA(r=0.5, g=0.5, b=0.5, a=0.3)  # Gray, semi-transparent
         unknown_marker.pose.orientation.w = 1.0
-
-        # 6. Lidar obstacles along path (bright green) - what lidar sees on the path
-        path_obstacle_marker = Marker()
-        path_obstacle_marker.header.stamp = stamp
-        path_obstacle_marker.header.frame_id = 'map'
-        path_obstacle_marker.ns = 'lidar_along_path'
-        path_obstacle_marker.id = 5
-        path_obstacle_marker.type = Marker.CUBE_LIST
-        path_obstacle_marker.action = Marker.ADD
-        path_obstacle_marker.scale.x = self.resolution * 1.2  # Slightly larger to stand out
-        path_obstacle_marker.scale.y = self.resolution * 1.2
-        path_obstacle_marker.scale.z = 0.3  # Taller to stand out
-        path_obstacle_marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)  # Bright green
-        path_obstacle_marker.pose.orientation.w = 1.0
 
         # Iterate through grid and categorize obstacles
         rows, cols = self.grid_dynamic.shape
@@ -2244,18 +1693,11 @@ class DStarNavigator(Node):
                     # SLAM-discovered obstacle
                     slam_marker.points.append(point)
                 elif is_dynamic and not is_base:
-                    # Lidar-detected dynamic obstacle
-                    lidar_marker.points.append(point)
+                    # Dynamic obstacle (from local costmap)
+                    dynamic_marker.points.append(point)
                 elif is_unknown and not is_dynamic:
                     # Unknown/unexplored area (shown as passable but unexplored)
                     unknown_marker.points.append(point)
-
-        # Add lidar obstacles along path (stored separately from grid scan)
-        for gx, gy in self.lidar_obstacles_along_path:
-            world_x = gx * self.resolution + self.origin[0]
-            world_y = gy * self.resolution + self.origin[1]
-            point = Point(x=world_x, y=world_y, z=0.0)
-            path_obstacle_marker.points.append(point)
 
         # Add markers to array (only if they have points)
         if original_marker.points:
@@ -2264,12 +1706,10 @@ class DStarNavigator(Node):
             marker_array.markers.append(inflated_marker)
         if slam_marker.points:
             marker_array.markers.append(slam_marker)
-        if lidar_marker.points:
-            marker_array.markers.append(lidar_marker)
+        if dynamic_marker.points:
+            marker_array.markers.append(dynamic_marker)
         if unknown_marker.points:
             marker_array.markers.append(unknown_marker)
-        if path_obstacle_marker.points:
-            marker_array.markers.append(path_obstacle_marker)
 
         # Publish marker array
         self.grid_markers_pub.publish(marker_array)
@@ -2364,12 +1804,6 @@ class DStarNavigator(Node):
             self.get_logger().warn('No odometry data available yet')
             return None
         return (self.current_pose['x'], self.current_pose['y'])
-
-    def _log_obstacle_detection(self, obst_gx, obst_gy, dist, threshold, total_obstacles):
-        """Log obstacle detection event with details."""
-        self.get_logger().warn('Obstacle blocking path detected!')
-        self.get_logger().warn(f'  Position: ({obst_gx},{obst_gy}), Distance: {dist:.1f} cells')
-        self.get_logger().warn(f'  Threshold: {threshold} cells, Total obstacles: {total_obstacles}')
 
     def _log_replanning_trigger(self, reason, count):
         """Log replanning trigger event."""
