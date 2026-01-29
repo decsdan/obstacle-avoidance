@@ -30,11 +30,9 @@ Authors: Devin Dennis, Assisted with Claude Code
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from geometry_msgs.msg import Twist, TwistStamped, PoseStamped, Point
-from nav_msgs.msg import Odometry, OccupancyGrid, Path
+from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
+from nav_msgs.msg import Odometry, OccupancyGrid
 from map_msgs.msg import OccupancyGridUpdate
-from visualization_msgs.msg import Marker, MarkerArray
-from std_msgs.msg import ColorRGBA
 import numpy as np
 import heapq
 import math
@@ -77,11 +75,8 @@ class PlannerConstants:
     CMD_VEL = f'{NAMESPACE}/cmd_vel'
     ODOMETRY = f'{NAMESPACE}/odom'
     OCCUPANCY_GRID = f'{NAMESPACE}/map'
-    PATH = f'{NAMESPACE}/path'
     DYNAMIC_GRID = f'{NAMESPACE}/dynamic_grid'
     GOAL_POSE = f'{NAMESPACE}/d_star_goal_pose'
-    GRID_MARKERS = f'{NAMESPACE}/grid_markers'
-
     # Global costmap topics (Nav2)
     GLOBAL_COSTMAP = f'{NAMESPACE}/global_costmap/costmap'
     GLOBAL_COSTMAP_UPDATES = f'{NAMESPACE}/global_costmap/costmap_updates'
@@ -472,9 +467,7 @@ class DStarNavigator(Node):
 
         # ROS2 publishers
         self.cmd_vel_pub = self.create_publisher(TwistStamped, PlannerConstants.CMD_VEL, 10)
-        self.path_pub = self.create_publisher(Path, PlannerConstants.PATH, 10)
         self.dynamic_grid_pub = self.create_publisher(OccupancyGrid, PlannerConstants.DYNAMIC_GRID, 10)
-        self.grid_markers_pub = self.create_publisher(MarkerArray, PlannerConstants.GRID_MARKERS, 10)
 
         # ROS2 subscribers
         self._setup_subscribers()
@@ -1112,7 +1105,6 @@ class DStarNavigator(Node):
         if self.path:
             self.current_waypoint_idx = 0
             self.get_logger().info(f'Path found with {len(self.path)} waypoints')
-            self.publish_path()
             return True
         else:
             self.get_logger().error('No path found!')
@@ -1539,7 +1531,6 @@ class DStarNavigator(Node):
 
                 self.get_logger().info(f'Replanning successful! Path: {len(self.path)} waypoints '
                                       f'({len(preserved_waypoints)} preserved + {len(new_path)} new)')
-                self.publish_path()
             else:
                 self.get_logger().error('Replanning failed! Stopping navigation.')
                 self.path = []
@@ -1600,27 +1591,6 @@ class DStarNavigator(Node):
     # UTILITY METHODS
     # ========================================================================
 
-    def publish_path(self):
-        """
-        Publish planned path for visualization in RViz.
-
-        Converts waypoint list to ROS Path message.
-        """
-        path_msg = Path()
-        path_msg.header.stamp = self.get_clock().now().to_msg()
-        path_msg.header.frame_id = 'map'
-
-        for x, y in self.path:
-            pose = PoseStamped()
-            pose.header.stamp = path_msg.header.stamp
-            pose.header.frame_id = 'map'
-            pose.pose.position.x = x
-            pose.pose.position.y = y
-            pose.pose.position.z = 0.0
-            path_msg.poses.append(pose)
-
-        self.path_pub.publish(path_msg)
-
     def publish_dynamic_grid(self):
         """
         Publish the dynamic grid for visualization.
@@ -1649,147 +1619,6 @@ class DStarNavigator(Node):
         grid_msg.data = occupancy_data
 
         self.dynamic_grid_pub.publish(grid_msg)
-
-        # Also publish markers for better visualization
-        self.publish_grid_markers()
-
-    def publish_grid_markers(self):
-        """
-        Publish grid obstacles as MarkerArray for RViz visualization.
-
-        Color coding:
-        - Red: Original SLAM obstacles (raw detections)
-        - Orange: Inflated obstacle zones (safety buffer)
-        - Purple: SLAM base obstacles
-        - Cyan: Lidar-detected dynamic obstacles
-
-        Subscribe to /don/grid_markers in RViz to see this.
-        """
-        if self.grid_dynamic is None or self.resolution is None:
-            return
-
-        marker_array = MarkerArray()
-        stamp = self.get_clock().now().to_msg()
-
-        # Create separate markers for different obstacle types
-        # Using CUBE_LIST for efficiency (one marker with many cubes)
-
-        # 1. Original SLAM obstacles (red) - raw detected obstacles
-        original_marker = Marker()
-        original_marker.header.stamp = stamp
-        original_marker.header.frame_id = 'map'
-        original_marker.ns = 'slam_original'
-        original_marker.id = 0
-        original_marker.type = Marker.CUBE_LIST
-        original_marker.action = Marker.ADD
-        original_marker.scale.x = self.resolution * 0.9
-        original_marker.scale.y = self.resolution * 0.9
-        original_marker.scale.z = 0.1
-        original_marker.color = ColorRGBA(r=0.8, g=0.0, b=0.0, a=0.8)  # Red
-        original_marker.pose.orientation.w = 1.0
-
-        # 2. Inflated SLAM obstacles (orange) - safety buffer around obstacles
-        inflated_marker = Marker()
-        inflated_marker.header.stamp = stamp
-        inflated_marker.header.frame_id = 'map'
-        inflated_marker.ns = 'inflated_obstacles'
-        inflated_marker.id = 1
-        inflated_marker.type = Marker.CUBE_LIST
-        inflated_marker.action = Marker.ADD
-        inflated_marker.scale.x = self.resolution * 0.9
-        inflated_marker.scale.y = self.resolution * 0.9
-        inflated_marker.scale.z = 0.05
-        inflated_marker.color = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.5)  # Orange
-        inflated_marker.pose.orientation.w = 1.0
-
-        # 3. SLAM base obstacles (purple) - in grid_base but not in grid
-        slam_marker = Marker()
-        slam_marker.header.stamp = stamp
-        slam_marker.header.frame_id = 'map'
-        slam_marker.ns = 'slam_obstacles'
-        slam_marker.id = 2
-        slam_marker.type = Marker.CUBE_LIST
-        slam_marker.action = Marker.ADD
-        slam_marker.scale.x = self.resolution * 0.9
-        slam_marker.scale.y = self.resolution * 0.9
-        slam_marker.scale.z = 0.15
-        slam_marker.color = ColorRGBA(r=0.6, g=0.0, b=0.8, a=0.8)  # Purple
-        slam_marker.pose.orientation.w = 1.0
-
-        # 4. Dynamic obstacles (cyan) - in grid_dynamic but not in grid_base (from local costmap)
-        dynamic_marker = Marker()
-        dynamic_marker.header.stamp = stamp
-        dynamic_marker.header.frame_id = 'map'
-        dynamic_marker.ns = 'dynamic_obstacles'
-        dynamic_marker.id = 3
-        dynamic_marker.type = Marker.CUBE_LIST
-        dynamic_marker.action = Marker.ADD
-        dynamic_marker.scale.x = self.resolution * 0.9
-        dynamic_marker.scale.y = self.resolution * 0.9
-        dynamic_marker.scale.z = 0.2
-        dynamic_marker.color = ColorRGBA(r=0.0, g=0.8, b=0.8, a=0.9)  # Cyan
-        dynamic_marker.pose.orientation.w = 1.0
-
-        # 5. Unknown/unexplored areas (gray)
-        unknown_marker = Marker()
-        unknown_marker.header.stamp = stamp
-        unknown_marker.header.frame_id = 'map'
-        unknown_marker.ns = 'unknown_areas'
-        unknown_marker.id = 4
-        unknown_marker.type = Marker.CUBE_LIST
-        unknown_marker.action = Marker.ADD
-        unknown_marker.scale.x = self.resolution * 0.9
-        unknown_marker.scale.y = self.resolution * 0.9
-        unknown_marker.scale.z = 0.02
-        unknown_marker.color = ColorRGBA(r=0.5, g=0.5, b=0.5, a=0.3)  # Gray, semi-transparent
-        unknown_marker.pose.orientation.w = 1.0
-
-        # Iterate through grid and categorize obstacles
-        rows, cols = self.grid_dynamic.shape
-        for gy in range(rows):
-            for gx in range(cols):
-                # Convert to world coordinates
-                world_x = gx * self.resolution + self.origin[0]
-                world_y = gy * self.resolution + self.origin[1]
-                point = Point(x=world_x, y=world_y, z=0.0)
-
-                # Check what type of obstacle this is
-                is_original = self.grid_original[gy, gx] != 0 if self.grid_original is not None else False
-                is_inflated = self.grid[gy, gx] != 0 if self.grid is not None else False
-                is_base = self.grid_base[gy, gx] != 0 if self.grid_base is not None else False
-                is_dynamic = self.grid_dynamic[gy, gx] != 0
-                is_unknown = self.grid_unknown[gy, gx] != 0 if self.grid_unknown is not None else False
-
-                if is_original:
-                    # Original SLAM obstacle
-                    original_marker.points.append(point)
-                elif is_inflated:
-                    # Inflated safety zone
-                    inflated_marker.points.append(point)
-                elif is_base and not is_inflated:
-                    # SLAM-discovered obstacle
-                    slam_marker.points.append(point)
-                elif is_dynamic and not is_base:
-                    # Dynamic obstacle (from local costmap)
-                    dynamic_marker.points.append(point)
-                elif is_unknown and not is_dynamic:
-                    # Unknown/unexplored area (shown as passable but unexplored)
-                    unknown_marker.points.append(point)
-
-        # Add markers to array (only if they have points)
-        if original_marker.points:
-            marker_array.markers.append(original_marker)
-        if inflated_marker.points:
-            marker_array.markers.append(inflated_marker)
-        if slam_marker.points:
-            marker_array.markers.append(slam_marker)
-        if dynamic_marker.points:
-            marker_array.markers.append(dynamic_marker)
-        if unknown_marker.points:
-            marker_array.markers.append(unknown_marker)
-
-        # Publish marker array
-        self.grid_markers_pub.publish(marker_array)
 
     def _is_valid_in_inflated_grid(self, grid_pos):
         """
