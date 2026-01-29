@@ -53,7 +53,7 @@ class PlannerConstants:
 
     Adjust these values to tune robot behavior:
     - Increase SAFETY_CLEARANCE for more cautious navigation
-    - Adjust LOCAL_COSTMAP_OBSTACLE_THRESHOLD for obstacle sensitivity
+    - Adjust COSTMAP_OBSTACLE_THRESHOLD for obstacle sensitivity
     """
 
     # -------- Robot Physical Parameters (meters) --------
@@ -82,12 +82,12 @@ class PlannerConstants:
     GOAL_POSE = f'{NAMESPACE}/d_star_goal_pose'
     GRID_MARKERS = f'{NAMESPACE}/grid_markers'
 
-    # Local costmap topics (Nav2)
-    LOCAL_COSTMAP = f'{NAMESPACE}/local_costmap/costmap'
-    LOCAL_COSTMAP_UPDATES = f'{NAMESPACE}/local_costmap/costmap_updates'
+    # Global costmap topics (Nav2)
+    GLOBAL_COSTMAP = f'{NAMESPACE}/global_costmap/costmap'
+    GLOBAL_COSTMAP_UPDATES = f'{NAMESPACE}/global_costmap/costmap_updates'
 
-    # Local costmap configuration
-    LOCAL_COSTMAP_OBSTACLE_THRESHOLD = 50  # Cost value above which cell is considered obstacle (0-254)
+    # Costmap configuration
+    COSTMAP_OBSTACLE_THRESHOLD = 50  # Cost value above which cell is considered obstacle (0-254)
 
 
 
@@ -502,10 +502,10 @@ class DStarNavigator(Node):
         self.planner_grid_snapshot = None  # Snapshot for change detection
         self.known_obstacles = set()       # Track obstacles already replanned for
 
-        # Local costmap state (Nav2 integration)
-        self.local_costmap = None           # Full local costmap data
-        self.local_costmap_info = None      # Costmap metadata (origin, resolution, size)
-        self.grid_local_costmap = None      # Separate layer for local costmap obstacles
+        # Global costmap state (Nav2 integration)
+        self.global_costmap = None          # Full global costmap data
+        self.global_costmap_info = None     # Costmap metadata (origin, resolution, size)
+        self.grid_local_costmap = None      # Separate layer for costmap obstacles
 
         # Control parameters
         self.linear_speed = 0.2
@@ -554,13 +554,13 @@ class DStarNavigator(Node):
             PoseStamped, PlannerConstants.GOAL_POSE, self.goal_pose_callback, 10
         )
 
-        # Local costmap subscribers (Nav2 integration for obstacle detection and clearing)
-        self.local_costmap_sub = self.create_subscription(
-            OccupancyGrid, PlannerConstants.LOCAL_COSTMAP, self.local_costmap_callback, 10
+        # Global costmap subscribers (Nav2 integration for obstacle detection and clearing)
+        self.global_costmap_sub = self.create_subscription(
+            OccupancyGrid, PlannerConstants.GLOBAL_COSTMAP, self.global_costmap_callback, 10
         )
-        self.local_costmap_update_sub = self.create_subscription(
-            OccupancyGridUpdate, PlannerConstants.LOCAL_COSTMAP_UPDATES,
-            self.local_costmap_update_callback, 10
+        self.global_costmap_update_sub = self.create_subscription(
+            OccupancyGridUpdate, PlannerConstants.GLOBAL_COSTMAP_UPDATES,
+            self.global_costmap_update_callback, 10
         )
 
     def goal_pose_callback(self, msg: PoseStamped):
@@ -647,26 +647,26 @@ class DStarNavigator(Node):
         }
 
     # ========================================================================
-    # LOCAL COSTMAP CALLBACKS (Nav2 Integration)
+    # GLOBAL COSTMAP CALLBACKS (Nav2 Integration)
     # ========================================================================
 
-    def local_costmap_callback(self, msg: OccupancyGrid):
+    def global_costmap_callback(self, msg: OccupancyGrid):
         """
-        Receive full local costmap from Nav2.
+        Receive full global costmap from Nav2.
 
         Stores the costmap data and metadata, then immediately processes all
         cells for obstacles. This ensures obstacles appear in the dynamic grid
         as soon as Nav2 detects them, without waiting for incremental updates.
 
         Args:
-            msg: OccupancyGrid message from Nav2 local costmap
+            msg: OccupancyGrid message from Nav2 global costmap
         """
-        self.local_costmap = np.array(msg.data, dtype=np.int8).reshape(
+        self.global_costmap = np.array(msg.data, dtype=np.int8).reshape(
             (msg.info.height, msg.info.width)
         )
-        self.local_costmap_info = msg.info
+        self.global_costmap_info = msg.info
         self.get_logger().debug(
-            f'Received local costmap: {msg.info.width}x{msg.info.height}, '
+            f'Received global costmap: {msg.info.width}x{msg.info.height}, '
             f'resolution: {msg.info.resolution}m'
         )
 
@@ -681,7 +681,7 @@ class DStarNavigator(Node):
 
         for cy in range(msg.info.height):
             for cx in range(msg.info.width):
-                cost = self.local_costmap[cy, cx]
+                cost = self.global_costmap[cy, cx]
 
                 # Convert costmap cell to world coordinates
                 world_x = costmap_origin_x + cx * costmap_resolution
@@ -693,9 +693,9 @@ class DStarNavigator(Node):
                 if not self._in_bounds(grid_x, grid_y):
                     continue
 
-                is_obstacle = 1 if cost > PlannerConstants.LOCAL_COSTMAP_OBSTACLE_THRESHOLD else 0
+                is_obstacle = 1 if cost > PlannerConstants.COSTMAP_OBSTACLE_THRESHOLD else 0
 
-                # Update local costmap layer
+                # Update costmap layer
                 if self.grid_local_costmap is not None:
                     self.grid_local_costmap[grid_y, grid_x] = is_obstacle
 
@@ -707,7 +707,7 @@ class DStarNavigator(Node):
         if changed_cells and self.dstar_planner:
             self.dstar_planner.update_obstacles(changed_cells)
             self.get_logger().debug(
-                f'Full local costmap processed: {len(changed_cells)} cells changed')
+                f'Full global costmap processed: {len(changed_cells)} cells changed')
 
             self.publish_dynamic_grid()
 
@@ -719,27 +719,26 @@ class DStarNavigator(Node):
                     path_blocked = self._check_path_blocked_by_costmap_changes(changed_cells)
                     if path_blocked:
                         self.get_logger().warn(
-                            f'Full costmap detected obstacle in path, triggering replan '
+                            f'Global costmap detected obstacle in path, triggering replan '
                             f'({len(changed_cells)} cells changed)')
                     else:
                         self.get_logger().info(
-                            f'Full costmap grid changed ({len(changed_cells)} cells), '
+                            f'Global costmap grid changed ({len(changed_cells)} cells), '
                             f'replanning for potentially better route')
                     self.replanning_needed = True
                     self.last_replan_time = current_time
 
-    def local_costmap_update_callback(self, msg: OccupancyGridUpdate):
+    def global_costmap_update_callback(self, msg: OccupancyGridUpdate):
         """
-        Process incremental local costmap updates from Nav2.
+        Process incremental global costmap updates from Nav2.
 
         Updates the dynamic grid with obstacle changes detected by Nav2's
-        costmap layers. This handles both obstacle detection AND clearing,
-        solving the problem where SLAM doesn't clear removed obstacles quickly.
+        costmap layers. This handles both obstacle detection AND clearing.
 
         Args:
             msg: OccupancyGridUpdate message containing changed cells
         """
-        if self.local_costmap is None or self.local_costmap_info is None:
+        if self.global_costmap is None or self.global_costmap_info is None:
             return
 
         if self.grid_dynamic is None or self.resolution is None:
@@ -748,15 +747,15 @@ class DStarNavigator(Node):
         changed_cells = []
 
         for i, cost in enumerate(msg.data):
-            # Calculate position in local costmap
+            # Calculate position in global costmap
             local_x = msg.x + (i % msg.width)
             local_y = msg.y + (i // msg.width)
 
-            # Convert local costmap coordinates to world coordinates
-            world_x = (self.local_costmap_info.origin.position.x +
-                      local_x * self.local_costmap_info.resolution)
-            world_y = (self.local_costmap_info.origin.position.y +
-                      local_y * self.local_costmap_info.resolution)
+            # Convert global costmap coordinates to world coordinates
+            world_x = (self.global_costmap_info.origin.position.x +
+                      local_x * self.global_costmap_info.resolution)
+            world_y = (self.global_costmap_info.origin.position.y +
+                      local_y * self.global_costmap_info.resolution)
 
             # Convert world coordinates to our grid coordinates
             grid_x, grid_y = self.world_to_grid(world_x, world_y)
@@ -766,9 +765,9 @@ class DStarNavigator(Node):
                 continue
 
             # Convert Nav2 cost (0-254) to binary obstacle (0 or 1)
-            is_obstacle = 1 if cost > PlannerConstants.LOCAL_COSTMAP_OBSTACLE_THRESHOLD else 0
+            is_obstacle = 1 if cost > PlannerConstants.COSTMAP_OBSTACLE_THRESHOLD else 0
 
-            # Update the local costmap layer (survives SLAM resets)
+            # Update the costmap layer (survives SLAM resets)
             if self.grid_local_costmap is not None:
                 self.grid_local_costmap[grid_y, grid_x] = is_obstacle
 
@@ -780,7 +779,7 @@ class DStarNavigator(Node):
         # Update D* Lite planner with changed cells and trigger replan
         if changed_cells and self.dstar_planner:
             self.dstar_planner.update_obstacles(changed_cells)
-            self.get_logger().debug(f'Local costmap update: {len(changed_cells)} cells changed')
+            self.get_logger().debug(f'Global costmap update: {len(changed_cells)} cells changed')
 
             # Republish dynamic grid and markers so visualization reflects the changes
             self.publish_dynamic_grid()
@@ -794,7 +793,7 @@ class DStarNavigator(Node):
                     path_blocked = self._check_path_blocked_by_costmap_changes(changed_cells)
                     if path_blocked:
                         self.get_logger().warn(
-                            f'Local costmap detected obstacle in path, triggering replan '
+                            f'Global costmap detected obstacle in path, triggering replan '
                             f'({len(changed_cells)} cells changed)')
                     else:
                         self.get_logger().info(
