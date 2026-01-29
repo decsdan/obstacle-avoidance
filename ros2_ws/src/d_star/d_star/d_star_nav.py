@@ -29,6 +29,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
 from nav_msgs.msg import Odometry, OccupancyGrid
+from sensor_msgs.msg import LaserScan
 from map_msgs.msg import OccupancyGridUpdate
 import numpy as np
 import heapq
@@ -78,6 +79,11 @@ class PlannerConstants:
     # Local costmap topics (Nav2) - used for dynamic obstacle detection
     LOCAL_COSTMAP = f'{NAMESPACE}/local_costmap/costmap'
     LOCAL_COSTMAP_UPDATES = f'{NAMESPACE}/local_costmap/costmap_updates'
+
+    # Lidar topic and configuration
+    SCAN = f'{NAMESPACE}/scan'
+    LIDAR_CLEAR_RANGE = 3.0           # Max range (meters) to clear stale obstacles via lidar
+    LIDAR_ANGLE_OFFSET = 0.0          # Lidar mounting angle offset (radians)
 
     # Costmap configuration
     COSTMAP_OBSTACLE_THRESHOLD = 50  # Cost value above which cell is considered obstacle (0-254)
@@ -382,6 +388,9 @@ class DStarNavigator(Node):
         self.local_costmap = None
         self.local_costmap_info = None
 
+        # Lidar state
+        self.latest_scan = None
+
         # Control parameters
         self.linear_speed = 0.2
         self.angular_speed = 0.5
@@ -408,6 +417,9 @@ class DStarNavigator(Node):
 
         self.odom_sub = self.create_subscription(
             Odometry, PlannerConstants.ODOMETRY, self.odom_callback, qos_best_effort
+        )
+        self.scan_sub = self.create_subscription(
+            LaserScan, PlannerConstants.SCAN, self.scan_callback, qos_best_effort
         )
 
         # Goal pose subscriber
@@ -462,6 +474,7 @@ class DStarNavigator(Node):
         self.get_logger().info(f'Listening for goal poses on: {PlannerConstants.GOAL_POSE}')
         self.get_logger().info(f'Global costmap: {PlannerConstants.GLOBAL_COSTMAP}')
         self.get_logger().info(f'Local costmap: {PlannerConstants.LOCAL_COSTMAP}')
+        self.get_logger().info(f'Lidar scan: {PlannerConstants.SCAN} (clear range: {PlannerConstants.LIDAR_CLEAR_RANGE}m)')
 
     # ========================================================================
     # ROS2 CALLBACKS
@@ -474,6 +487,89 @@ class DStarNavigator(Node):
             'y': msg.pose.pose.position.y,
             'theta': self.quaternion_to_yaw(msg.pose.pose.orientation)
         }
+
+    def scan_callback(self, msg):
+        """Store latest lidar scan and verify obstacles."""
+        self.latest_scan = msg
+        if self.grid_dynamic is not None and self.current_pose is not None:
+            self._verify_obstacles_with_lidar()
+
+    # ========================================================================
+    # LIDAR OBSTACLE VERIFICATION
+    # ========================================================================
+
+    def _verify_obstacles_with_lidar(self):
+        """
+        Use lidar rays to clear stale obstacles from grid_dynamic.
+
+        For each lidar ray that passes through a grid cell without hitting
+        anything, clear that cell if it was marked as an obstacle by the
+        local costmap layer (not the global costmap base).
+        """
+        if self.latest_scan is None or self.current_pose is None:
+            return
+        if self.grid_dynamic is None or self.resolution is None:
+            return
+
+        scan = self.latest_scan
+        robot_x = self.current_pose['x']
+        robot_y = self.current_pose['y']
+        robot_theta = self.current_pose['theta']
+
+        cleared_cells = set()
+        step_size = self.resolution / 2.0
+        clear_range = PlannerConstants.LIDAR_CLEAR_RANGE
+        angle_offset = PlannerConstants.LIDAR_ANGLE_OFFSET
+
+        angle = scan.angle_min
+        for range_val in scan.ranges:
+            # Compute world angle for this ray
+            world_angle = robot_theta + angle + angle_offset
+
+            if (math.isfinite(range_val) and
+                range_val >= scan.range_min and
+                range_val <= scan.range_max):
+                # Valid return — ray hit something
+                # March along ray up to the hit point and clear cells before it
+                march_range = min(range_val, clear_range)
+            else:
+                # No valid return — ray passed through entirely
+                march_range = clear_range
+
+            # March along the ray, clearing stale obstacle cells
+            dist = step_size
+            while dist < march_range:
+                wx = robot_x + dist * math.cos(world_angle)
+                wy = robot_y + dist * math.sin(world_angle)
+                gx, gy = self.world_to_grid(wx, wy)
+
+                if not self._in_bounds(gx, gy):
+                    break
+
+                # Only clear cells from local costmap layer, not global base
+                if (self.grid_local_costmap[gy, gx] != 0 and
+                    self.grid_base[gy, gx] == 0):
+                    self.grid_local_costmap[gy, gx] = 0
+                    cleared_cells.add((gx, gy))
+
+                dist += step_size
+
+            angle += scan.angle_increment
+
+        # Apply cleared cells to grid_dynamic and update planner
+        if cleared_cells:
+            changed = []
+            for gx, gy in cleared_cells:
+                new_val = self.grid_base[gy, gx]
+                if self.grid_dynamic[gy, gx] != new_val:
+                    self.grid_dynamic[gy, gx] = new_val
+                    changed.append((gx, gy))
+
+            if changed and self.dstar_planner:
+                self.dstar_planner.grid = self.grid_dynamic.copy()
+                self.dstar_planner.update_obstacles(changed)
+                self.get_logger().debug(
+                    f'Lidar verification cleared {len(changed)} stale obstacle cells')
 
     # ========================================================================
     # GLOBAL COSTMAP CALLBACKS (Base/Persistent Map)
@@ -728,11 +824,15 @@ class DStarNavigator(Node):
         """
         Check if changed cells warrant replanning and trigger if so.
 
-        Applies cooldown to prevent rapid replanning.
+        First verifies obstacles with lidar to clear stale ones, then
+        applies cooldown to prevent rapid replanning.
 
         Args:
             changed_cells: List of (grid_x, grid_y) tuples that changed
         """
+        # Verify with lidar first — may clear stale obstacles and avoid replan
+        self._verify_obstacles_with_lidar()
+
         current_time = self.get_clock().now()
         time_since_last_replan = (current_time - self.last_replan_time).nanoseconds / 1e9
 
@@ -1096,8 +1196,17 @@ class DStarNavigator(Node):
                 self.get_logger().info(f'Replanning successful! Path: {len(self.path)} waypoints '
                                       f'({len(preserved_waypoints)} preserved + {len(new_path)} new)')
             else:
-                self.get_logger().error('Replanning failed! Stopping navigation.')
-                self.path = []
+                # Keep path up to the obstacle so robot drives as far as it can
+                if (self.blocked_waypoint_idx is not None and
+                    self.blocked_waypoint_idx > self.current_waypoint_idx and
+                    self.path):
+                    self.path = self.path[:self.blocked_waypoint_idx]
+                    self.get_logger().warn(
+                        f'Replanning failed! Keeping path up to obstacle '
+                        f'(waypoint {self.blocked_waypoint_idx}), {len(self.path)} waypoints remain')
+                else:
+                    self.get_logger().error('Replanning failed! No valid partial path, stopping navigation.')
+                    self.path = []
 
         self.blocked_waypoint_idx = None
         self.replanning_needed = False
