@@ -1469,6 +1469,9 @@ class DStarNavigator(Node):
         2. If goal reached -> stop and clear path
         3. Otherwise -> follow current waypoint
         """
+        # Publish dynamic grid for visualization (every control loop cycle)
+        self.publish_dynamic_grid()
+
         if not self.path or self.current_pose is None:
             return
 
