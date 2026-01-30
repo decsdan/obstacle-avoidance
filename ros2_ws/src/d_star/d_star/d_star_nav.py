@@ -75,6 +75,7 @@ class PlannerConstants:
     CMD_VEL = f'{NAMESPACE}/cmd_vel'
     ODOMETRY = f'{NAMESPACE}/odom'
     OCCUPANCY_GRID = f'{NAMESPACE}/map'
+    DYNAMIC_GRID = f'{NAMESPACE}/dynamic_grid'
     GOAL_POSE = f'{NAMESPACE}/d_star_goal_pose'
 
     # Local costmap topics (Nav2)
@@ -466,6 +467,7 @@ class DStarNavigator(Node):
 
         # ROS2 publishers
         self.cmd_vel_pub = self.create_publisher(TwistStamped, PlannerConstants.CMD_VEL, 10)
+        self.dynamic_grid_pub = self.create_publisher(OccupancyGrid, PlannerConstants.DYNAMIC_GRID, 10)
 
         # ROS2 subscribers
         self._setup_subscribers()
@@ -700,6 +702,8 @@ class DStarNavigator(Node):
             self.get_logger().debug(
                 f'Full local costmap processed: {len(changed_cells)} cells changed')
 
+            self.publish_dynamic_grid()
+
             if self.path:
                 current_time = self.get_clock().now()
                 time_since_last_replan = (current_time - self.last_replan_time).nanoseconds / 1e9
@@ -770,6 +774,9 @@ class DStarNavigator(Node):
         if changed_cells and self.dstar_planner:
             self.dstar_planner.update_obstacles(changed_cells)
             self.get_logger().debug(f'Local costmap update: {len(changed_cells)} cells changed')
+
+            # Republish dynamic grid so visualization reflects the changes
+            self.publish_dynamic_grid()
 
             if self.path:
                 current_time = self.get_clock().now()
@@ -1031,6 +1038,9 @@ class DStarNavigator(Node):
             self.dstar_planner.grid = self.grid_dynamic.copy()
             self.dstar_planner.update_obstacles(changed_cells)
             self.planner_grid_snapshot = self.grid_base.copy()
+
+        # Publish updated dynamic grid for visualization
+        self.publish_dynamic_grid()
 
     def _check_path_blocked_by_obstacles(self, obstacles_grid):
         """
@@ -1583,6 +1593,35 @@ class DStarNavigator(Node):
     # ========================================================================
     # UTILITY METHODS
     # ========================================================================
+
+    def publish_dynamic_grid(self):
+        """
+        Publish the dynamic grid for visualization.
+
+        The dynamic grid shows the current planning grid including:
+        - SLAM-discovered obstacles
+        - Lidar-detected obstacles (temporary)
+        """
+        if self.grid_dynamic is None or self.resolution is None:
+            return
+
+        grid_msg = OccupancyGrid()
+        grid_msg.header.stamp = self.get_clock().now().to_msg()
+        grid_msg.header.frame_id = 'map'
+
+        # Set map metadata
+        grid_msg.info.resolution = self.resolution
+        grid_msg.info.width = self.grid_dynamic.shape[1]
+        grid_msg.info.height = self.grid_dynamic.shape[0]
+        grid_msg.info.origin.position.x = self.origin[0]
+        grid_msg.info.origin.position.y = self.origin[1]
+        grid_msg.info.origin.position.z = 0.0
+
+        # Convert grid to occupancy data (0=free, 100=occupied)
+        occupancy_data = (self.grid_dynamic * 100).astype(np.int8).flatten().tolist()
+        grid_msg.data = occupancy_data
+
+        self.dynamic_grid_pub.publish(grid_msg)
 
     def _is_valid_in_inflated_grid(self, grid_pos):
         """
