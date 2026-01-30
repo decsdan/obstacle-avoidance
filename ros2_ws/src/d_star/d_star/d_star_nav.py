@@ -499,6 +499,7 @@ class DStarNavigator(Node):
         self.local_costmap = None           # Full local costmap data
         self.local_costmap_info = None      # Costmap metadata (origin, resolution, size)
         self.grid_local_costmap = None      # Separate layer for local costmap obstacles
+        self.grid_local_costmap_mask = None # Mask tracking which cells have costmap data (1=has data, 0=no data)
 
         # Control parameters
         self.linear_speed = 0.2
@@ -713,6 +714,9 @@ class DStarNavigator(Node):
             # Update the local costmap layer (survives SLAM resets)
             if self.grid_local_costmap is not None:
                 self.grid_local_costmap[grid_y, grid_x] = is_obstacle
+                # Mark this cell as having costmap data (so it overrides SLAM)
+                if self.grid_local_costmap_mask is not None:
+                    self.grid_local_costmap_mask[grid_y, grid_x] = 1
 
             # Track changes for D* Lite incremental update
             if self.grid_dynamic[grid_y, grid_x] != is_obstacle:
@@ -722,7 +726,12 @@ class DStarNavigator(Node):
         # Update D* Lite planner with changed cells and trigger replan
         if changed_cells and self.dstar_planner:
             self.dstar_planner.update_obstacles(changed_cells)
-            self.get_logger().debug(f'Local costmap update: {len(changed_cells)} cells changed')
+            num_obstacles = sum(1 for x, y in changed_cells if self.grid_dynamic[y, x] == 1)
+            num_cleared = len(changed_cells) - num_obstacles
+            self.get_logger().info(
+                f'Local costmap update: {len(changed_cells)} cells changed '
+                f'({num_obstacles} obstacles, {num_cleared} cleared) - COSTMAP IS TRUTH'
+            )
 
             # Republish dynamic grid so visualization reflects the changes
             self.publish_dynamic_grid()
@@ -888,6 +897,7 @@ class DStarNavigator(Node):
         self.grid_dynamic = np.zeros((height, width), dtype=np.int8)
         self.grid_unknown = np.zeros((height, width), dtype=np.int8)
         self.grid_local_costmap = np.zeros((height, width), dtype=np.int8)
+        self.grid_local_costmap_mask = np.zeros((height, width), dtype=np.int8)  # Tracks which cells have costmap data
 
     def _map_slam_to_grid(self, slam_grid, unknown_mask, slam_resolution, slam_origin,
                           height, width, previous_unknown):
@@ -967,10 +977,15 @@ class DStarNavigator(Node):
             # Replace base with current SLAM state (not accumulate)
             self.grid_base = slam_obstacles_inflated
 
-        # Update dynamic grid to match base, then merge local costmap obstacles back in
+        # Update dynamic grid: Start with SLAM base, then COSTMAP OVERRIDES as truth
         self.grid_dynamic = self.grid_base.copy()
-        if self.grid_local_costmap is not None:
-            self.grid_dynamic = np.maximum(self.grid_dynamic, self.grid_local_costmap)
+        if self.grid_local_costmap is not None and self.grid_local_costmap_mask is not None:
+            # Where costmap has data (mask==1), use costmap value (overrides SLAM)
+            # Where no costmap data (mask==0), use SLAM value
+            # This makes costmap the "truth" over SLAM since it's real-time sensor data
+            self.grid_dynamic = np.where(self.grid_local_costmap_mask == 1,
+                                        self.grid_local_costmap,
+                                        self.grid_dynamic)
 
         # Find changed cells (both additions AND removals)
         changed_cells = []
