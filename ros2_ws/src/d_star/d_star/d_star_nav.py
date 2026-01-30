@@ -683,12 +683,18 @@ class DStarNavigator(Node):
             msg: OccupancyGridUpdate message containing changed cells
         """
         if self.local_costmap is None or self.local_costmap_info is None:
+            self.get_logger().warn('Costmap update IGNORED: local_costmap or info not initialized')
             return
 
         if self.grid_dynamic is None or self.resolution is None:
+            self.get_logger().warn('Costmap update IGNORED: grid_dynamic or resolution not initialized')
             return
 
+        self.get_logger().info(f'Costmap update received: {len(msg.data)} cells, position=({msg.x}, {msg.y}), size={msg.width}x{msg.height}')
+
         changed_cells = []
+        obstacles_detected = 0
+        out_of_bounds = 0
 
         for i, cost in enumerate(msg.data):
             # Calculate position in local costmap
@@ -706,10 +712,14 @@ class DStarNavigator(Node):
 
             # Check bounds
             if not self._in_bounds(grid_x, grid_y):
+                out_of_bounds += 1
                 continue
 
             # Convert Nav2 cost (0-254) to binary obstacle (0 or 1)
             is_obstacle = 1 if cost > PlannerConstants.LOCAL_COSTMAP_OBSTACLE_THRESHOLD else 0
+
+            if is_obstacle:
+                obstacles_detected += 1
 
             # Update the local costmap layer (survives SLAM resets)
             if self.grid_local_costmap is not None:
@@ -723,14 +733,19 @@ class DStarNavigator(Node):
                 self.grid_dynamic[grid_y, grid_x] = is_obstacle
                 changed_cells.append((grid_x, grid_y))
 
+        # Log summary
+        self.get_logger().info(
+            f'Costmap processing: {obstacles_detected} obstacles detected, '
+            f'{out_of_bounds} out of bounds, {len(changed_cells)} cells changed in grid_dynamic'
+        )
+
         # Update D* Lite planner with changed cells and trigger replan
         if changed_cells and self.dstar_planner:
             self.dstar_planner.update_obstacles(changed_cells)
             num_obstacles = sum(1 for x, y in changed_cells if self.grid_dynamic[y, x] == 1)
             num_cleared = len(changed_cells) - num_obstacles
             self.get_logger().info(
-                f'Local costmap update: {len(changed_cells)} cells changed '
-                f'({num_obstacles} obstacles, {num_cleared} cleared) - COSTMAP IS TRUTH'
+                f'Applied to D* planner: {num_obstacles} obstacles, {num_cleared} cleared - COSTMAP IS TRUTH'
             )
 
             # Republish dynamic grid so visualization reflects the changes
@@ -983,6 +998,12 @@ class DStarNavigator(Node):
             # Where costmap has data (mask==1), use costmap value (overrides SLAM)
             # Where no costmap data (mask==0), use SLAM value
             # This makes costmap the "truth" over SLAM since it's real-time sensor data
+            costmap_cells_count = np.sum(self.grid_local_costmap_mask)
+            costmap_obstacles_count = np.sum((self.grid_local_costmap_mask == 1) & (self.grid_local_costmap == 1))
+            self.get_logger().info(
+                f'SLAM merge: Applying costmap override to {costmap_cells_count} cells '
+                f'({costmap_obstacles_count} obstacles from costmap)'
+            )
             self.grid_dynamic = np.where(self.grid_local_costmap_mask == 1,
                                         self.grid_local_costmap,
                                         self.grid_dynamic)
