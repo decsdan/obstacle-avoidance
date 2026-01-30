@@ -959,13 +959,13 @@ class DStarNavigator(Node):
         # Start with base grid (empty initially, allowing exploration)
         self.grid_base = self.grid.copy()
 
-        # Add current SLAM obstacles (inflated)
+        # Replace with current SLAM obstacles (inflated) - allows both adding AND removing
         if current_slam_obstacles.sum() > 0:
             total_inflation = self.robot_radius + self.safety_clearance
             slam_obstacles_inflated = self._inflate_obstacles(current_slam_obstacles, total_inflation)
 
-            # Merge SLAM obstacles with base
-            self.grid_base = np.maximum(self.grid_base, slam_obstacles_inflated)
+            # Replace base with current SLAM state (not accumulate)
+            self.grid_base = slam_obstacles_inflated
 
         # Update dynamic grid to match base, then merge local costmap obstacles back in
         self.grid_dynamic = self.grid_base.copy()
