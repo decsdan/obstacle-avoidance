@@ -55,9 +55,9 @@ class PlannerConstants:
     """
 
     # -------- Robot Physical Parameters (meters) --------
-    NAMESPACE = '/don'          # Name of the physical robot
+    NAMESPACE = '/mikey'          # Name of the physical robot
     ROBOT_RADIUS = 0.22           # Physical radius of the robot body
-    SAFETY_CLEARANCE = 0.0      # Extra safety buffer around obstacles
+    SAFETY_CLEARANCE = 0.05      # Extra safety buffer around obstacles
                                   # Total inflation = ROBOT_RADIUS + SAFETY_CLEARANCE
 
     # -------- Grid Cell Tolerances (cells) --------
@@ -68,7 +68,7 @@ class PlannerConstants:
     MAX_WAYPOINTS = 10
 
     # -------- Control Parameters --------
-    REPLAN_COOLDOWN = 3.0         # Minimum seconds between replans
+    REPLAN_COOLDOWN = 1.0         # Minimum seconds between replans
     ROBOT_CLEARANCE_CELLS = 3     # Cells around robot to keep free
 
     # -------- Topic Names --------
@@ -513,7 +513,7 @@ class DStarNavigator(Node):
         self.control_timer = self.create_timer(0.1, self.control_loop)
 
         # Visualization timer (1 Hz) - slower updates to avoid flashing
-        self.viz_timer = self.create_timer(1.0, self.publish_dynamic_grid)
+        self.viz_timer = self.create_timer(0.1, self.publish_dynamic_grid)
 
         self.get_logger().info('Using SLAM-only mode')
         self.get_logger().info('Grid will be initialized from first SLAM message')

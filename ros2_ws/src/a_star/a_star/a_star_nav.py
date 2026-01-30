@@ -54,7 +54,7 @@ class NavigatorConstants:
 
     # Robot Physical Parameters (meters)
     ROBOT_RADIUS = 0.22          # TurtleBot4 radius
-    SAFETY_CLEARANCE = 0.05     # Additional safety margin
+    SAFETY_CLEARANCE = 0.00     # Additional safety margin
 
     # Control Parameters
     LINEAR_SPEED = 0.2           # Forward speed (m/s)
@@ -70,12 +70,12 @@ class NavigatorConstants:
     TIGHT_SPACE_RADIUS = 3       # Grid cells to use original grid near start
 
     # Publishing/Subscribing Paths
-    CMD_VEL = '/don/cmd_vel'
-    ODOMETRY = '/don/odom'
+    CMD_VEL = '/mikey/cmd_vel'
+    ODOMETRY = '/mikey/odom'
 
     # Pgm and yaml paths
-    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/maze.yaml'
-    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/maze.pgm'
+    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/simple_static.yaml'
+    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/simple_static.pgm'
 
 
 
