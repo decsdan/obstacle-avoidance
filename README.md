@@ -138,6 +138,9 @@ ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.20 ros2 run a_star a_star_nav
 
 # Run interactive visualizer
 ros2 run a_star visualizer
+
+# Saving SLAM map for navigator
+ros2 run nav2_map_server map_saver_cli -f "map_name" --ros-args -p map_subscribe_transient_local:=true -r __ns:=/don
 ```
 
 **Features:**
