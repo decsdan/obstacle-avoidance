@@ -169,6 +169,10 @@ ros2 run d_star visualizer
 # Run live path visualizer (shows planned vs traveled path)
 ros2 run d_star live_visualizer
 ```
+Note: 
+For nav2, make sure to set the Reliability Policy under the Local Costmap Topic to Best Effort. 
+For setting goals for d_star_nav, make sure to enable the tool properties, and update the topic (goal_pose) for 2d goal pose to {namespace}/d_star_goal_pose.
+To visualize the dynamic grid, make sure to add the topic after running the navigator under the topic dynamic_grid.
 
 **Features:**
 - Incremental pathfinding with dynamic replanning
