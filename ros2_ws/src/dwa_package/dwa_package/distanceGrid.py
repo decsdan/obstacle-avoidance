@@ -15,6 +15,7 @@ different possible routes.
 import numpy as np
 import math
 from collections import deque
+from typing import List, Tuple, Set
 
 def getNeighborCoords(xcoordinate, ycoordinate, grid):
     """
@@ -275,3 +276,52 @@ def generateOccupancyGrid(occupiedPoints, radius=None):
     grid = placeObstacles(grid, occupiedPoints)
     grid = placeUnknown(grid, radius)
     return grid
+
+def bresenham(x0: int, y0: int, x1: int, y1: int) -> List[Tuple[int, int]]:
+    cells = []
+
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+
+    err = dx - dy
+    x, y = x0, y0
+
+    while True:
+        cells.append((x, y))
+        if x == x1 and y == y1:
+            break
+
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x += sx
+        if e2 < dx:
+            err += dx
+            y += sy
+
+    return cells
+
+def get_path(points):
+    complete_path = []
+    for i in range(len(points)-1):
+        complete_path.extend(bresenham(points[i][0], points[i][1], points[i+1][0], points[i+1][1])[1:])
+    return complete_path
+
+def get_path_cost(path, distanceGrid):
+    total_cost = 0
+    for point in path:
+        x_pos = point[0] + int(distanceGrid.shape[0] / 2)
+        y_pos = point[1] + int(distanceGrid.shape[1] / 2)
+        total_cost+= distanceGrid[x_pos][y_pos]
+    return total_cost
+
+def get_costs_for_all_paths(all_paths, occupiedPoints, radius=None):
+    grid = generateOccupancyGrid(occupiedPoints, radius=None)
+    grid = getDistanceGrid(grid,grid.shape[0],grid.shape[1],100)
+    all_costs = []
+    for path in all_paths:
+        all_costs.append(get_path_cost(path, grid))
+    return all_costs
