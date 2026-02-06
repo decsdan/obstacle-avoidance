@@ -351,11 +351,24 @@ def get_path_cost(path, distanceGrid):
     totalCost = 0
     for x,y in path:
         if distanceGrid[y, x] <= 0:
-            cost = 100
+            cost = math.inf
         else:
             cost = math.exp(-1 * distanceGrid[y, x])
         totalCost += cost
     return totalCost
+
+def normalize_path_costs(allCosts):
+    # these are all of the non infinite values
+    finiteCosts = [cost for cost in allCosts if math.isfinite(cost)]
+
+    minVal = min(finiteCosts)
+    maxVal = max(finiteCosts)
+
+    normalizedCosts = [
+        (cost - minVal) / (maxVal - minVal) if math.isfinite(cost) else cost
+        for cost in allCosts
+    ]
+    return normalizedCosts
 
 def get_all_path_costs(allPaths, occupiedPoints):
     occupiedPoints = clean_points(occupiedPoints)
@@ -364,4 +377,5 @@ def get_all_path_costs(allPaths, occupiedPoints):
     allCosts = []
     for path in allPaths:
         allCosts.append(get_path_cost(path, distanceGrid))
-    return allCosts
+    normalizedCosts = normalize_path_costs(allCosts)
+    return normalizedCosts
