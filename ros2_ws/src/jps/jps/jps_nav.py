@@ -14,10 +14,10 @@ Features:
     - Environment variable configuration for robot parameters
 
 Publishes to:
-    - /cmd_vel (TwistStamped): Velocity commands for robot control
+    - /mikey/cmd_vel (TwistStamped): Velocity commands for robot control
 
 Subscribes to:
-    - /sim_ground_truth_pose (Odometry): Robot position in map frame
+    - /mikey/odom (Odometry): Robot position in map frame
 
 Usage:
     ros2 run jps jps_nav
@@ -54,7 +54,7 @@ class NavigatorConstants:
 
     # Robot Physical Parameters (meters)
     ROBOT_RADIUS = 0.22          # TurtleBot4 radius
-    SAFETY_CLEARANCE = 0.15      # Additional safety margin
+    SAFETY_CLEARANCE = 0.20      # Additional safety margin
 
     # Control Parameters
     LINEAR_SPEED = 0.2           # Forward speed (m/s)
@@ -68,6 +68,14 @@ class NavigatorConstants:
     # Path Planning
     MAX_PATH_WAYPOINTS = 20      # Maximum waypoints after simplification
     TIGHT_SPACE_RADIUS = 3       # Grid cells to use original grid near start
+
+    # Publishing/Subscribing Paths - CRITICAL: MUST MATCH YOUR ROBOT
+    CMD_VEL = '/mikey/cmd_vel'   # Change 'mikey' to your robot name if different
+    ODOMETRY = '/mikey/odom'     # Change 'mikey' to your robot name if different
+
+    # Pgm and yaml paths - MUST match A* paths
+    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olin304.yaml'
+    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/olin304.pgm'
 
 
 # ============================================================================
@@ -106,10 +114,14 @@ class JPSNavigator(Node):
         # INITIALIZATION - ROS2 Publishers and Subscribers
         # ====================================================================
 
-        # Command velocity publisher (TwistStamped for Jazzy, Twist for Humble)
-        self.cmd_vel_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+        # Command velocity publisher - USING CONSTANTS
+        self.cmd_vel_pub = self.create_publisher(
+            TwistStamped, 
+            NavigatorConstants.CMD_VEL,  # Using constant
+            10
+        )
 
-        # Odometry subscriber (best-effort QoS to match publisher)
+        # Odometry subscriber - USING CONSTANTS
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -117,7 +129,7 @@ class JPSNavigator(Node):
         )
         self.odom_sub = self.create_subscription(
             Odometry,
-            '/sim_ground_truth_pose',
+            NavigatorConstants.ODOMETRY,  # Using constant
             self.odom_callback,
             qos_profile
         )
@@ -161,9 +173,9 @@ class JPSNavigator(Node):
         # INITIALIZATION - Load Map
         # ====================================================================
 
-        # Slammed maze map
-        yaml_file = os.path.expanduser('~/code/obstacle-avoidance-comps/ros2_ws/olin304-308.yaml')
-        pgm_file = os.path.expanduser('~/code/obstacle-avoidance-comps/ros2_ws/olin304-308.pgm')
+        # Use constants for map paths (same as A*)
+        yaml_file = os.path.expanduser(NavigatorConstants.SLAM_MAP_YAML)
+        pgm_file = os.path.expanduser(NavigatorConstants.SLAM_MAP_PGM)
 
         self.load_map(yaml_file, pgm_file)
 
@@ -174,6 +186,8 @@ class JPSNavigator(Node):
         self.get_logger().info('JPS Navigator initialized')
         self.get_logger().info(f'Robot radius: {self.robot_radius}m, Safety clearance: {self.safety_clearance}m')
         self.get_logger().info(f'Total obstacle inflation: {self.robot_radius + self.safety_clearance}m')
+        self.get_logger().info(f'Commanding on: {NavigatorConstants.CMD_VEL}')
+        self.get_logger().info(f'Listening on: {NavigatorConstants.ODOMETRY}')
         self.get_logger().info('Usage: navigator.navigate_to_goal(start_x, start_y, goal_x, goal_y)')
 
     # ========================================================================
@@ -269,7 +283,7 @@ class JPSNavigator(Node):
         updates internal state for navigation control.
 
         Args:
-            msg: Odometry message from /sim_ground_truth_pose
+            msg: Odometry message from odometry topic
         """
         self.current_pose = {
             'x': msg.pose.pose.position.x,
@@ -736,7 +750,7 @@ class JPSNavigator(Node):
         target_angle = math.atan2(dy, dx)
         angle_diff = self.normalize_angle(target_angle - self.current_pose['theta'])
 
-        # Create velocity command (TwistStamped for Jazzy, Twist for Humble)
+        # Create velocity command
         cmd = TwistStamped()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.header.frame_id = 'base_link'
@@ -766,7 +780,6 @@ class JPSNavigator(Node):
         cmd = TwistStamped()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.header.frame_id = 'base_link'
-        # cmd.twist is already zeros by default
         self.cmd_vel_pub.publish(cmd)
 
     def get_current_position(self):
@@ -849,6 +862,8 @@ def main(args=None):
     print(f"  Robot radius: {robot_radius}m (set via ROBOT_RADIUS env var)")
     print(f"  Safety clearance: {safety_clearance}m (set via SAFETY_CLEARANCE env var)")
     print(f"  Total inflation: {robot_radius + safety_clearance}m")
+    print(f"  Commanding on: {NavigatorConstants.CMD_VEL}")
+    print(f"  Listening on: {NavigatorConstants.ODOMETRY}")
     print("\nUsage Examples:")
     print("  1. Get current position:")
     print("     pos = navigator.get_current_position()")

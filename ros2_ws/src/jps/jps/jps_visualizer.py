@@ -868,9 +868,9 @@ def main(args=None):
     robot_radius = VisualizerConstants.ROBOT_RADIUS
     safety_clearance = VisualizerConstants.SAFETY_CLEARANCE
 
-    # Default map path
-    yaml_file = os.path.expanduser('~/code/obstacle-avoidance-comps/ros2_ws/olin304-308.yaml')
-    pgm_file = os.path.expanduser('~/code/obstacle-avoidance-comps/ros2_ws/olin304-308.pgm')
+    # Default map path - UPDATED to match A* paths
+    yaml_file = os.path.expanduser('~/obstacle-avoidance-comps/ros2_ws/olin304.yaml')
+    pgm_file = os.path.expanduser('~/obstacle-avoidance-comps/ros2_ws/olin304.pgm')
 
     # Parse command line arguments
     if len(sys.argv) >= 3:
