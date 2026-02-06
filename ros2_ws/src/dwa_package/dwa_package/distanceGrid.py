@@ -286,7 +286,7 @@ def distance_from_obstacles(obstacleGrid: np.ndarray) -> np.ndarray:
     # find all spots where there's an obstacle and add it to queue
     obstacle_coords = np.argwhere(obstacleGrid == 100)
     for y, x in obstacle_coords:
-        dist_grid[y, x] = 0
+        dist_grid[y, x] = -2
         queue.append((y, x))
     
     # manahttan distance neighbors
@@ -350,7 +350,7 @@ def get_path_given_points(trajectory):
 def get_path_cost(path, distanceGrid):
     totalCost = 0
     for x,y in path:
-        if distanceGrid[y, x] == 0:
+        if distanceGrid[y, x] <= 0:
             cost = 100
         else:
             cost = math.exp(-1 * distanceGrid[y, x])
