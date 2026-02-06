@@ -305,27 +305,6 @@ def distance_from_obstacles(obstacleGrid: np.ndarray) -> np.ndarray:
                 queue.append((ny, nx))
     
     return dist_grid
-    
-arr = np.array([[1, 2, 3],
-                [4, 5, 6]])
-
-points = [
-    (-9.47, 3.21),
-    (4.58, -7.33),
-    (0.12, 5.67),
-    (-2.89, -1.45),
-    (7.24, 8.91),
-    (-6.11, 2.34),
-    (1.99, -9.87),
-    (3.33, 4.44),
-    (-0.56, -3.78),
-    (9.01, -0.22)
-]
-"""[(-94, 32), (45, -73), (1, 56), (-28, -14), (72, 89), 
-(-61, 23), (19, -98), (33, 44), (-5, -37), (90, -2)]"""
-obstacleGrid = generate_obstacle_grid(points)
-distanceGrid = distance_from_obstacles(obstacleGrid)
-print_grid_to_file(distanceGrid)
 
 def bresenham(x0: int, y0: int, x1: int, y1: int) -> List[Tuple[int, int]]:
     cells = []
