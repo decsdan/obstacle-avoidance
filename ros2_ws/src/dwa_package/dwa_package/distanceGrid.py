@@ -51,7 +51,7 @@ def getNeighborCoords(xcoordinate, ycoordinate, grid):
     #eg. a circle shape in a square grid
     validNeighbors = []
     UNKNOWN = -1
-    width, height = grid.shape
+    height, width = grid.shape
 
     for nx, ny in neighbors:
         if 0 <= nx < width and 0 <= ny < height:
@@ -126,7 +126,7 @@ def newGrid(finalValues, WIDTH, HEIGHT):
     Returns:
         - list[][]: distance grid
     """
-    newGrid = np.zeros((WIDTH, HEIGHT), dtype=int)
+    newGrid = np.full((WIDTH, HEIGHT), -1, dtype=int)
     for coordinate in finalValues:
         newGrid[coordinate[0], coordinate[1]] = coordinate[2]
     return newGrid
@@ -228,6 +228,8 @@ def getAngleAlignment(posx, posy, theta, goalx, goaly):
     return angleErr
 
 def generateSizeContainingPoints(occupiedPoints):
+    if not occupiedPoints:
+        return (0, 0)
     smallestX = largestX = occupiedPoints[0][0]
     smallestY = largestY = occupiedPoints[0][1]
 
@@ -240,42 +242,90 @@ def generateSizeContainingPoints(occupiedPoints):
     return (largestX - smallestX, largestY - smallestY)
 
 def generateRadiusWithPoints(occupiedPoints):
-    longestDistance = max(occupiedPoints[0][0], occupiedPoints[0][1])
-    for point in occupiedPoints[1:]:
-        if point[0] > longestDistance:
-            longestDistance = point[0]
-        if point[1] > longestDistance:
-            longestDistance = point[1]
-    return longestDistance
+    if not occupiedPoints:
+        return 0
+    cx = sum(x for x, _ in occupiedPoints) / len(occupiedPoints)
+    cy = sum(y for _, y in occupiedPoints) / len(occupiedPoints)
+    return max(math.hypot(x - cx, y - cy) for x, y in occupiedPoints)
 
-def placeObstacles(grid, occupiedPoints):
-    width, height = grid.shape
-    for x, y in occupiedPoints:
-        if 0 <= x < width and 0 <= y < height:
-            grid[x, y] = 100
-    return grid
+"""np is row order so arr[row][col]"""
 
-def placeUnknown(grid, radius):
-    width = grid.shape[0]
-    height = grid.shape[1]
-    center = (width / 2, height / 2)
-    for x in range(width):
-        for y in range(height):
-            if getDistanceToGoal((x,y), center) > radius:
-                grid[x][y] = -1
-    return grid
+def print_grid_to_file(grid, filename="gridPrint.txt"):
+    with open(filename, "w") as f:
+        for row in grid:
+            f.write(" ".join(str(cell) for cell in row) + "\n")
 
-def generateOccupancyGrid(occupiedPoints, radius=None):
-    size = None
-    if radius == None:
-        radius = generateRadiusWithPoints(occupiedPoints)
-    size = (radius*2,radius*2)
-    WIDTH = size[0]
-    HEIGHT = size[1]
-    grid = np.zeros((WIDTH, HEIGHT), dtype=int)
-    grid = placeObstacles(grid, occupiedPoints)
-    grid = placeUnknown(grid, radius)
-    return grid
+def place_obstacles(grid, occupiedPoints):
+    for point in occupiedPoints:
+        #grid[row][col]
+        grid[point[1], point[0]] = 100
+
+def clean_points(points):
+    transformedPoints = []
+    for point in points:
+        transformedX = int(point[0]*10) + 80
+        transformedY = int(point[1]*10) + 80
+        if transformedX < 0 or transformedX > 160 or transformedY < 0 or transformedY > 160:
+            continue
+        transformedPoints.append((transformedX, transformedY))
+    return transformedPoints
+
+def generate_obstacle_grid(occupiedPoints, size = (0,0)):
+    WIDTH = 161
+    HEIGHT = 161
+    obstacleGrid = np.zeros((HEIGHT, WIDTH), dtype=int)
+    place_obstacles(obstacleGrid, occupiedPoints)
+    return obstacleGrid
+
+def distance_from_obstacles(obstacleGrid: np.ndarray) -> np.ndarray:
+    HEIGHT, WIDTH = obstacleGrid.shape
+    # setting up the queue and a grid of -1 for unvisited sspots
+    dist_grid = -np.ones_like(obstacleGrid, dtype=int)
+    queue = deque()
+    
+    # find all spots where there's an obstacle and add it to queue
+    obstacle_coords = np.argwhere(obstacleGrid == 100)
+    for y, x in obstacle_coords:
+        dist_grid[y, x] = 0
+        queue.append((y, x))
+    
+    # manahttan distance neighbors
+    directions = [(-1,0), (1,0), (0,-1), (0,1)]
+    
+    #this is the actual bfs part
+    while queue:
+        y, x = queue.popleft()
+        current_dist = dist_grid[y, x]
+        
+        #check neighbors
+        for dy, dx in directions:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < HEIGHT and 0 <= nx < WIDTH and dist_grid[ny, nx] == -1:
+                dist_grid[ny, nx] = current_dist + 1
+                queue.append((ny, nx))
+    
+    return dist_grid
+    
+arr = np.array([[1, 2, 3],
+                [4, 5, 6]])
+
+points = [
+    (-9.47, 3.21),
+    (4.58, -7.33),
+    (0.12, 5.67),
+    (-2.89, -1.45),
+    (7.24, 8.91),
+    (-6.11, 2.34),
+    (1.99, -9.87),
+    (3.33, 4.44),
+    (-0.56, -3.78),
+    (9.01, -0.22)
+]
+"""[(-94, 32), (45, -73), (1, 56), (-28, -14), (72, 89), 
+(-61, 23), (19, -98), (33, 44), (-5, -37), (90, -2)]"""
+obstacleGrid = generate_obstacle_grid(points)
+distanceGrid = distance_from_obstacles(obstacleGrid)
+print_grid_to_file(distanceGrid)
 
 def bresenham(x0: int, y0: int, x1: int, y1: int) -> List[Tuple[int, int]]:
     cells = []
@@ -304,24 +354,35 @@ def bresenham(x0: int, y0: int, x1: int, y1: int) -> List[Tuple[int, int]]:
 
     return cells
 
-def get_path(points):
-    complete_path = []
-    for i in range(len(points)-1):
-        complete_path.extend(bresenham(points[i][0], points[i][1], points[i+1][0], points[i+1][1])[1:])
-    return complete_path
+def get_path_given_points(trajectory):
+    finalPath = []
+
+    for i in range(len(trajectory) - 1):
+        x0, y0 = trajectory[i]
+        x1, y1 = trajectory[i + 1]
+        line_points = bresenham(x0, y0, x1, y1)
+        finalPath.extend(line_points[1:])
+
+    # this removes the duplicates but keeps the order
+    # there would normally be duplicates from the start and end points
+    finalPath = list(dict.fromkeys(finalPath))
+    return finalPath
 
 def get_path_cost(path, distanceGrid):
-    total_cost = 0
-    for point in path:
-        x_pos = point[0] + int(distanceGrid.shape[0] / 2)
-        y_pos = point[1] + int(distanceGrid.shape[1] / 2)
-        total_cost+= distanceGrid[x_pos][y_pos]
-    return total_cost
+    totalCost = 0
+    for x,y in path:
+        if distanceGrid[y, x] == 0:
+            cost = 100
+        else:
+            cost = math.exp(-1 * distanceGrid[y, x])
+        totalCost += cost
+    return totalCost
 
-def get_costs_for_all_paths(all_paths, occupiedPoints, radius=None):
-    grid = generateOccupancyGrid(occupiedPoints, radius=None)
-    grid = getDistanceGrid(grid,grid.shape[0],grid.shape[1],100)
-    all_costs = []
-    for path in all_paths:
-        all_costs.append(get_path_cost(path, grid))
-    return all_costs
+def get_all_path_costs(allPaths, occupiedPoints):
+    occupiedPoints = clean_points(occupiedPoints)
+    obstacleGrid = generate_obstacle_grid(occupiedPoints)
+    distanceGrid = distance_from_obstacles(obstacleGrid)
+    allCosts = []
+    for path in allPaths:
+        allCosts.append(get_path_cost(path, distanceGrid))
+    return allCosts
