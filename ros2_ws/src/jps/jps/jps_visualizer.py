@@ -869,8 +869,8 @@ def main(args=None):
     safety_clearance = VisualizerConstants.SAFETY_CLEARANCE
 
     # Default map path - UPDATED to match A* paths
-    yaml_file = os.path.expanduser('~/obstacle-avoidance-comps/ros2_ws/simple_static.yaml')
-    pgm_file = os.path.expanduser('~/obstacle-avoidance-comps/ros2_ws/simple_static.pgm')
+    yaml_file = os.path.expanduser('~/obstacle-avoidance-comps/ros2_ws/olin304.yaml')
+    pgm_file = os.path.expanduser('~/obstacle-avoidance-comps/ros2_ws/olin304.pgm')
 
     # Parse command line arguments
     if len(sys.argv) >= 3:
