@@ -9,7 +9,8 @@ from message_filters import Subscriber, ApproximateTimeSynchronizer
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
-from tf2_ros import Buffer, TransformListener                  
+from tf2_ros import Buffer, TransformListener
+import distanceGrid as dg                
 #import nav2_amcl #TODO need to sudo import nav2 for this, to get properly localized x y coords (not just odometry)                                   
 
 class DWA(Node):
@@ -291,6 +292,11 @@ class DWA(Node):
             min_dists = np.full(len(final_vs), self.max_lidar_range)
         
         o_score = np.clip(min_dists / self.safe_dist, 0.0, 1.0) ** 2
+        #NOTE: left all obstacle score code intact above.
+        #CODE START
+        o_score_list = dg.get_all_path_costs(trajectories, obstacles)
+        o_score = np.array(o_score_list)
+        #CODE END
         
         #velocity and smoothness
         v_score = np.clip(final_vs / self.max_v, 0.0, 1.0)
