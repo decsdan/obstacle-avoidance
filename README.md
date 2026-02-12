@@ -350,13 +350,6 @@ ros2 run jps jps_visualizer
 
 # Monitor robot position
 ros2 run jps odom
-
-# In EVERY new terminal:
-source /opt/ros/jazzy/setup.bash
-source /etc/turtlebot4_discovery/setup.bash
-# Then your workspace
-source ~/obstacle-avoidance-comps/ros2_ws/install/setup.bash
-
 ```
 
 **Features:**
@@ -370,20 +363,21 @@ source ~/obstacle-avoidance-comps/ros2_ws/install/setup.bash
 Reactive local navigation using Dynamic Window Approach with TF2/AMCL localization.
 These instructions assume robot namespace `/don`. Replace with your robot's namespace if different.
 
-#### Terminal 1 - DWA Node
+#### Quick Start (with Localization)
+
+**Terminal 1 - Localization:**
 ```bash
 source /opt/ros/jazzy/setup.bash
 source /etc/turtlebot4_discovery/setup.bash
 ros2 daemon stop; ros2 daemon start
 
-cd ~/obstacle-avoidance-comps/ros2_ws
-colcon build --packages-select dwa_package
-source install/setup.bash
-
-ros2 run dwa_package dwa_node
+ros2 launch turtlebot4_navigation localization.launch.py \
+    namespace:=/don \
+    map:=/path/to/your/map.yaml \
+    params_file:=/path/to/obstacle-avoidance-comps/ros2_ws/amcl_params.yaml
 ```
 
-#### Terminal 2 - RViz2 Visualization
+**Terminal 2 - RViz:**
 ```bash
 source /opt/ros/jazzy/setup.bash
 source /etc/turtlebot4_discovery/setup.bash
@@ -474,16 +468,39 @@ ros2_ws/
 
 ## Troubleshooting
 
+### TF2 transform not available
+- With namespaced robots, TF is on `/don/tf` not `/tf`. Verify with: `ros2 topic hz /don/tf`
+- Use `view_robot.launch.py` which handles TF remapping automatically
+- To check TF chain manually: `ros2 run tf2_ros tf2_echo map base_link --ros-args -r /tf:=/don/tf -r /tf_static:=/don/tf_static`
+- Verify map→odom→base_link chain exists
+
 ### Map frame not available in RViz
-- Ensure localization is enabled with `localization:=true`
-- Check that map path is correct and absolute
-- Verify AMCL is running: `ros2 node list | grep amcl`
+- The `map` frame is created by AMCL. It won't exist until AMCL initializes with a pose
+- Use `amcl_params.yaml` with `set_initial_pose: true` to auto-bootstrap the map frame on startup
+- If not using the params file, publish an initial pose: `ros2 topic pub -r 1 /don/initialpose ...` (use `-r 1` not `--once` — the single-shot publish often fires before AMCL discovers it)
+
+### Map shows "no map received" in RViz
+- Verify the map is publishing: `ros2 topic info /don/map` (should show 1 publisher)
+- In RViz, expand the Map display properties and set **Durability** to **Transient Local**
+- The map_server uses transient local QoS; RViz defaults to volatile which won't receive it
 
 ### Robot not localizing properly
 - Set accurate initial pose using **2D Pose Estimate** in RViz
-- Ensure the map matches the Gazebo world
-- Check particle cloud convergence
+- Ensure the 2D Pose Estimate topic is set to `/don/initialpose` (Panels → Tool Properties)
+- Ensure the map matches the actual environment
+- Check particle cloud convergence (should cluster around robot)
+- Try moving robot slightly to help AMCL converge
+
+### Goals not being received
+- Check topic name matches: `ros2 topic echo /don/goal_pose`
+- Verify "2D Goal Pose" tool in RViz is configured to correct topic
+- Panels → Tool Properties → 2D Goal Pose → Topic: `/don/goal_pose`
+
+### AMCL stuck on "Waiting for service map_server/get_state"
+- Check that `RMW_IMPLEMENTATION` is not set to an uninstalled DDS: `echo $RMW_IMPLEMENTATION`
+- If set to `rmw_cyclonedds_cpp` without CycloneDDS installed, fix with: `export RMW_IMPLEMENTATION=rmw_fastrtps_cpp`
+- Nodes may be crashing silently — check logs: `ls ~/.ros/log/` and inspect the latest launch.log
 
 ### Commands not found
-- Make sure you've sourced the workspace: `source install/setup.bash`
+- Source the workspace: `source install/setup.bash`
 - Verify ROS 2 is sourced: `echo $ROS_DISTRO`

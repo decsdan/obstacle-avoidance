@@ -16,6 +16,17 @@ import distanceGrid as dg
 #import nav2_amcl #TODO need to sudo import nav2 for this, to get properly localized x y coords (not just odometry)                                   
 
 class DWA(Node):
+    """
+    Dynamic Window Approach (DWA) local planner for TurtleBot4.
+    
+    Each control cycle, we compute the range of velocities reachable given
+    current speed + acceleration limits (the "dynamic window"), simulate a
+    short trajectory for each (v, w) sample, and pick the one that best
+    balances goal progress, obstacle clearance, heading, and speed.
+    
+    Localization: prefers map-frame pose via TF2/AMCL, defaults to odom if no TF works.
+    Goals come in through RViz's 2D Goal Pose tool on /{namespace}/goal_pose.
+    """
     
     
     def __init__(self):
@@ -149,14 +160,43 @@ class DWA(Node):
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         return math.atan2(siny_cosp, cosy_cosp)
 
-#for use in rviz,,, allows you to track possible paths, colored red to green based on score, with chosen path as a bold blue
+
+    def get_robot_pose_map_frame(self):
+        """
+        Get robot pose from TF2 map->base_link transform.
+        Returns (x, y, theta) in map frame, or None if transform unavailable.
+        """
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'map',
+                'base_link',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.1)
+            )
+            x = transform.transform.translation.x
+            y = transform.transform.translation.y
+            q = transform.transform.rotation
+            theta = self.quat_to_yaw(q)
+            return (x, y, theta)
+        except Exception as e:
+            return None
+
+
     def publish_trajectory_markers(self, trajectories, scores, best_idx):
+        """
+        Publishes the possible paths DWA can take, from red to green based on score, with chosen path in blue
+
+        Args:
+            trajectories (list of all trajectories): see predict_trajectories
+            scores (list of all scores (matches trajectories size)): scores for all trajectories
+            best_idx (int): index of the highest scoring path
+        """
         if not self.visualize_trajectories:
             return
         
         now = self.get_clock().now().to_msg()
         marker = Marker()
-        marker.header.frame_id = "odom"
+        marker.header.frame_id = self.active_frame
         marker.header.stamp = now
         marker.ns = "candidate_trajectories"
         marker.id = 0
@@ -208,7 +248,7 @@ class DWA(Node):
         self.traj_pub.publish(marker)
         
         best_marker = Marker()
-        best_marker.header.frame_id = "odom"
+        best_marker.header.frame_id = self.active_frame
         best_marker.header.stamp = now
         best_marker.ns = "best_trajectory"
         best_marker.id = 1
@@ -233,15 +273,23 @@ class DWA(Node):
     
 #funcs
     def get_obstacles(self):
-        if self.scan_msg is None or self.odom_msg is None:
+        """Convert the latest lidar scan from polar (range, angle) into world-frame
+        XY obstacle points, using the robot's current pose for the transform"""
+        if self.scan_msg is None:
             return np.array([])
         
-        theta = self.quat_to_yaw(self.odom_msg.pose.pose.orientation)
-        x = self.odom_msg.pose.pose.position.x
-        y = self.odom_msg.pose.pose.position.y
+        map_pose = self.get_robot_pose_map_frame()
+        if map_pose is not None:
+            x, y, theta = map_pose
+        elif self.odom_msg is not None:
+            theta = self.quat_to_yaw(self.odom_msg.pose.pose.orientation)
+            x = self.odom_msg.pose.pose.position.x
+            y = self.odom_msg.pose.pose.position.y
+        else:
+            return np.array([])
 
         
-        #TODO May have to downsample for Turtlebot performance
+        #TODO May have to downsample for Turtlebot performance, LIDAR_downsample currently set to 1
         ranges = np.array(self.scan_msg.ranges)[::self.LIDAR_downsample]
         angles = np.linspace(
             self.scan_msg.angle_min,
@@ -267,6 +315,15 @@ class DWA(Node):
 
 
     def cost_function(self, trajectories, final_vs, final_ws, obstacles, curr_x, curr_y):
+        """Score each candidate trajectory with a weighted sum of:
+          - goal:       how much closer the trajectory endpoint gets to the goal
+          - heading:    alignment between final heading and direction to goal
+          - obstacle:   clearance from nearest obstacle (via distanceGrid)
+          - velocity:   preference for higher forward speed
+          - smoothness: penalty for high angular velocity
+        
+        Trajectories whose closest obstacle is within critical_radius get
+        hard-rejected (score = -inf)."""
         
         final_pos = trajectories[:, -1, :2]
         curr_dist = np.linalg.norm(self.goal - np.array([curr_x, curr_y]))
@@ -326,6 +383,10 @@ class DWA(Node):
         
     # changed to do vector mult,, similar logic but applies to all v w 
     def predict_trajectories(self, v_arr, w_arr, curr_x, curr_y, curr_theta, steps=30, dt=0.1):
+        """Forward-simulate all (v, w) pairs in parallel using vectorized cumulative sums.
+        Each pair is held constant for `steps` timesteps of length `dt`.
+        Returns (trajectories, final_vs, final_ws) where trajectories is (N, steps, 3)
+        with columns [x, y, theta]."""
         
                 
         #copy over v and w across array
@@ -342,6 +403,9 @@ class DWA(Node):
     
         
     def dynamic_window(self, curr_v, curr_w):
+        """Compute the reachable velocity bounds given current (v, w) and
+        acceleration limits over the next window_steps * dt seconds.
+        Returns (v_max, v_min, w_max, w_min) clamped to global limits."""
 
         window_time = self.dt * self.window_steps #look further ahead
 
@@ -357,6 +421,13 @@ class DWA(Node):
 
 
     def nav_loop(self):
+        """Main control loop, called every dt seconds. Pipeline:
+        1. Emergency stop check (front-cone lidar)
+        2. Get pose (map frame if AMCL available, else odom)
+        3. Goal-reached check
+        4. Compute dynamic window → sample (v,w) → simulate trajectories
+        5. Score trajectories → pick best → publish cmd_vel
+        Falls back to recovery behavior if all trajectories are rejected."""
         if self.goal is None:
             return 
         if self.odom_msg is None or self.scan_msg is None:
@@ -387,9 +458,16 @@ class DWA(Node):
                 return
             
 
-        curr_x = self.odom_msg.pose.pose.position.x 
-        curr_y = self.odom_msg.pose.pose.position.y
-        curr_theta = self.quat_to_yaw(self.odom_msg.pose.pose.orientation)
+        # get pose (try map frame, else odom)
+        map_pose = self.get_robot_pose_map_frame()
+        if map_pose is not None:
+            curr_x, curr_y, curr_theta = map_pose
+            self.active_frame = 'map'
+        else:
+            curr_x = self.odom_msg.pose.pose.position.x 
+            curr_y = self.odom_msg.pose.pose.position.y
+            curr_theta = self.quat_to_yaw(self.odom_msg.pose.pose.orientation)
+            self.active_frame = 'odom'
         curr_v = self.odom_msg.twist.twist.linear.x
         curr_w = self.odom_msg.twist.twist.angular.z
 
@@ -417,10 +495,12 @@ class DWA(Node):
             v_arr, w_arr, curr_x, curr_y, curr_theta, self.steps, self.dt
         )
 
+
+        #view what DWA sees as obstacles in RVIZ (should also be adjusted to map frame now)
         obstacles = self.get_obstacles()
         if len(obstacles) > 0:
             marker = Marker()
-            marker.header.frame_id = "odom"
+            marker.header.frame_id = self.active_frame
             marker.header.stamp = self.get_clock().now().to_msg()
             marker.type = Marker.SPHERE_LIST
             marker.action = Marker.ADD
