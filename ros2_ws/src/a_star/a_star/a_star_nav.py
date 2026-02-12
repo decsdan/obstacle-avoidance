@@ -33,10 +33,13 @@ Architecture:
 """
 
 import rclpy
+import rclpy.time
+import rclpy.duration
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
 from nav_msgs.msg import Odometry
+from tf2_ros import Buffer, TransformListener
 import numpy as np
 import yaml
 from PIL import Image
@@ -70,8 +73,8 @@ class NavigatorConstants:
     TIGHT_SPACE_RADIUS = 3       # Grid cells to use original grid near start
 
     # Publishing/Subscribing Paths
-    CMD_VEL = '/mikey/cmd_vel'
-    ODOMETRY = '/mikey/odom'
+    CMD_VEL = '/don/cmd_vel'
+    ODOMETRY = '/don/odom'
 
     # Pgm and yaml paths
     SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/simple_static.yaml'
@@ -131,6 +134,26 @@ class AStarNavigator(Node):
             qos_profile
         )
 
+        # Goal pose subscriber (for RViz 2D Goal Pose)
+        self.goal_sub = self.create_subscription(
+            PoseStamped,
+            NavigatorConstants.ODOMETRY.rsplit('/', 1)[0] + '/goal_pose',  # e.g., /don/goal_pose
+            self.goal_callback,
+            10
+        )
+
+        # TF2 for map frame localization
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # ====================================================================
+        # INITIALIZATION - Frame tracking
+        # ====================================================================
+
+        # Track which frame is actively being used for pose
+        # A* plans in map frame (static map coordinates = map frame)
+        self.active_frame = 'map'
+
         # ====================================================================
         # INITIALIZATION - Map Data
         # ====================================================================
@@ -187,6 +210,7 @@ class AStarNavigator(Node):
         self.get_logger().info('A* Navigator initialized')
         self.get_logger().info(f'Robot radius: {self.robot_radius}m, Safety clearance: {self.safety_clearance}m')
         self.get_logger().info(f'Total obstacle inflation: {self.robot_radius + self.safety_clearance}m')
+        self.get_logger().info(f'Planning frame: {self.active_frame}')
         self.get_logger().info('Usage: navigator.navigate_to_goal(start_x, start_y, goal_x, goal_y)')
 
     # ========================================================================
@@ -290,6 +314,54 @@ class AStarNavigator(Node):
             'theta': self.quaternion_to_yaw(msg.pose.pose.orientation)
         }
 
+    def goal_callback(self, msg):
+        """
+        Handle goal pose from RViz 2D Goal Pose tool.
+        
+        Automatically plans and starts navigation to the received goal.
+        Uses current TF2 position as start.
+        
+        Args:
+            msg: PoseStamped message from goal_pose topic
+        """
+        goal_x = msg.pose.position.x
+        goal_y = msg.pose.position.y
+        self.get_logger().info(f'Received goal from RViz: ({goal_x:.2f}, {goal_y:.2f})')
+        
+        # Get current position from TF2 (map frame)
+        start_pose = self.get_robot_pose_map_frame()
+        if start_pose is None:
+            self.get_logger().error('Cannot get robot position from TF2. Is localization running?')
+            return
+        
+        start_x, start_y, _ = start_pose
+        self.get_logger().info(f'Current position (map frame): ({start_x:.2f}, {start_y:.2f})')
+        
+        # Plan and start navigation
+        self.navigate_to_goal(start_x, start_y, goal_x, goal_y)
+
+    def get_robot_pose_map_frame(self):
+        """
+        Get robot pose from TF2 map->base_link transform.
+        
+        Returns:
+            tuple: (x, y, theta) in map frame, or None if transform unavailable
+        """
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'map',
+                'base_link',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.1)
+            )
+            x = transform.transform.translation.x
+            y = transform.transform.translation.y
+            q = transform.transform.rotation
+            theta = self.quaternion_to_yaw(q)
+            return (x, y, theta)
+        except Exception as e:
+            return None
+
     # ========================================================================
     # NAVIGATION INTERFACE
     # ========================================================================
@@ -319,11 +391,11 @@ class AStarNavigator(Node):
 
         if self.path:
             self.current_waypoint_idx = 0
-            self.get_logger().info(f'✓ Path found with {len(self.path)} waypoints')
+            self.get_logger().info(f'Path found with {len(self.path)} waypoints')
             self.print_path()
             return True
         else:
-            self.get_logger().error('✗ No path found! Check if start/goal are valid and reachable')
+            self.get_logger().error('No path found! Check if start/goal are valid and reachable')
             return False
 
     # ========================================================================
@@ -613,7 +685,7 @@ class AStarNavigator(Node):
         # Check if goal reached
         if self.current_waypoint_idx >= len(self.path):
             self.stop_robot()
-            self.get_logger().info('🎯 Goal reached!')
+            self.get_logger().info('Goal reached!')
             self.path = []
             return
 
@@ -621,12 +693,23 @@ class AStarNavigator(Node):
         target = self.path[self.current_waypoint_idx]
         tx, ty = target
 
+        # Try to get pose from TF2 (map frame), fall back to odom
+        map_pose = self.get_robot_pose_map_frame()
+        if map_pose is not None:
+            curr_x, curr_y, curr_theta = map_pose
+            self.active_frame = 'map'
+        else:
+            curr_x = self.current_pose['x']
+            curr_y = self.current_pose['y']
+            curr_theta = self.current_pose['theta']
+            self.active_frame = 'odom'
+
         # Calculate distance and angle to target
-        dx = tx - self.current_pose['x']
-        dy = ty - self.current_pose['y']
+        dx = tx - curr_x
+        dy = ty - curr_y
         distance = math.sqrt(dx**2 + dy**2)
         target_angle = math.atan2(dy, dx)
-        angle_diff = self.normalize_angle(target_angle - self.current_pose['theta'])
+        angle_diff = self.normalize_angle(target_angle - curr_theta)
 
         # Create velocity command (TwistStamped for Jazzy, Twist for Humble)
         cmd = TwistStamped()
@@ -718,8 +801,8 @@ def main(args=None):
     """
     Main entry point for the A* navigator.
 
-    Initializes ROS2, creates the navigator node, waits for odometry data,
-    prompts for goal input, and executes navigation.
+    Initializes ROS2, creates the navigator node, and spins waiting for goals.
+    Goals are received via the goal_pose topic (use RViz 2D Goal Pose tool).
 
     Configuration via environment variables:
         ROBOT_RADIUS: Robot radius in meters (default 0.22)
@@ -735,56 +818,24 @@ def main(args=None):
 
     # Print usage information
     print("\n" + "="*60)
-    print("TurtleBot4 A* Navigator")
+    print("TurtleBot4 A* Navigator (with AMCL/TF2 Localization)")
     print("="*60)
     print(f"\nRobot Configuration:")
     print(f"  Robot radius: {robot_radius}m (set via ROBOT_RADIUS env var)")
     print(f"  Safety clearance: {safety_clearance}m (set via SAFETY_CLEARANCE env var)")
     print(f"  Total inflation: {robot_radius + safety_clearance}m")
-    print("\nUsage Examples:")
-    print("  1. Get current position:")
-    print("     pos = navigator.get_current_position()")
-    print("\n  2. Navigate to goal:")
-    print("     navigator.navigate_to_goal(0.0, 0.0, 3.0, 2.0)")
-    print("\n  3. Use current position:")
-    print("     pos = navigator.get_current_position()")
-    print("     if pos:")
-    print("         navigator.navigate_to_goal(pos[0], pos[1], 3.0, 2.0)")
-    print("\nTo customize clearance:")
-    print("  ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.20 ros2 run a_star a_star_nav")
+    print("\nWaiting for goals via RViz 2D Goal Pose tool...")
+    print("  1. Set initial pose using '2D Pose Estimate' in RViz")
+    print("  2. Click '2D Goal Pose' and click on the map to send goals")
+    print("  3. Robot will navigate to goal, then wait for next goal")
+    print("\nPress Ctrl+C to stop.")
     print("="*60 + "\n")
 
-    # Wait for odometry data
-    print("Waiting for odometry data...")
-    while navigator.current_pose is None and rclpy.ok():
-        rclpy.spin_once(navigator, timeout_sec=0.1)
-
-    if navigator.current_pose:
-        print(f"Current position: ({navigator.current_pose['x']:.2f}, {navigator.current_pose['y']:.2f})")
-
-        # Get goal from user input
-        try:
-            goal_x = float(input("Enter goal X coordinate (meters): "))
-            goal_y = float(input("Enter goal Y coordinate (meters): "))
-        except (ValueError, EOFError, KeyboardInterrupt):
-            print("\nInvalid input or interrupted. Exiting...")
-            navigator.destroy_node()
-            rclpy.shutdown()
-            return
-
-        # Use current position as start
-        start_x = navigator.current_pose['x']
-        start_y = navigator.current_pose['y']
-
-        # Plan and execute navigation
-        if navigator.navigate_to_goal(start_x, start_y, goal_x, goal_y):
-            print("\nNavigation started! Press Ctrl+C to stop.\n")
-            try:
-                rclpy.spin(navigator)
-            except KeyboardInterrupt:
-                print("\nStopping navigation...")
-        else:
-            print("\nNavigation failed!")
+    # Spin and wait for goals (event-driven)
+    try:
+        rclpy.spin(navigator)
+    except KeyboardInterrupt:
+        print("\nStopping navigation...")
 
     # Cleanup
     navigator.stop_robot()

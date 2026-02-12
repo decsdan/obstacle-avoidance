@@ -1,4 +1,6 @@
 import rclpy
+import rclpy.time
+import rclpy.duration
 import numpy as np
 import math
 from rclpy.node import Node
@@ -100,6 +102,10 @@ class DWA(Node):
         self.emergency_scan_msg = None
         self.scan_msg = None
         self.odom_msg = None
+
+        # Track which frame is actively used for pose/obstacles
+        # Updated each nav_loop tick based on TF2 availability
+        self.active_frame = 'odom'
         
 #subs
         self.declare_parameter('namespace', '/don') #currently blank, but to get it to work on the robot, you need to use the robot name, for us it is /don

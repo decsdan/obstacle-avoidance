@@ -59,12 +59,145 @@ In terminal 3 run:
 ros2 launch turtlebot4_viz view_navigation.launch.py namespace:=/don
 ```
 
-then move the robot around to start.
+then move the robot around to start. This will create a SLAM map that you can save 
+
+---
+
+### 7. Saving Maps for Navigation
+
+To save a SLAM map for use with localization:
+
+```bash
+ros2 run nav2_map_server map_saver_cli -f "map_name" \
+    --ros-args -p map_subscribe_transient_local:=true -r __ns:=/don
+```
+
+This creates `map_name.yaml` and `map_name.pgm` files.
 
 Apply changes:
 ```bash
 source ~/.bashrc
 ```
+
+---
+
+## Running with AMCL Localization
+
+This workflow uses a pre-saved map with AMCL localization, allowing you to run multiple navigation experiments without restarting terminals.
+
+### Prerequisites
+
+Install required packages:
+```bash
+sudo apt install ros-${ROS_DISTRO}-nav2-map-server ros-${ROS_DISTRO}-nav2-amcl
+```
+
+This workspace includes `amcl_params.yaml` which configures AMCL to auto-set an initial pose at (0,0,0) on startup. This is required because the `map` frame won't exist in RViz until AMCL initializes, and without it you can't see the map to place a 2D Pose Estimate. The auto-pose bootstraps the `map` frame so RViz works immediately — you then refine with 2D Pose Estimate.
+
+### Experiment Workflow (Physical Robot)
+
+**Terminal 1 - Localization (AMCL):**
+```bash
+source /opt/ros/jazzy/setup.bash
+source /etc/turtlebot4_discovery/setup.bash
+ros2 daemon stop; ros2 daemon start
+
+# Launch localization with your saved map and AMCL params
+ros2 launch turtlebot4_navigation localization.launch.py \
+    namespace:=/don \
+    map:=/path/to/your/map.yaml \
+    params_file:=/path/to/obstacle-avoidance-comps/ros2_ws/amcl_params.yaml
+```
+
+Wait for AMCL to print `Setting pose` — the `map` frame is now available.
+
+If AMCL is still stuck on "Please set the initial pose...", the params file may not have loaded. See **Manual Initial Pose Fallback** below.
+
+**Terminal 2 - RViz Visualization:**
+```bash
+source /opt/ros/jazzy/setup.bash
+source /etc/turtlebot4_discovery/setup.bash
+
+ros2 launch turtlebot4_viz view_robot.launch.py namespace:=/don
+```
+
+**Terminal 3 - Navigation Node (A* or DWA):**
+```bash
+source /opt/ros/jazzy/setup.bash
+source /etc/turtlebot4_discovery/setup.bash
+cd ~/obstacle-avoidance-comps/ros2_ws
+source install/setup.bash
+
+# For A* navigation:
+ros2 run a_star a_star_nav
+
+# Or for DWA navigation:
+ros2 run dwa_package dwa_node
+```
+
+### Manual Initial Pose Fallback
+
+If `amcl_params.yaml` doesn't auto-set the initial pose (AMCL keeps printing "Please set the initial pose..."), bootstrap it manually. Run this in a spare terminal and wait for AMCL to print `Setting pose`, then Ctrl+C:
+
+```bash
+ros2 topic pub -r 1 /don/initialpose geometry_msgs/msg/PoseWithCovarianceStamped "{
+  header: {frame_id: 'map'},
+  pose: {
+    pose: {
+      position: {x: 0.0, y: 0.0, z: 0.0},
+      orientation: {w: 1.0}
+    }
+  }
+}"
+```
+
+> **Note:** Use `-r 1` (repeated), not `--once`. The single-shot publish often fires before AMCL discovers the publisher and gets silently dropped.
+
+Once the `map` frame exists, RViz will display the map and you can refine with **2D Pose Estimate** as usual.
+
+### Running Repeated Experiments
+
+Once all terminals are running, you can run multiple experiments without restarting:
+
+1. **Set Initial Pose (required after moving robot):**
+   - Ensure the 2D Pose Estimate topic is set to `/don/initialpose` (Panels → Tool Properties)
+   - In RViz, click the **"2D Pose Estimate"** button in the top toolbar
+   - Click and drag on the map where the robot actually is
+   - The arrow shows the robot's heading direction
+   - Watch the particle cloud (red arrows) converge around the robot
+
+2. **Send Goal:**
+   - Click the **"2D Goal Pose"** button in RViz toolbar
+   - Click and drag on the map where you want the robot to go
+   - The navigator will plan and execute the path
+
+3. **After Goal Reached:**
+   - Manually move/lift robot back to starting position
+   - Set initial pose again using "2D Pose Estimate"
+   - Send a new goal
+   - Repeat as needed!
+
+### RViz Setup for Navigation
+
+**Configure 2D Pose Estimate tool:**
+1. In RViz: Panels → Tool Properties
+2. Find "2D Pose Estimate" tool
+3. Set Topic to: `/{namespace}/initialpose` (e.g., `/don/initialpose`)
+
+**Configure 2D Goal Pose tool:**
+1. In RViz: Panels → Tool Properties
+2. Find "2D Goal Pose" tool
+3. Set Topic to: `/{namespace}/goal_pose` (e.g., `/don/goal_pose`)
+
+**Add visualization topics:**
+- `/don/map` (Map) - Occupancy grid from localization. If it shows "no map received", expand the display properties and set **Durability** to **Transient Local**
+- `/don/scan` (LaserScan) - LiDAR points
+- `/don/particlecloud` (PoseArray) - AMCL particle cloud
+
+**For DWA visualization, also add:**
+- `/don/debug_obstacles` (Marker) - Detected obstacles
+- `/don/dwa/trajectories` (Marker) - Candidate paths
+- `/don/dwa/best_trajectory` (Marker) - Selected path
 
 ---
 
@@ -81,6 +214,22 @@ ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py
 ```bash
 ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py slam:=true nav2:=true rviz:=true world:=maze
 ```
+
+### Using Saved Map in Simulation
+
+```bash
+cd ~/obstacle-avoidance-comps/ros2_ws
+source install/setup.bash
+ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py \
+  slam:=false \
+  localization:=true \
+  nav2:=false \
+  rviz:=true \
+  world:=maze \
+  map:=$PWD/maze_slamed.yaml
+```
+
+Then in a separate terminal, run your navigation node.
 
 ---
 
@@ -123,14 +272,14 @@ ros2 run sensor_data lidar
 ```
 
 ### A* Navigator
-Autonomous navigation using A* pathfinding algorithm with hybrid obstacle checking.
+Autonomous navigation using A* pathfinding algorithm with TF2/AMCL localization.
 
 ```bash
 cd ~/obstacle-avoidance-comps/ros2_ws
 colcon build --packages-select a_star
 source install/local_setup.bash
 
-# Run A* navigator (prompts for goal coordinates)
+# Run A* navigator (receives goals via RViz 2D Goal Pose)
 ros2 run a_star a_star_nav
 
 # With custom safety parameters
@@ -138,16 +287,14 @@ ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.20 ros2 run a_star a_star_nav
 
 # Run interactive visualizer
 ros2 run a_star visualizer
-
-# Saving SLAM map for navigator
-ros2 run nav2_map_server map_saver_cli -f "map_name" --ros-args -p map_subscribe_transient_local:=true -r __ns:=/don
 ```
 
 **Features:**
-- Interactive goal input via terminal
+- Receives goals via RViz "2D Goal Pose" tool
+- Uses TF2 for map frame localization (works with AMCL)
 - Hybrid obstacle validation (tight spaces + safety margins)
 - Pure pursuit waypoint following
-- Environment variable configuration
+- Supports repeated experiments without restart
 
 ### D* Lite Navigator
 Autonomous navigation using D* Lite with dynamic replanning and obstacle detection.
@@ -220,6 +367,7 @@ source ~/obstacle-avoidance-comps/ros2_ws/install/setup.bash
 
 ### DWA Navigator
 
+Reactive local navigation using Dynamic Window Approach with TF2/AMCL localization.
 These instructions assume robot namespace `/don`. Replace with your robot's namespace if different.
 
 #### Terminal 1 - DWA Node
@@ -239,7 +387,6 @@ ros2 run dwa_package dwa_node
 ```bash
 source /opt/ros/jazzy/setup.bash
 source /etc/turtlebot4_discovery/setup.bash
-ros2 daemon stop; ros2 daemon start
 
 ros2 launch turtlebot4_viz view_robot.launch.py namespace:=/don
 ```
@@ -263,108 +410,48 @@ Then in RViz: File → Open Config → `~/obstacle-avoidance-comps/don_viz.rviz`
 1. File → Save Config As → `~/obstacle-avoidance-comps/don_viz.rviz`
 
 
-#### Terminal 3 - Debugging (optional)
+**Terminal 3 - DWA Node:**
 ```bash
 source /opt/ros/jazzy/setup.bash
 source /etc/turtlebot4_discovery/setup.bash
+cd ~/obstacle-avoidance-comps/ros2_ws
+colcon build
+source install/setup.bash
 
-ros2 topic hz /don/scan
-ros2 topic echo /don/goal_pose
-ros2 topic echo /don/cmd_vel
+ros2 run dwa_package dwa_node
 ```
+
+Then in RViz:
+1. Set initial pose with "2D Pose Estimate"
+2. Send goals with "2D Goal Pose"
 
 #### DWA Parameters
 
-Parameters can be adjusted via command line using `--ros-args -p parameter:=value`.
-
-**Cost Weights** (normalized 0-1, comparable scale):
+**Cost Weights** (normalized 0-1):
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `weights.goal` | 0.3 | Reward for progress toward goal |
-| `weights.heading` | 0.02 | Reward for pointing at goal |
-| `weights.velocity` | 0.3 | Reward for higher speeds |
-| `weights.smoothness` | 0.02 | Reward for less angular velocity |
+| `weights.goal` | 0.5 | Reward for progress toward goal |
+| `weights.heading` | 0.05 | Reward for pointing at goal |
+| `weights.velocity` | 0.2 | Reward for higher speeds |
+| `weights.smoothness` | 0.05 | Reward for less angular velocity |
 | `weights.obstacle` | 0.1 | Incentivizes being further from objects |
 
-**Safety Distances** (meters from robot center):
+**Safety Distances** (meters):
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `critical_radius` | 0.30 | Hard rejection boundary |
-| `safe_distance` | 0.50 | Distance for max obstacle score |
-| `emergency_stop_distance` | 0.25 | Triggers immediate stop |
+| `critical_radius` | 0.18 | Hard rejection boundary |
+| `safe_distance` | 0.60 | Distance for max obstacle score |
+| `emergency_stop_distance` | 0.17 | Triggers immediate stop |
 
-**Velocity Limits**:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `max_velocity` | 1.0 | Maximum linear velocity (m/s) |
-| `max_angular_velocity` | 2.5 | Maximum angular velocity (rad/s) |
-
-**Planning**:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `prediction_steps` | 30 | Trajectory lookahead steps |
-| `dt` | 0.1 | Time step (s), total lookahead = steps × dt |
-| `goal_tolerance` | 0.3 | Distance to consider goal reached (m) |
-
-**Example:** Run with custom weights for aggressive obstacle avoidance:
-
+**Example:** Run with custom weights:
 ```bash
 ros2 run dwa_package dwa_node --ros-args \
     -p weights.goal:=0.4 \
     -p weights.obstacle:=0.5 \
     -p max_velocity:=0.5
 ```
----
-## Using Saved Maps with Localization and Navigation
-
-### Prerequisites
-
-Install required packages:
-```bash
-sudo apt install ros-${ROS_DISTRO}-nav2-map-server
-```
-
-
-
-### Launch with Pre-Saved Map
-
-If you have a saved map (e.g., `maze_slamed.pgm` and `maze_slamed.yaml`):
-
-```bash
-cd ~/obstacle-avoidance-comps/ros2_ws
-source install/setup.bash
-ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py \
-  slam:=false \
-  localization:=true \
-  nav2:=true \
-  rviz:=true \
-  world:=maze \
-  map:=$PWD/maze_slamed.yaml
-```
-
-**Parameters:**
-| Parameter | Description |
-|-----------|-------------|
-| `slam:=false` | Don't create a new map (using saved map) |
-| `localization:=true` | Use AMCL to localize on existing map |
-| `nav2:=true` | Enable Nav2 for autonomous navigation |
-| `rviz:=true` | Launch RViz for visualization |
-| `world:=maze` | Load the maze world in Gazebo |
-| `map:=<path>` | Path to your saved map YAML file |
-
-### RViz Configuration
-
-1. **Fixed Frame** should automatically be set to `map`
-2. Your saved map should be visible
-3. Click **2D Pose Estimate** button (top toolbar)
-4. Click and drag on the map where the robot is in Gazebo to set initial pose
-5. Once localized, use **Nav2 Goal** button to send navigation goals
-
-> **Important:** The robot needs an accurate initial pose for AMCL to work properly. The particle cloud should converge around the robot's actual position.
 
 ---
 
@@ -375,6 +462,7 @@ ros2_ws/
 ├── src/
 │   ├── a_star/          # A* pathfinding implementation
 │   ├── d_star/          # D* pathfinding implementation
+│   ├── dwa_package/     # DWA local planner with TF2 localization
 │   ├── demo_package/    # Demo movement package
 │   ├── joy_test/        # Position data testing
 │   └── sensor_data/     # Camera and lidar visualization
