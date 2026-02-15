@@ -14,16 +14,18 @@ Features:
     - Environment variable configuration for robot parameters
 
 Publishes to:
-    - /cmd_vel (TwistStamped): Velocity commands for robot control
+    - /{namespace}/cmd_vel (TwistStamped): Velocity commands (standalone mode)
+    - /{namespace}/a_star/plan (nav_msgs/Path): Global plan for local planners
 
 Subscribes to:
-    - /sim_ground_truth_pose (Odometry): Robot position in map frame
+    - /{namespace}/odom (Odometry): Robot odometry
+    - /{namespace}/goal_pose (PoseStamped): Goal from RViz 2D Goal Pose
 
 Usage:
     ros2 run a_star a_star_nav
 
     With custom parameters:
-    ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.20 ros2 run a_star a_star_nav
+    ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.05 ros2 run a_star a_star_nav
 
 Architecture:
     - Hybrid obstacle checking near start position for escaping tight spaces
@@ -37,8 +39,8 @@ import rclpy.time
 import rclpy.duration
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import TwistStamped, PoseStamped
+from nav_msgs.msg import Odometry, Path
 from tf2_ros import Buffer, TransformListener
 import numpy as np
 import yaml
@@ -57,7 +59,7 @@ class NavigatorConstants:
 
     # Robot Physical Parameters (meters)
     ROBOT_RADIUS = 0.22          # TurtleBot4 radius
-    SAFETY_CLEARANCE = 0.00     # Additional safety margin
+    SAFETY_CLEARANCE = 0.05     # Additional safety margin
 
     # Control Parameters
     LINEAR_SPEED = 0.2           # Forward speed (m/s)
@@ -72,13 +74,12 @@ class NavigatorConstants:
     MAX_PATH_WAYPOINTS = 20      # Maximum waypoints after simplification
     TIGHT_SPACE_RADIUS = 3       # Grid cells to use original grid near start
 
-    # Publishing/Subscribing Paths
-    CMD_VEL = '/don/cmd_vel'
-    ODOMETRY = '/don/odom'
+    # Robot namespace (e.g., '/don' for the physical robot)
+    NAMESPACE = '/don'
 
-    # Pgm and yaml paths
-    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/simple_static.yaml'
-    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/simple_static.pgm'
+    # Publishing/Subscribing Paths (derived from NAMESPACE)
+    CMD_VEL = NAMESPACE + '/cmd_vel'
+    ODOMETRY = NAMESPACE + '/odom'
 
 
 
@@ -94,15 +95,24 @@ class AStarNavigator(Node):
     obstacle checking to handle tight spaces while maintaining safety.
     """
 
-    def __init__(self, robot_radius=None, safety_clearance=None):
+    def __init__(self, robot_radius=None, safety_clearance=None, map_yaml=None, map_pgm=None):
         """
         Initialize the A* navigator.
 
         Args:
             robot_radius: Robot radius in meters (default from constants or env)
             safety_clearance: Safety margin in meters (default from constants or env)
+            map_yaml: Path to map YAML file (default from MAP_YAML env var or prompts user)
+            map_pgm: Path to map PGM file (default from MAP_PGM env var or derived from YAML)
         """
-        super().__init__('astar_navigator')
+        # Remap /tf and /tf_static to the robot's namespaced TF topics
+        # so that TransformListener receives frames from the namespaced robot
+        ns = NavigatorConstants.NAMESPACE
+        super().__init__('astar_navigator', cli_args=[
+            '--ros-args',
+            '-r', f'/tf:={ns}/tf',
+            '-r', f'/tf_static:={ns}/tf_static',
+        ])
 
         # ====================================================================
         # INITIALIZATION - Robot Parameters
@@ -118,7 +128,21 @@ class AStarNavigator(Node):
         # INITIALIZATION - ROS2 Publishers and Subscribers
         # ====================================================================
 
-        # Command velocity publisher (TwistStamped for Jazzy, Twist for Humble)
+        # ---- Mode: standalone (drive robot) vs planner-only (publish path) ----
+        # In standalone mode, A* plans AND drives via cmd_vel (original behavior).
+        # In planner-only mode, A* only publishes nav_msgs/Path for a local
+        # planner (e.g. DWA) to follow — mirroring the Nav2 planner/controller split.
+        self.standalone = os.getenv('STANDALONE', 'true').lower() in ('true', '1', 'yes')
+
+        # Global plan publisher (nav_msgs/Path) — always active so the path
+        # can be visualized or consumed by a downstream local planner.
+        self.plan_pub = self.create_publisher(
+            Path,
+            NavigatorConstants.NAMESPACE + '/a_star/plan',
+            10
+        )
+
+        # Command velocity publisher (only used in standalone mode)
         self.cmd_vel_pub = self.create_publisher(TwistStamped, NavigatorConstants.CMD_VEL, 10)
 
         # Odometry subscriber (best-effort QoS to match publisher)
@@ -137,7 +161,7 @@ class AStarNavigator(Node):
         # Goal pose subscriber (for RViz 2D Goal Pose)
         self.goal_sub = self.create_subscription(
             PoseStamped,
-            NavigatorConstants.ODOMETRY.rsplit('/', 1)[0] + '/goal_pose',  # e.g., /don/goal_pose
+            NavigatorConstants.NAMESPACE + '/goal_pose',
             self.goal_callback,
             10
         )
@@ -170,6 +194,7 @@ class AStarNavigator(Node):
         self.current_pose = None        # Current robot pose {x, y, theta}
         self.path = []                  # Planned path as list of (x, y) in world coords
         self.current_waypoint_idx = 0   # Index of current target waypoint
+        self.latest_plan_msg = None     # Cached nav_msgs/Path for republishing
 
         # ====================================================================
         # INITIALIZATION - Control Parameters
@@ -181,37 +206,56 @@ class AStarNavigator(Node):
         self.angle_tolerance = NavigatorConstants.ANGLE_TOLERANCE
 
         # ====================================================================
-        # INITIALIZATION - Control Loop Timer
+        # INITIALIZATION - Control Loop Timer (standalone mode only)
         # ====================================================================
 
-        self.control_timer = self.create_timer(
-            NavigatorConstants.CONTROL_TIMER_PERIOD,
-            self.control_loop
-        )
+        if self.standalone:
+            self.control_timer = self.create_timer(
+                NavigatorConstants.CONTROL_TIMER_PERIOD,
+                self.control_loop
+            )
+
+        # Republish the global plan at 1 Hz so late-joining subscribers
+        # (e.g. DWA starting after A* already planned) can pick it up.
+        self.plan_republish_timer = self.create_timer(1.0, self.republish_plan)
 
         # ====================================================================
         # INITIALIZATION - Load Map
         # ====================================================================
 
-        # Default map path (same as a_star_nav.py)
-        # yaml_file = '/opt/ros/jazzy/share/turtlebot4_navigation/maps/maze.yaml'
-        # pgm_file = '/opt/ros/jazzy/share/turtlebot4_navigation/maps/maze.pgm'
+        # Resolve map paths: constructor args > env vars > prompt user
+        if map_yaml is None:
+            map_yaml = os.getenv('MAP_YAML')
+        if map_pgm is None:
+            map_pgm = os.getenv('MAP_PGM')
 
-        # Slammed maze map
-        yaml_file = os.path.expanduser(NavigatorConstants.SLAM_MAP_YAML)
-        pgm_file = os.path.expanduser(NavigatorConstants.SLAM_MAP_PGM)
+        if map_yaml is None:
+            self.get_logger().error(
+                'No map provided. Set MAP_YAML env var or pass --ros-args -p map_yaml:=<path>'
+            )
+            raise SystemExit('Map YAML path required. Set MAP_YAML env var.')
 
-        self.load_map(yaml_file, pgm_file)
+        map_yaml = os.path.expanduser(map_yaml)
+        if map_pgm is None:
+            # Derive PGM path from YAML path (replace .yaml with .pgm)
+            map_pgm = map_yaml.rsplit('.', 1)[0] + '.pgm'
+        else:
+            map_pgm = os.path.expanduser(map_pgm)
+
+        self.load_map(map_yaml, map_pgm)
 
         # ====================================================================
         # INITIALIZATION - Logging
         # ====================================================================
 
+        mode_str = 'STANDALONE (plan + drive)' if self.standalone else \
+                   'PLANNER-ONLY (publish path for local planner)'
         self.get_logger().info('A* Navigator initialized')
+        self.get_logger().info(f'Mode: {mode_str}')
         self.get_logger().info(f'Robot radius: {self.robot_radius}m, Safety clearance: {self.safety_clearance}m')
         self.get_logger().info(f'Total obstacle inflation: {self.robot_radius + self.safety_clearance}m')
         self.get_logger().info(f'Planning frame: {self.active_frame}')
-        self.get_logger().info('Usage: navigator.navigate_to_goal(start_x, start_y, goal_x, goal_y)')
+        self.get_logger().info(f'Global plan topic: {NavigatorConstants.NAMESPACE}/a_star/plan')
 
     # ========================================================================
     # MAP LOADING AND PROCESSING
@@ -306,7 +350,7 @@ class AStarNavigator(Node):
         updates internal state for navigation control.
 
         Args:
-            msg: Odometry message from /sim_ground_truth_pose
+            msg: Odometry message from /{namespace}/odom
         """
         self.current_pose = {
             'x': msg.pose.pose.position.x,
@@ -370,8 +414,9 @@ class AStarNavigator(Node):
         """
         Plan path and start navigation from start to goal.
 
-        Main entry point for navigation. Plans a path using A* and
-        starts the waypoint following control loop.
+        In standalone mode, plans a path AND drives the robot via cmd_vel.
+        In planner-only mode, plans a path and publishes it as nav_msgs/Path
+        for a downstream local planner (e.g. DWA) to follow.
 
         Args:
             start_x: Start X coordinate in world frame (meters)
@@ -393,10 +438,68 @@ class AStarNavigator(Node):
             self.current_waypoint_idx = 0
             self.get_logger().info(f'Path found with {len(self.path)} waypoints')
             self.print_path()
+
+            # Always publish the global plan (consumed by local planners or RViz)
+            self.publish_global_plan()
+
+            if not self.standalone:
+                self.get_logger().info(
+                    'Planner-only mode: path published, waiting for next goal.'
+                )
+                # Clear path so control_loop (if somehow active) does nothing
+                self.path = []
+
             return True
         else:
             self.get_logger().error('No path found! Check if start/goal are valid and reachable')
+            self.latest_plan_msg = None
             return False
+
+    # ========================================================================
+    # GLOBAL PLAN PUBLISHING (for stacked planner/controller architecture)
+    # ========================================================================
+
+    def publish_global_plan(self):
+        """
+        Publish the current path as a nav_msgs/Path message.
+
+        Follows the Nav2 convention: the global planner publishes a Path in
+        the 'map' frame. A downstream local planner (e.g. DWA) subscribes
+        and tracks the path while handling reactive obstacle avoidance.
+        """
+        if not self.path:
+            return
+
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = 'map'
+
+        for (wx, wy) in self.path:
+            pose = PoseStamped()
+            pose.header = path_msg.header
+            pose.pose.position.x = float(wx)
+            pose.pose.position.y = float(wy)
+            pose.pose.position.z = 0.0
+            # Orientation: point toward next waypoint (identity for last)
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+
+        self.latest_plan_msg = path_msg
+        self.plan_pub.publish(path_msg)
+        self.get_logger().info(
+            f'Published global plan ({len(path_msg.poses)} poses) on '
+            f'{NavigatorConstants.NAMESPACE}/a_star/plan'
+        )
+
+    def republish_plan(self):
+        """
+        Periodically republish the latest plan so late-joining subscribers
+        (e.g. DWA node started after A* already planned) receive it.
+        """
+        if self.latest_plan_msg is not None:
+            # Update timestamp so the message isn't stale
+            self.latest_plan_msg.header.stamp = self.get_clock().now().to_msg()
+            self.plan_pub.publish(self.latest_plan_msg)
 
     # ========================================================================
     # PATH PLANNING
@@ -693,16 +796,19 @@ class AStarNavigator(Node):
         target = self.path[self.current_waypoint_idx]
         tx, ty = target
 
-        # Try to get pose from TF2 (map frame), fall back to odom
+        # Get pose from TF2 (map frame) — path is planned in map frame,
+        # so odom fallback would cause drift-induced navigation errors.
         map_pose = self.get_robot_pose_map_frame()
         if map_pose is not None:
             curr_x, curr_y, curr_theta = map_pose
             self.active_frame = 'map'
         else:
-            curr_x = self.current_pose['x']
-            curr_y = self.current_pose['y']
-            curr_theta = self.current_pose['theta']
-            self.active_frame = 'odom'
+            self.get_logger().warn(
+                'TF2 map->base_link unavailable. Stopping until localization recovers. '
+                'Is AMCL running? Check TF remapping for namespace.'
+            )
+            self.stop_robot()
+            return
 
         # Calculate distance and angle to target
         dx = tx - curr_x
@@ -806,28 +912,48 @@ def main(args=None):
 
     Configuration via environment variables:
         ROBOT_RADIUS: Robot radius in meters (default 0.22)
-        SAFETY_CLEARANCE: Safety margin in meters (default 0.15)
+        SAFETY_CLEARANCE: Safety margin in meters (default 0.05)
+        MAP_YAML: Path to map YAML file (required)
+        MAP_PGM: Path to map PGM file (derived from MAP_YAML if not set)
+        STANDALONE: 'true' = plan + drive (default), 'false' = publish path only
     """
     # Get parameters from environment or use defaults
     robot_radius = float(os.getenv('ROBOT_RADIUS', str(NavigatorConstants.ROBOT_RADIUS)))
     safety_clearance = float(os.getenv('SAFETY_CLEARANCE', str(NavigatorConstants.SAFETY_CLEARANCE)))
+    map_yaml = os.getenv('MAP_YAML')
+    map_pgm = os.getenv('MAP_PGM')
 
     # Initialize ROS2
     rclpy.init(args=args)
-    navigator = AStarNavigator(robot_radius=robot_radius, safety_clearance=safety_clearance)
+    navigator = AStarNavigator(
+        robot_radius=robot_radius,
+        safety_clearance=safety_clearance,
+        map_yaml=map_yaml,
+        map_pgm=map_pgm,
+    )
 
     # Print usage information
+    standalone = navigator.standalone
+    mode_label = 'STANDALONE' if standalone else 'PLANNER-ONLY (stacked)'
     print("\n" + "="*60)
     print("TurtleBot4 A* Navigator (with AMCL/TF2 Localization)")
     print("="*60)
+    print(f"\nMode: {mode_label}  (set via STANDALONE env var)")
     print(f"\nRobot Configuration:")
     print(f"  Robot radius: {robot_radius}m (set via ROBOT_RADIUS env var)")
     print(f"  Safety clearance: {safety_clearance}m (set via SAFETY_CLEARANCE env var)")
     print(f"  Total inflation: {robot_radius + safety_clearance}m")
-    print("\nWaiting for goals via RViz 2D Goal Pose tool...")
-    print("  1. Set initial pose using '2D Pose Estimate' in RViz")
-    print("  2. Click '2D Goal Pose' and click on the map to send goals")
-    print("  3. Robot will navigate to goal, then wait for next goal")
+    if standalone:
+        print("\nWaiting for goals via RViz 2D Goal Pose tool...")
+        print("  1. Set initial pose using '2D Pose Estimate' in RViz")
+        print("  2. Click '2D Goal Pose' and click on the map to send goals")
+        print("  3. Robot will navigate to goal, then wait for next goal")
+    else:
+        print(f"\nPublishing global plan on: {NavigatorConstants.NAMESPACE}/a_star/plan")
+        print("  1. Set initial pose using '2D Pose Estimate' in RViz")
+        print("  2. Click '2D Goal Pose' to send goals")
+        print("  3. A* publishes the path — start your local planner (e.g. DWA)")
+        print("     to subscribe and drive the robot")
     print("\nPress Ctrl+C to stop.")
     print("="*60 + "\n")
 

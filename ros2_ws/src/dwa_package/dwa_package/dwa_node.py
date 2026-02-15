@@ -12,7 +12,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
 from tf2_ros import Buffer, TransformListener
-import distanceGrid as dg                
+from dwa_package import distanceGrid as dg
 #import nav2_amcl #TODO need to sudo import nav2 for this, to get properly localized x y coords (not just odometry)                                   
 
 class DWA(Node):
@@ -30,8 +30,22 @@ class DWA(Node):
     
     
     def __init__(self):
-        super().__init__('dynamic_window_approach')   
-        
+        # Read namespace early so we can remap TF topics at node init time.
+        # ROS2 param override (--ros-args -p namespace:=/foo) still works;
+        # the cli_args remaps just set up the TF subscriptions.
+        import sys
+        _ns = '/don'
+        for i, arg in enumerate(sys.argv):
+            if arg.startswith('namespace:='):
+                _ns = arg.split(':=', 1)[1]
+            elif arg == '-p' and i + 1 < len(sys.argv) and sys.argv[i+1].startswith('namespace:='):
+                _ns = sys.argv[i+1].split(':=', 1)[1]
+
+        super().__init__('dynamic_window_approach', cli_args=[
+            '--ros-args',
+            '-r', f'/tf:={_ns}/tf',
+            '-r', f'/tf_static:={_ns}/tf_static',
+        ])
 
 #relevant hyperparams,,,, can edit here or test diff with command line
 #twist
@@ -345,7 +359,7 @@ class DWA(Node):
         ))
         h_score = 1.0 - (heading_err / np.pi)
         
-        #obstacle score
+        #obstacle score — min_dists used for hard-rejection below
         if len(obstacles) > 0:
             all_pts = trajectories[:, :, :2]
             diffs = obstacles[None, None, :, :] - all_pts[:, :, None, :]
@@ -353,13 +367,9 @@ class DWA(Node):
             min_dists = np.min(dists, axis=(1, 2))
         else:
             min_dists = np.full(len(final_vs), self.max_lidar_range)
-        
-        o_score = np.clip(min_dists / self.safe_dist, 0.0, 1.0) ** 2
-        #NOTE: left all obstacle score code intact above.
-        #CODE START
+
         o_score_list = dg.get_all_path_costs(trajectories, obstacles)
         o_score = np.array(o_score_list)
-        #CODE END
         
         #velocity and smoothness
         v_score = np.clip(final_vs / self.max_v, 0.0, 1.0)

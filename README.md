@@ -128,8 +128,8 @@ source /etc/turtlebot4_discovery/setup.bash
 cd ~/obstacle-avoidance-comps/ros2_ws
 source install/setup.bash
 
-# For A* navigation:
-ros2 run a_star a_star_nav
+# For A* navigation (MAP_YAML is required):
+MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav
 
 # Or for DWA navigation:
 ros2 run dwa_package dwa_node
@@ -274,16 +274,23 @@ ros2 run sensor_data lidar
 ### A* Navigator
 Autonomous navigation using A* pathfinding algorithm with TF2/AMCL localization.
 
+Supports two modes:
+- **Standalone** (default): A* plans AND drives the robot via `cmd_vel`
+- **Planner-only**: A* publishes a `nav_msgs/Path` on `/{ns}/a_star/plan` for a local planner (e.g. DWA) to follow — mirroring the Nav2 planner/controller split
+
 ```bash
 cd ~/obstacle-avoidance-comps/ros2_ws
 colcon build --packages-select a_star
 source install/local_setup.bash
 
-# Run A* navigator (receives goals via RViz 2D Goal Pose)
-ros2 run a_star a_star_nav
+# Run A* in standalone mode (plan + drive)
+MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav
+
+# Run A* in planner-only mode (for stacking with DWA)
+STANDALONE=false MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav
 
 # With custom safety parameters
-ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.20 ros2 run a_star a_star_nav
+MAP_YAML=/path/to/your/map.yaml ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.05 ros2 run a_star a_star_nav
 
 # Run interactive visualizer
 ros2 run a_star visualizer
@@ -293,7 +300,8 @@ ros2 run a_star visualizer
 - Receives goals via RViz "2D Goal Pose" tool
 - Uses TF2 for map frame localization (works with AMCL)
 - Hybrid obstacle validation (tight spaces + safety margins)
-- Pure pursuit waypoint following
+- Pure pursuit waypoint following (standalone mode)
+- Publishes `nav_msgs/Path` global plan (both modes)
 - Supports repeated experiments without restart
 
 ### D* Lite Navigator
