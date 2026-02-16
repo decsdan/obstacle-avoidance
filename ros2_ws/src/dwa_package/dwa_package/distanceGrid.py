@@ -361,13 +361,24 @@ def normalize_path_costs(allCosts):
     # these are all of the non infinite values
     finiteCosts = [cost for cost in allCosts if math.isfinite(cost)]
 
+    if len(finiteCosts) == 0:
+        return allCosts
+
     minVal = min(finiteCosts)
     maxVal = max(finiteCosts)
+    valRange = maxVal - minVal
 
-    normalizedCosts = [
-        (cost - minVal) / (maxVal - minVal) if math.isfinite(cost) else cost
-        for cost in allCosts
-    ]
+    if valRange == 0:
+        # All finite costs are identical — normalize them all to 0.5
+        normalizedCosts = [
+            0.5 if math.isfinite(cost) else cost
+            for cost in allCosts
+        ]
+    else:
+        normalizedCosts = [
+            (cost - minVal) / valRange if math.isfinite(cost) else cost
+            for cost in allCosts
+        ]
     return normalizedCosts
 
 def get_all_path_costs(allPaths, occupiedPoints):

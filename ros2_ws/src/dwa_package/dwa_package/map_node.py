@@ -8,7 +8,7 @@ import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid
 import numpy as np
-import distanceGrid as dg
+from dwa_package import distanceGrid as dg
 
 class MapListener(Node):
     def __init__(self):
