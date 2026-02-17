@@ -510,6 +510,11 @@ class DStarNavigator(Node):
         self.last_replan_time = self.get_clock().now()
         self.blocked_waypoint_idx = None  # Track which waypoint is blocked by obstacle
 
+        # Distance and time tracking
+        self.start_time = None
+        self.total_distance = 0.0  # Total distance traveled in meters
+        self.last_position = None  # Last position for distance calculation
+
         # Control loop timer (10 Hz)
         self.control_timer = self.create_timer(0.1, self.control_loop)
 
@@ -708,10 +713,6 @@ class DStarNavigator(Node):
                             self.grid_dynamic[grid_y, grid_x] = is_obstacle
                             changed_cells.append((grid_x, grid_y))
 
-        self.get_logger().info(
-            f'Full costmap processed: {obstacles_found} obstacles, '
-            f'{out_of_bounds} out of bounds, {len(changed_cells)} cells changed'
-        )
 
         # Update D* Lite planner and trigger replan if needed
         if changed_cells and self.dstar_planner:
@@ -1069,12 +1070,6 @@ class DStarNavigator(Node):
             # Where costmap has data (mask==1), use costmap value (overrides SLAM)
             # Where no costmap data (mask==0), use SLAM value
             # This makes costmap the "truth" over SLAM since it's real-time sensor data
-            costmap_cells_count = np.sum(self.grid_local_costmap_mask)
-            costmap_obstacles_count = np.sum((self.grid_local_costmap_mask == 1) & (self.grid_local_costmap == 1))
-            self.get_logger().info(
-                f'SLAM merge: Applying costmap override to {costmap_cells_count} cells '
-                f'({costmap_obstacles_count} obstacles from costmap)'
-            )
             self.grid_dynamic = np.where(self.grid_local_costmap_mask == 1,
                                         self.grid_local_costmap,
                                         self.grid_dynamic)
@@ -1163,7 +1158,12 @@ class DStarNavigator(Node):
 
         if self.path:
             self.current_waypoint_idx = 0
+            # Initialize distance and time tracking
+            self.start_time = self.get_clock().now()
+            self.total_distance = 0.0
+            self.last_position = (start_x, start_y)
             self.get_logger().info(f'Path found with {len(self.path)} waypoints')
+            self.get_logger().info('Started tracking distance and time')
             return True
         else:
             self.get_logger().error('No path found!')
@@ -1527,6 +1527,16 @@ class DStarNavigator(Node):
         """
         if not self.path or self.current_pose is None:
             return
+        
+        # Update distance traveled
+        if self.last_position is not None:
+            current_x = self.current_pose['x']
+            current_y = self.current_pose['y']
+            dx = current_x - self.last_position[0]
+            dy = current_y - self.last_position[1]
+            distance_increment = math.sqrt(dx**2 + dy**2)
+            self.total_distance += distance_increment
+            self.last_position = (current_x, current_y)
 
         if self.replanning_needed:
             self._handle_replanning()
@@ -1534,7 +1544,14 @@ class DStarNavigator(Node):
 
         if self.current_waypoint_idx >= len(self.path):
             self.stop_robot()
-            self.get_logger().info('Goal reached! 😎')
+            # Calculate elapsed time
+            if self.start_time is not None:
+                elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+                self.get_logger().info('Goal reached! 😎')
+                self.get_logger().info(f'Total distance traveled: {self.total_distance:.2f} meters')
+                self.get_logger().info(f'Total time elapsed: {elapsed_time:.2f} seconds')
+            else:
+                self.get_logger().info('Goal reached! 😎')
             self.path = []
             return
 
@@ -1878,3 +1895,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+    
