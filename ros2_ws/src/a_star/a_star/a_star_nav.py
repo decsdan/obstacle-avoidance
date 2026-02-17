@@ -36,7 +36,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 import numpy as np
 import yaml
 from PIL import Image
@@ -70,8 +70,10 @@ class NavigatorConstants:
     TIGHT_SPACE_RADIUS = 3       # Grid cells to use original grid near start
 
     # Publishing/Subscribing Paths
-    CMD_VEL = '/mikey/cmd_vel'
-    ODOMETRY = '/mikey/odom'
+    NAMESPACE = '/mikey'
+    CMD_VEL = f'{NAMESPACE}/cmd_vel'
+    ODOMETRY = f'{NAMESPACE}/odom'
+    PATH = f'{NAMESPACE}/a_star_path'
 
     # Pgm and yaml paths
     SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/simple_static.yaml'
@@ -117,6 +119,9 @@ class AStarNavigator(Node):
 
         # Command velocity publisher (TwistStamped for Jazzy, Twist for Humble)
         self.cmd_vel_pub = self.create_publisher(TwistStamped, NavigatorConstants.CMD_VEL, 10)
+
+        # Path publisher for RViz visualization
+        self.path_pub = self.create_publisher(Path, NavigatorConstants.PATH, 10)
 
         # Odometry subscriber (best-effort QoS to match publisher)
         qos_profile = QoSProfile(
@@ -334,6 +339,7 @@ class AStarNavigator(Node):
             self.get_logger().info(f'✓ Path found with {len(self.path)} waypoints')
             self.get_logger().info('Started tracking distance and time')
             self.print_path()
+            self.publish_path()
             return True
         else:
             self.get_logger().error('✗ No path found! Check if start/goal are valid and reachable')
@@ -601,6 +607,24 @@ class AStarNavigator(Node):
         simplified = [path[i] for i in range(0, len(path), step)]
         simplified.append(path[-1])  # Always include goal
         return simplified
+
+    def publish_path(self):
+        """Publish the planned path as a nav_msgs/Path for RViz visualization."""
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = 'map'
+
+        for x, y in self.path:
+            pose = PoseStamped()
+            pose.header.stamp = path_msg.header.stamp
+            pose.header.frame_id = 'map'
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+            pose.pose.position.z = 0.0
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+
+        self.path_pub.publish(path_msg)
 
     def print_path(self):
         """Print the planned path waypoints to logger."""

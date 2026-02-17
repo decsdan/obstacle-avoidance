@@ -31,7 +31,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
-from nav_msgs.msg import Odometry, OccupancyGrid
+from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from map_msgs.msg import OccupancyGridUpdate
 import numpy as np
 import heapq
@@ -77,6 +77,7 @@ class PlannerConstants:
     OCCUPANCY_GRID = f'{NAMESPACE}/map'
     DYNAMIC_GRID = f'{NAMESPACE}/dynamic_grid'
     GOAL_POSE = f'{NAMESPACE}/d_star_goal_pose'
+    PATH = f'{NAMESPACE}/d_star_path'
 
     # Local costmap topics (Nav2)
     LOCAL_COSTMAP = f'{NAMESPACE}/local_costmap/costmap'
@@ -468,6 +469,7 @@ class DStarNavigator(Node):
         # ROS2 publishers
         self.cmd_vel_pub = self.create_publisher(TwistStamped, PlannerConstants.CMD_VEL, 10)
         self.dynamic_grid_pub = self.create_publisher(OccupancyGrid, PlannerConstants.DYNAMIC_GRID, 10)
+        self.path_pub = self.create_publisher(Path, PlannerConstants.PATH, 10)
 
         # ROS2 subscribers
         self._setup_subscribers()
@@ -1164,6 +1166,7 @@ class DStarNavigator(Node):
             self.last_position = (start_x, start_y)
             self.get_logger().info(f'Path found with {len(self.path)} waypoints')
             self.get_logger().info('Started tracking distance and time')
+            self.publish_path()
             return True
         else:
             self.get_logger().error('No path found!')
@@ -1607,6 +1610,7 @@ class DStarNavigator(Node):
 
                 self.get_logger().info(f'Replanning successful! Path: {len(self.path)} waypoints '
                                       f'({len(preserved_waypoints)} preserved + {len(new_path)} new)')
+                self.publish_path()
             else:
                 self.get_logger().error('Replanning failed! Stopping navigation.')
                 self.path = []
@@ -1666,6 +1670,24 @@ class DStarNavigator(Node):
     # ========================================================================
     # UTILITY METHODS
     # ========================================================================
+
+    def publish_path(self):
+        """Publish the planned path as a nav_msgs/Path for RViz visualization."""
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = 'map'
+
+        for x, y in self.path:
+            pose = PoseStamped()
+            pose.header.stamp = path_msg.header.stamp
+            pose.header.frame_id = 'map'
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+            pose.pose.position.z = 0.0
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+
+        self.path_pub.publish(path_msg)
 
     def publish_dynamic_grid(self):
         """
