@@ -337,8 +337,10 @@ def get_path_given_points(trajectory):
     finalPath = []
 
     for i in range(len(trajectory) - 1):
-        x0, y0 = trajectory[i]
-        x1, y1 = trajectory[i + 1]
+        x0 = trajectory[i][0]
+        y0 = trajectory[i][1]
+        x1 = trajectory[i+1][0]
+        y1 = trajectory[i+1][1]
         line_points = bresenham(x0, y0, x1, y1)
         finalPath.extend(line_points[1:])
 
@@ -365,7 +367,7 @@ def normalize_path_costs(allCosts):
     maxVal = max(finiteCosts)
 
     normalizedCosts = [
-        (cost - minVal) / (maxVal - minVal) if math.isfinite(cost) else cost
+        (cost - minVal) / (maxVal - minVal+1) if math.isfinite(cost) else cost
         for cost in allCosts
     ]
     return normalizedCosts
@@ -376,6 +378,7 @@ def get_all_path_costs(allPaths, occupiedPoints):
     distanceGrid = distance_from_obstacles(obstacleGrid)
     allCosts = []
     for path in allPaths:
+        path = clean_points(path)
         allCosts.append(get_path_cost(path, distanceGrid))
     normalizedCosts = normalize_path_costs(allCosts)
     invertedCosts = []

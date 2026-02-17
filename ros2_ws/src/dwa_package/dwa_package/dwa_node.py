@@ -10,7 +10,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
 from tf2_ros import Buffer, TransformListener
-import distanceGrid as dg                
+from dwa_package import distanceGrid as dg                
 #import nav2_amcl #TODO need to sudo import nav2 for this, to get properly localized x y coords (not just odometry)                                   
 
 class DWA(Node):
@@ -29,7 +29,7 @@ class DWA(Node):
         self.declare_parameter('max_linear_acceleration', 0.5)
         self.declare_parameter('max_angular_acceleration', 1.5)
         self.declare_parameter('v_samples', 10) 
-        self.declare_parameter('w_samples', 20)
+        self.declare_parameter('w_samples', 40)
         self.declare_parameter('lidar_angle_offset', 1.5708) # for whatever reason, the real life turtlebot needs to be shifted 90 degrees
 
         self.max_v = self.get_parameter('max_velocity').value
@@ -67,7 +67,7 @@ class DWA(Node):
         
 # cost weights
         self.declare_parameter('weights.goal', 0.5)
-        self.declare_parameter('weights.heading', 0.05)
+        self.declare_parameter('weights.heading', 0.15)
         self.declare_parameter('weights.velocity', 0.2)
         self.declare_parameter('weights.smoothness', 0.05)
         self.declare_parameter('weights.obstacle', 0.1)
@@ -92,7 +92,7 @@ class DWA(Node):
         self.visualize_trajectories = self.get_parameter('visualize_trajectories').value
         self.traj_downsample = self.get_parameter('trajectory_visualization_downsample').value
         
-        self.declare_parameter('goal_tolerance', 0.3)
+        self.declare_parameter('goal_tolerance', 0.4)
         self.goal_tolerance = self.get_parameter('goal_tolerance').value
 
         self.timer = self.create_timer(self.dt, self.nav_loop)
@@ -102,7 +102,7 @@ class DWA(Node):
         self.odom_msg = None
         
 #subs
-        self.declare_parameter('namespace', '/don') #currently blank, but to get it to work on the robot, you need to use the robot name, for us it is /don
+        self.declare_parameter('namespace', '/raph') #currently blank, but to get it to work on the robot, you need to use the robot name, for us it is /don
         self.namespace = self.get_parameter('namespace').value
         print(f"{self.namespace}/scan")
 
@@ -265,6 +265,14 @@ class DWA(Node):
         final_pos = trajectories[:, -1, :2]
         curr_dist = np.linalg.norm(self.goal - np.array([curr_x, curr_y]))
         goal_dists = np.linalg.norm(self.goal - final_pos, axis=1)
+
+        #updating the window based on distance to goal, discrete and changes only @ a distance of 2 meters
+        if curr_dist < 1:
+            self.max_v = curr_dist / 1 + 0.1
+            self.w_heading = 0.25
+        else:
+            self.max_v = 0.4
+            self.w_heading = 0.05
         
         #goal score
         max_prog = self.max_v * self.dt * self.steps
@@ -298,7 +306,8 @@ class DWA(Node):
         o_score = np.array(o_score_list)
         #CODE END
         
-        #velocity and smoothness
+        #velocity and smoothnesso_score_list = dg.get_all_path_costs(trajectories, obstacles)
+        # o_score = np.array(o_score_list)
         v_score = np.clip(final_vs / self.max_v, 0.0, 1.0)
         w_score = np.clip(1.0 - (np.abs(final_ws) / self.max_w), 0.0, 1.0)
         
@@ -452,7 +461,6 @@ class DWA(Node):
         self.message.twist.linear.x = best_v
         self.message.twist.angular.z = best_w
         self.twist_publish.publish(self.message)
-
 
 
 def main(args=None):
