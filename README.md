@@ -205,9 +205,7 @@ ros2 run jps jps_visualizer
 ros2 run jps odom
 
 # In EVERY new terminal:
-source /opt/ros/jazzy/setup.bash
 source /etc/turtlebot4_discovery/setup.bash
-# Then your workspace
 source ~/obstacle-avoidance-comps/ros2_ws/install/setup.bash
 
 ```
