@@ -76,8 +76,8 @@ class NavigatorConstants:
     PATH = f'{NAMESPACE}/a_star_path'
 
     # Pgm and yaml paths
-    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/simple_static.yaml'
-    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/simple_static.pgm'
+    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/static_test_map2.yaml'
+    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/static_test_map2.pgm'
 
 
 
