@@ -96,22 +96,47 @@ This workspace includes `amcl_params.yaml` which configures AMCL to auto-set an 
 
 ### Experiment Workflow (Physical Robot)
 
+**Step 0 — Undock the robot** before launching anything. AMCL requires lidar data to initialize, and the lidar does not run while docked.
+
+**Step 1 — Restart the ROS2 daemon** (once per session, any terminal):
+```bash
+ros2 daemon stop; ros2 daemon start
+```
+
 **Terminal 1 - Localization (AMCL):**
 ```bash
-source /opt/ros/jazzy/setup.bash
-source /etc/turtlebot4_discovery/setup.bash
-ros2 daemon stop; ros2 daemon start
-
-# Launch localization with your saved map and AMCL params
 ros2 launch turtlebot4_navigation localization.launch.py \
     namespace:=/don \
     map:=/path/to/your/map.yaml \
     params_file:=/path/to/obstacle-avoidance-comps/ros2_ws/amcl_params.yaml
 ```
 
-Wait for AMCL to print `Setting pose` — the `map` frame is now available.
+Wait ~10 seconds. If AMCL prints `Setting pose`, the `map` frame is available — proceed to Terminal 2.
 
-If AMCL is still stuck on "Please set the initial pose...", the params file may not have loaded. See **Manual Initial Pose Fallback** below.
+If you see `failed to send response to /don/map_server/change_state (timeout)` and nothing else happens, the lifecycle manager has stalled. Leave Terminal 1 running and open a new terminal to fix it:
+
+```bash
+# Each command may hang a few seconds — Ctrl+C and continue
+ros2 lifecycle set /don/map_server activate
+ros2 lifecycle set /don/amcl configure
+ros2 lifecycle set /don/amcl activate
+```
+
+Then publish the initial pose to bootstrap the `map` frame:
+
+```bash
+ros2 topic pub -r 1 /don/initialpose geometry_msgs/msg/PoseWithCovarianceStamped "{
+  header: {frame_id: 'map'},
+  pose: {
+    pose: {
+      position: {x: 0.0, y: 0.0, z: 0.0},
+      orientation: {w: 1.0}
+    }
+  }
+}"
+```
+
+Wait for AMCL to print `Setting pose` in Terminal 1, then Ctrl+C. Use `-r 1` (repeated), not `--once` — the single-shot publish often fires before AMCL discovers the publisher.
 
 **Terminal 2 - RViz Visualization:**
 ```bash
@@ -134,26 +159,6 @@ MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav
 # Or for DWA navigation:
 ros2 run dwa_package dwa_node
 ```
-
-### Manual Initial Pose Fallback
-
-If `amcl_params.yaml` doesn't auto-set the initial pose (AMCL keeps printing "Please set the initial pose..."), bootstrap it manually. Run this in a spare terminal and wait for AMCL to print `Setting pose`, then Ctrl+C:
-
-```bash
-ros2 topic pub -r 1 /don/initialpose geometry_msgs/msg/PoseWithCovarianceStamped "{
-  header: {frame_id: 'map'},
-  pose: {
-    pose: {
-      position: {x: 0.0, y: 0.0, z: 0.0},
-      orientation: {w: 1.0}
-    }
-  }
-}"
-```
-
-> **Note:** Use `-r 1` (repeated), not `--once`. The single-shot publish often fires before AMCL discovers the publisher and gets silently dropped.
-
-Once the `map` frame exists, RViz will display the map and you can refine with **2D Pose Estimate** as usual.
 
 ### Running Repeated Experiments
 
@@ -475,6 +480,11 @@ ros2_ws/
 ---
 
 ## Troubleshooting
+
+### Lifecycle manager timeout (AMCL never activates)
+- **Symptom:** `failed to send response to /don/map_server/change_state (timeout)` and AMCL never prints `Configuring`
+- **Cause:** DDS service response timeout. Common on some machines with `rmw_fastrtps_cpp`
+- **Fix:** See lifecycle fix steps in [Experiment Workflow](#experiment-workflow-physical-robot)
 
 ### TF2 transform not available
 - With namespaced robots, TF is on `/don/tf` not `/tf`. Verify with: `ros2 topic hz /don/tf`

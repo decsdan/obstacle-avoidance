@@ -59,7 +59,7 @@ class NavigatorConstants:
 
     # Robot Physical Parameters (meters)
     ROBOT_RADIUS = 0.22          # TurtleBot4 radius
-    SAFETY_CLEARANCE = 0.05     # Additional safety margin
+    SAFETY_CLEARANCE = 0.00     # Additional safety margin
 
     # Control Parameters
     LINEAR_SPEED = 0.2           # Forward speed (m/s)
@@ -573,7 +573,11 @@ class AStarNavigator(Node):
 
         # Convert to world coordinates and simplify
         path_world = [self.grid_to_world(gx, gy) for gx, gy in path_grid]
-        simplified_path = self.simplify_path(path_world)
+        #only simplify the path if actually navigating along the path it created, otherwise we use the full path.
+        if self.standalone:
+            simplified_path = self.simplify_path(path_world)
+        else:
+            simplified_path = path_world  
 
         return simplified_path
 
