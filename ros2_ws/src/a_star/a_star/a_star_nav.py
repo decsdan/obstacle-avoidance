@@ -58,7 +58,7 @@ class NavigatorConstants:
     """Configuration constants for the A* navigator"""
 
     # Robot Physical Parameters (meters)
-    ROBOT_RADIUS = 0.22          # TurtleBot4 radius
+    ROBOT_RADIUS = 0.25      # TurtleBot4 radius
     SAFETY_CLEARANCE = 0.00     # Additional safety margin
 
     # Control Parameters
@@ -75,7 +75,7 @@ class NavigatorConstants:
     TIGHT_SPACE_RADIUS = 3       # Grid cells to use original grid near start
 
     # Robot namespace (e.g., '/don' for the physical robot)
-    NAMESPACE = '/don'
+    NAMESPACE = '/mikey'
 
     # Publishing/Subscribing Paths (derived from NAMESPACE)
     CMD_VEL = NAMESPACE + '/cmd_vel'
@@ -138,7 +138,7 @@ class AStarNavigator(Node):
         # can be visualized or consumed by a downstream local planner.
         self.plan_pub = self.create_publisher(
             Path,
-            NavigatorConstants.NAMESPACE + '/a_star/plan',
+            NavigatorConstants.NAMESPACE + '/a_star/plan', #/don/a_star/plan
             10
         )
 
@@ -574,11 +574,9 @@ class AStarNavigator(Node):
         # Convert to world coordinates and simplify
         path_world = [self.grid_to_world(gx, gy) for gx, gy in path_grid]
         #only simplify the path if actually navigating along the path it created, otherwise we use the full path.
-        if self.standalone:
-            simplified_path = self.simplify_path(path_world)
-        else:
-            simplified_path = path_world  
-
+        if not self.standalone:
+            MAX_PATH_WAYPOINTS = 50
+        simplified_path = self.simplify_path(path_world)
         return simplified_path
 
     def astar(self, start, goal):

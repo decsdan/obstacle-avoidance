@@ -260,11 +260,11 @@ def place_obstacles(grid, occupiedPoints):
         #grid[row][col]
         grid[point[1], point[0]] = 100
 
-def clean_points(points):
+def clean_points(points, curr_x=0.0, curr_y=0.0):
     transformedPoints = []
     for point in points:
-        transformedX = int(point[0]*10) + 80
-        transformedY = int(point[1]*10) + 80
+        transformedX = int((point[0] - curr_x) * 10) + 80
+        transformedY = int((point[1] - curr_y) * 10) + 80
         if transformedX < 0 or transformedX > 160 or transformedY < 0 or transformedY > 160:
             continue
         transformedPoints.append((transformedX, transformedY))
@@ -286,7 +286,7 @@ def distance_from_obstacles(obstacleGrid: np.ndarray) -> np.ndarray:
     # find all spots where there's an obstacle and add it to queue
     obstacle_coords = np.argwhere(obstacleGrid == 100)
     for y, x in obstacle_coords:
-        dist_grid[y, x] = -2
+        dist_grid[y, x] = 0
         queue.append((y, x))
     
     # manahttan distance neighbors
@@ -337,8 +337,10 @@ def get_path_given_points(trajectory):
     finalPath = []
 
     for i in range(len(trajectory) - 1):
-        x0, y0 = trajectory[i]
-        x1, y1 = trajectory[i + 1]
+        x0 = trajectory[i][0]
+        y0 = trajectory[i][1]
+        x1 = trajectory[i+1][0]
+        y1 = trajectory[i+1][1]
         line_points = bresenham(x0, y0, x1, y1)
         finalPath.extend(line_points[1:])
 
@@ -348,12 +350,14 @@ def get_path_given_points(trajectory):
     return finalPath
 
 def get_path_cost(path, distanceGrid):
+    if not path:
+        return math.inf
     totalCost = 0
     for x,y in path:
         if distanceGrid[y, x] <= 0:
             cost = math.inf
         else:
-            cost = math.exp(-1 * distanceGrid[y, x])
+            cost = math.exp(-0.3 * distanceGrid[y, x])
         totalCost += cost
     return totalCost
 
@@ -361,35 +365,47 @@ def normalize_path_costs(allCosts):
     # these are all of the non infinite values
     finiteCosts = [cost for cost in allCosts if math.isfinite(cost)]
 
-    if len(finiteCosts) == 0:
-        return allCosts
+    if not finiteCosts:
+        return [math.inf] * len(allCosts)
 
     minVal = min(finiteCosts)
     maxVal = max(finiteCosts)
-    valRange = maxVal - minVal
 
-    if valRange == 0:
-        # All finite costs are identical — normalize them all to 0.5
-        normalizedCosts = [
-            0.5 if math.isfinite(cost) else cost
-            for cost in allCosts
-        ]
-    else:
-        normalizedCosts = [
-            (cost - minVal) / valRange if math.isfinite(cost) else cost
-            for cost in allCosts
-        ]
+    normalizedCosts = [
+        (cost - minVal) / (maxVal - minVal+1) if math.isfinite(cost) else cost
+        for cost in allCosts
+    ]
     return normalizedCosts
 
-def get_all_path_costs(allPaths, occupiedPoints):
-    occupiedPoints = clean_points(occupiedPoints)
+def get_all_path_costs(allPaths, occupiedPoints, curr_x=0.0, curr_y=0.0):
+    occupiedPoints = clean_points(occupiedPoints, curr_x, curr_y)
     obstacleGrid = generate_obstacle_grid(occupiedPoints)
     distanceGrid = distance_from_obstacles(obstacleGrid)
     allCosts = []
     for path in allPaths:
+        path = clean_points(path, curr_x, curr_y)
         allCosts.append(get_path_cost(path, distanceGrid))
     normalizedCosts = normalize_path_costs(allCosts)
     invertedCosts = []
     for cost in normalizedCosts:
         invertedCosts.append(1-cost)
     return invertedCosts
+
+def get_all_path_costs_with_grid(allPaths, prebuilt_dist_grid, curr_x=0.0, curr_y=0.0):
+    pts = allPaths[:, :, :2]
+    grid_pts = ((pts - np.array([curr_x, curr_y])) * 10 + 80).astype(int)
+    gx = grid_pts[:, :, 0]
+    gy = grid_pts[:, :, 1]
+    in_bounds = (gx >= 0) & (gx <= 160) & (gy >= 0) & (gy <= 160)
+    gx_c = np.clip(gx, 0, 160)
+    gy_c = np.clip(gy, 0, 160)
+    dist_vals = prebuilt_dist_grid[gy_c, gx_c].astype(float)
+    # OOB points dropped (0 cost), obstacle points inf, valid points exp decay
+    point_costs = np.where(in_bounds, np.where(dist_vals > 0, np.exp(-0.3 * dist_vals), np.inf), 0.0)
+    # fully OOB paths or any obstacle-crossing path -> inf
+    all_oob = ~in_bounds.any(axis=1)
+    has_inf = np.isinf(point_costs).any(axis=1)
+    total = np.where(all_oob | has_inf, np.inf, point_costs.sum(axis=1))
+    allCosts = total.tolist()
+    normalizedCosts = normalize_path_costs(allCosts)
+    return [1 - cost for cost in normalizedCosts]

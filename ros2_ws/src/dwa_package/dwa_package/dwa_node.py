@@ -5,7 +5,7 @@ import numpy as np
 import math
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import TwistStamped, PoseStamped, Point
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -13,7 +13,6 @@ from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
 from tf2_ros import Buffer, TransformListener
 from dwa_package import distanceGrid as dg
-#import nav2_amcl #TODO need to sudo import nav2 for this, to get properly localized x y coords (not just odometry)                                   
 
 class DWA(Node):
     """
@@ -48,6 +47,12 @@ class DWA(Node):
         ])
 
 #relevant hyperparams,,,, can edit here or test diff with command line
+#stacked algo hyperprams
+        self.declare_parameter('stacked', True)
+        self.declare_parameter('lookahead', 0.22)
+
+        self.stacked = self.get_parameter('stacked').value
+        self.lookahead = self.get_parameter('lookahead').value
 #twist
         self.declare_parameter('max_velocity', 0.4)
         self.declare_parameter('min_velocity', 0.0)
@@ -55,8 +60,8 @@ class DWA(Node):
         self.declare_parameter('min_angular_velocity', -1.8)
         self.declare_parameter('max_linear_acceleration', 0.5)
         self.declare_parameter('max_angular_acceleration', 1.5)
-        self.declare_parameter('v_samples', 10) 
-        self.declare_parameter('w_samples', 20)
+        self.declare_parameter('v_samples', 8) 
+        self.declare_parameter('w_samples', 15)
         self.declare_parameter('lidar_angle_offset', 1.5708) # for whatever reason, the real life turtlebot needs to be shifted 90 degrees
 
         self.max_v = self.get_parameter('max_velocity').value
@@ -72,7 +77,7 @@ class DWA(Node):
         
 # planning
         self.declare_parameter('dt', 0.1)
-        self.declare_parameter('prediction_steps', 50)
+        self.declare_parameter('prediction_steps', 25)
         self.declare_parameter('window_steps', 8)
         self.declare_parameter('LIDAR_downsample', 1)
 
@@ -93,11 +98,11 @@ class DWA(Node):
         self.max_lidar_range = self.get_parameter('max_lidar_range').value
         
 # cost weights
-        self.declare_parameter('weights.goal', 0.5)
+        self.declare_parameter('weights.goal', 0.4)
         self.declare_parameter('weights.heading', 0.05)
         self.declare_parameter('weights.velocity', 0.2)
         self.declare_parameter('weights.smoothness', 0.05)
-        self.declare_parameter('weights.obstacle', 0.1)
+        self.declare_parameter('weights.obstacle', 0.2)
 
         self.w_goal = self.get_parameter('weights.goal').value
         self.w_heading = self.get_parameter('weights.heading').value
@@ -123,22 +128,32 @@ class DWA(Node):
         self.goal_tolerance = self.get_parameter('goal_tolerance').value
 
         self.timer = self.create_timer(self.dt, self.nav_loop)
+        
+#important vars
         self.goal = None
+        self.global_path = None
+        self.global_path_displacement = None
         self.emergency_scan_msg = None
         self.scan_msg = None
         self.odom_msg = None
+        self._cached_dist_grid = None
+        self._cached_grid_x = None
+        self._cached_grid_y = None
+        self._cached_obs_count = 0
 
         # Track which frame is actively used for pose/obstacles
         # Updated each nav_loop tick based on TF2 availability
         self.active_frame = 'odom'
         
 #subs
-        self.declare_parameter('namespace', '/don') #currently blank, but to get it to work on the robot, you need to use the robot name, for us it is /don
+        self.declare_parameter('namespace', '/mikey')
         self.namespace = self.get_parameter('namespace').value
-        print(f"{self.namespace}/scan")
-
+        if(self.stacked == True):
+            self.global_path_sub = self.create_subscription(Path, f"{self.namespace}/a_star/plan", self.global_path_callback, 10)
+        else:
+            self.goal_sub = self.create_subscription(PoseStamped, f"{self.namespace}/goal_pose", self.goal_callback, 10)
+            
         self.emergencyLidar = self.create_subscription(LaserScan, f"{self.namespace}/scan", self.emergency_lidar_callback, 10)
-        self.goal_sub = self.create_subscription(PoseStamped, f"{self.namespace}/goal_pose", self.goal_callback, 10)
         self.odom_sub = Subscriber(self, Odometry, f'{self.namespace}/odom', qos_profile=qos_profile_sensor_data)
         self.scan_sub = Subscriber(self, LaserScan, f'{self.namespace}/scan', qos_profile=qos_profile_sensor_data)
 
@@ -154,8 +169,13 @@ class DWA(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self) 
         self.sync = ApproximateTimeSynchronizer([self.odom_sub, self.scan_sub], 10, 0.1)
         self.sync.registerCallback(self.synchronized_callback)
-        
-
+    
+    #TODO this can be solved by an action server such that it doesnt need to be done regularly
+    def global_path_callback(self, msg):
+        if self.global_path is None or self.global_path.poses != msg.poses:
+            self.global_path = msg
+            self.get_logger().info("New global path has been grabbed!")
+            self.get_path_displacement()
 
     def goal_callback(self, msg):
         self.goal = np.array([msg.pose.position.x, msg.pose.position.y])
@@ -167,7 +187,71 @@ class DWA(Node):
         self.scan_msg = scan_msg
         self.odom_msg = odom_msg
 
+    def get_path_displacement(self):
+        #creates an array the same size as the number of items in the path, where each value at each index is the total displacement from one waypoint to the next
+        if self.global_path is None or len(self.global_path.poses) == 0:
+            return None
+        self.global_path_displacement = []
+        prev_x = None
+        prev_y = None
+        for pose in self.global_path.poses:
+            #calc dist between current x val and previous x val, then pass along prev x for next pose x and y
+            x = pose.pose.position.x
+            y = pose.pose.position.y
+
+            if prev_x is None:
+                prev_x = pose.pose.position.x
+
+            if prev_y is None:
+                prev_y = pose.pose.position.y
+
+            dx = x-prev_x
+            dy = y-prev_y
+            
+            prev_x = x
+            prev_y = y
+            self.global_path_displacement.append(math.sqrt(dx*dx + dy*dy))
+
+
 # helper funcs
+    def get_moving_goal(self, curr_x, curr_y):
+        #function to create a rolling goal, based on some "lookahead" value, such that the waypoint is further away than the lookahead value in relation to the robot along the path
+        if self.global_path is None or len(self.global_path.poses) == 0:
+            return None
+        distances = []
+        for pose in self.global_path.poses:
+            x = pose.pose.position.x
+            y = pose.pose.position.y
+
+            dx = x-curr_x
+            dy = y-curr_y
+            
+            distances.append(math.sqrt(dx*dx + dy*dy))
+            
+        closestpose = int(np.argmin(distances))
+        i = 1
+        target_idx = closestpose + i
+        traveled = 0
+        while (
+            target_idx < len(self.global_path.poses) - 1 and
+            traveled < self.lookahead
+        ):
+            traveled += self.global_path_displacement[target_idx]
+            i += 1
+            target_idx = closestpose + i
+
+        target_idx = min(target_idx, len(self.global_path.poses) - 1)
+
+        goal_x = self.global_path.poses[target_idx].pose.position.x
+        goal_y = self.global_path.poses[target_idx].pose.position.y
+        goal_theta = self.quat_to_yaw(self.global_path.poses[target_idx].pose.orientation)
+        return goal_x, goal_y, goal_theta
+
+
+
+
+
+
 
     def quat_to_yaw(self, q):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
@@ -281,9 +365,6 @@ class DWA(Node):
         self.best_traj_pub.publish(best_marker)
 
 
-
-
-
     
 #funcs
     def get_obstacles(self):
@@ -343,6 +424,11 @@ class DWA(Node):
         curr_dist = np.linalg.norm(self.goal - np.array([curr_x, curr_y]))
         goal_dists = np.linalg.norm(self.goal - final_pos, axis=1)
         
+        #TODO add Dist_from_path score (normalized)
+
+        #TODO add path_heading score (normalized)
+
+
         #goal score
         max_prog = self.max_v * self.dt * self.steps
         progress = curr_dist - goal_dists
@@ -368,7 +454,21 @@ class DWA(Node):
         else:
             min_dists = np.full(len(final_vs), self.max_lidar_range)
 
-        o_score_list = dg.get_all_path_costs(trajectories, obstacles)
+        rebuild = (
+            self._cached_dist_grid is None or
+            self._cached_grid_x is None or
+            math.sqrt((curr_x - self._cached_grid_x)**2 + (curr_y - self._cached_grid_y)**2) > 0.05 or
+            abs(len(obstacles) - self._cached_obs_count) > 10
+        )
+        if rebuild:
+            self._cached_grid_x = curr_x
+            self._cached_grid_y = curr_y
+            self._cached_obs_count = len(obstacles)
+            cleaned_obs = dg.clean_points(obstacles, curr_x, curr_y)
+            obs_grid = dg.generate_obstacle_grid(cleaned_obs)
+            self._cached_dist_grid = dg.distance_from_obstacles(obs_grid)
+
+        o_score_list = dg.get_all_path_costs_with_grid(trajectories, self._cached_dist_grid, curr_x, curr_y)
         o_score = np.array(o_score_list)
         
         #velocity and smoothness
@@ -438,8 +538,12 @@ class DWA(Node):
         4. Compute dynamic window → sample (v,w) → simulate trajectories
         5. Score trajectories → pick best → publish cmd_vel
         Falls back to recovery behavior if all trajectories are rejected."""
-        if self.goal is None:
-            return 
+        if self.stacked:
+            if self.global_path is None:
+                return
+        else:
+            if self.goal is None:
+                return
         if self.odom_msg is None or self.scan_msg is None:
             return
         
@@ -481,8 +585,23 @@ class DWA(Node):
         curr_v = self.odom_msg.twist.twist.linear.x
         curr_w = self.odom_msg.twist.twist.angular.z
 
+        if self.stacked:
+            result = self.get_moving_goal(curr_x, curr_y)
+            if result is None:
+                return
+            goal_x, goal_y, goal_theta = result
+            if not np.array_equal(self.goal, np.array([goal_x,goal_y])):
+                self.get_logger().info(f"New Goal Assigned: {goal_x, goal_y, goal_theta}")
+                self.goal = np.array([goal_x, goal_y])
 
-        dist = np.linalg.norm(self.goal - np.array([curr_x, curr_y]))
+        if self.stacked:
+            final_goal = np.array([
+                self.global_path.poses[-1].pose.position.x,
+                self.global_path.poses[-1].pose.position.y
+            ])
+            dist = np.linalg.norm(final_goal - np.array([curr_x, curr_y]))
+        else:
+            dist = np.linalg.norm(self.goal - np.array([curr_x, curr_y]))
         if dist < self.goal_tolerance:
             self.get_logger().info("Goal reached!")
             stop_cmd = TwistStamped()
@@ -492,7 +611,9 @@ class DWA(Node):
             stop_cmd.twist.angular.z = 0.0
             self.twist_publish.publish(stop_cmd)
             self.goal = None
-            return   
+            if self.stacked:
+                self.global_path = None
+            return 
 
 
         poss_v_max, poss_v_min, poss_w_max, poss_w_min = self.dynamic_window(curr_v, curr_w)
@@ -528,7 +649,6 @@ class DWA(Node):
                 p.z = 0.0
                 marker.points.append(p)
             self.debug_pub.publish(marker)
-
         scores, min_dists = self.cost_function(trajectories, final_vs, final_ws, obstacles, curr_x, curr_y)
         best_idx = np.argmax(scores)
         self.publish_trajectory_markers(trajectories, scores, best_idx)
