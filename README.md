@@ -68,8 +68,7 @@ then move the robot around to start. This will create a SLAM map that you can sa
 To save a SLAM map for use with localization:
 
 ```bash
-ros2 run nav2_map_server map_saver_cli -f "map_name" \
-    --ros-args -p map_subscribe_transient_local:=true -r __ns:=/don
+ros2 run nav2_map_server map_saver_cli -f "debugMaze"     --ros-args -p map_subscribe_transient_local:=true -r __ns:=/don -p save_map_timeout:=5000.0
 ```
 
 This creates `map_name.yaml` and `map_name.pgm` files.
