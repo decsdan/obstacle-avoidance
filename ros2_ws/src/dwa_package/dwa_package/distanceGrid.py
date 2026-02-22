@@ -378,7 +378,7 @@ def get_all_path_costs(allPaths, occupiedPoints):
     distanceGrid = distance_from_obstacles(obstacleGrid)
     allCosts = []
     for path in allPaths:
-        path = clean_points(path)
+        path = get_path_given_points(clean_points(path))
         allCosts.append(get_path_cost(path, distanceGrid))
     normalizedCosts = normalize_path_costs(allCosts)
     invertedCosts = []
