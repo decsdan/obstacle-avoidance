@@ -49,7 +49,7 @@ class DWA(Node):
 #relevant hyperparams,,,, can edit here or test diff with command line
 #stacked algo hyperprams
         self.declare_parameter('stacked', True)
-        self.declare_parameter('lookahead', 0.22)
+        self.declare_parameter('lookahead', 0.5)
 
         self.stacked = self.get_parameter('stacked').value
         self.lookahead = self.get_parameter('lookahead').value
@@ -61,7 +61,7 @@ class DWA(Node):
         self.declare_parameter('max_linear_acceleration', 0.5)
         self.declare_parameter('max_angular_acceleration', 1.5)
         self.declare_parameter('v_samples', 8) 
-        self.declare_parameter('w_samples', 15)
+        self.declare_parameter('w_samples', 20)
         self.declare_parameter('lidar_angle_offset', 1.5708) # for whatever reason, the real life turtlebot needs to be shifted 90 degrees
 
         self.max_v = self.get_parameter('max_velocity').value
@@ -88,19 +88,16 @@ class DWA(Node):
         
 # bubbles
         self.declare_parameter('critical_radius', 0.18)
-        self.declare_parameter('safe_distance', 0.60)
         self.declare_parameter('emergency_stop_distance', 0.17)
         self.declare_parameter('max_lidar_range', 8.0)
-
         self.critical_radius = self.get_parameter('critical_radius').value
-        self.safe_dist = self.get_parameter('safe_distance').value
         self.emergency_stop_dist = self.get_parameter('emergency_stop_distance').value
         self.max_lidar_range = self.get_parameter('max_lidar_range').value
         
 # cost weights
         self.declare_parameter('weights.goal', 0.4)
         self.declare_parameter('weights.heading', 0.05)
-        self.declare_parameter('weights.velocity', 0.2)
+        self.declare_parameter('weights.velocity', 0.1)
         self.declare_parameter('weights.smoothness', 0.05)
         self.declare_parameter('weights.obstacle', 0.2)
 
@@ -109,6 +106,10 @@ class DWA(Node):
         self.w_velocity = self.get_parameter('weights.velocity').value
         self.w_smoothness = self.get_parameter('weights.smoothness').value
         self.w_obstacle = self.get_parameter('weights.obstacle').value
+        self.declare_parameter('weights.dist_path', 0.15)
+        self.declare_parameter('weights.heading_path', 0.05)
+        self.w_dist_path = self.get_parameter('weights.dist_path').value
+        self.w_heading_path = self.get_parameter('weights.heading_path').value
         
 # recovery
         self.declare_parameter('recovery.linear_velocity', 0.0)
@@ -411,12 +412,14 @@ class DWA(Node):
 
     def cost_function(self, trajectories, final_vs, final_ws, obstacles, curr_x, curr_y):
         """Score each candidate trajectory with a weighted sum of:
-          - goal:       how much closer the trajectory endpoint gets to the goal
-          - heading:    alignment between final heading and direction to goal
-          - obstacle:   clearance from nearest obstacle (via distanceGrid)
-          - velocity:   preference for higher forward speed
-          - smoothness: penalty for high angular velocity
-        
+          - goal:         how much closer the trajectory endpoint gets to the goal
+          - heading:      alignment between final heading and direction to goal
+          - obstacle:     clearance from nearest obstacle (via distanceGrid)
+          - velocity:     preference for higher forward speed
+          - smoothness:   penalty for high angular velocity
+          - dist_path:    lateral deviation of endpoint from global path (stacked only)
+          - heading_path: alignment of final heading with path tangent (stacked only)
+
         Trajectories whose closest obstacle is within critical_radius get
         hard-rejected (score = -inf)."""
         
@@ -424,9 +427,57 @@ class DWA(Node):
         curr_dist = np.linalg.norm(self.goal - np.array([curr_x, curr_y]))
         goal_dists = np.linalg.norm(self.goal - final_pos, axis=1)
         
-        #TODO add Dist_from_path score (normalized)
+        if self.stacked and self.global_path is not None and len(self.global_path.poses) >= 2:
 
-        #TODO add path_heading score (normalized)
+            #put ROS path into numpy array of length N, with (x,y) for each waypoint as values
+            path_pts = []
+            for p in self.global_path.poses:
+                path_pts.append([p.pose.position.x, p.pose.position.y])
+            path_pts = np.array(path_pts) #[W0, W1, W2, ... WN]
+            #for creating the vectors between each waypoint
+            A = path_pts[:-1] #[W0, W1, W2, ... WN-1]
+            B = path_pts[1:]  #[W1, W2, W3, ... WN]
+            AB = B - A #a set of vector values [dx,dy] for all paths from [W0 to W1], [W1 to W2].... [WN-1 to WN]
+
+            #vector magnitude (handles 0 if two waypoints are the same)
+            AB_len_sq = np.maximum(np.sum(AB ** 2, axis=1), 1e-10)
+
+            #holds the vector from every waypoint start to every trajectory endpoint (such that we can compare the distance from each trajectory endpoint to every waypoint vector)
+            #so PA[i,j] is the vector from waypoint A[j] to trajectory endpoint i, all pairs simultaneously
+            PA = final_pos[:, None, :] - A[None, :, :]
+            
+            #for every Endpoint in trajectories (has them all set as a vector from A[n] to every P) looks at the vector between waypoint A[i] and B[i], 
+            #and determines how far along that vector the endpoint is (clipped between 0 and 1 so if the endpoint doesnt lie along that vector, its just a 0 or 1 depending on what side its on)
+            t = np.clip(np.sum(PA * AB[None, :, :], axis=2) / AB_len_sq[None, :],0.0, 1.0)
+
+            #closest point on each segment to each trajectory endpoint: A + t*(B-A)
+            #t=0 gives A, t=1 gives B, values in between give points along the segment
+            #so this very specifically gets, for each endpoint, what the exact point along the path(not just waypoints, but every vector between each waypoint) is the closest, and the specific value as well
+            closest = A[None, :, :] + t[:, :, None] * AB[None, :, :]
+
+            #basic distance calc, done for every permutation of waypoint->endpoint and its respective closest val
+            seg_dists = np.linalg.norm(final_pos[:, None, :] - closest, axis=2)
+
+            #finds the minimum dist for each specific trajectory endpoint, regardless of waypoint (via the collapsing axis), then normalizes it.
+            min_path_dists = np.min(seg_dists, axis=1)
+            #max dev is what distance from the path will give you a 0, anything over 1.0 meters from the path will give you a 0
+            max_dev = 1.0
+            dp_score = np.clip(1.0 - (min_path_dists / max_dev), 0.0, 1.0)
+
+            #heading_to_path: now that seg_dists can give what point is the closest to each endpoint, heading can be used
+            #compute that segment's tangent angle, then score how closely the trajectory's final
+            #heading aligns with that tangent (1.0 = perfectly aligned, 0.0 = opposite direction)
+            nearest_seg_idx = np.argmin(seg_dists, axis=1)
+            seg_tangents = np.arctan2(AB[:, 1], AB[:, 0])
+            path_theta = seg_tangents[nearest_seg_idx]
+            final_theta = trajectories[:, -1, 2]
+
+            heading_err = np.abs(np.arctan2(np.sin(path_theta - final_theta),np.cos(path_theta - final_theta)))
+            hp_score = 1.0 - (heading_err / np.pi) # normalize
+        else:
+            # not in stacked mode or no path yet — neutral score of 1.0 so these terms have no effect
+            dp_score = np.ones(len(final_vs))
+            hp_score = np.ones(len(final_vs))
 
 
         #goal score
@@ -481,7 +532,9 @@ class DWA(Node):
             self.w_heading * h_score +
             self.w_velocity * v_score +
             self.w_smoothness * w_score +
-            self.w_obstacle * o_score
+            self.w_obstacle * o_score +
+            self.w_dist_path * dp_score +
+            self.w_heading_path * hp_score
         )
         
         #hard reject if too close to objects

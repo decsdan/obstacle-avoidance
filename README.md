@@ -153,10 +153,10 @@ cd ~/obstacle-avoidance-comps/ros2_ws
 source install/setup.bash
 
 # For A* navigation (MAP_YAML is required):
-MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav
+MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav --ros-args -p namespace:=/don
 
 # Or for DWA navigation:
-ros2 run dwa_package dwa_node
+ros2 run dwa_package dwa_node --ros-args -p namespace:=/don
 ```
 
 ### Running Repeated Experiments
@@ -202,6 +202,55 @@ Once all terminals are running, you can run multiple experiments without restart
 - `/don/debug_obstacles` (Marker) - Detected obstacles
 - `/don/dwa/trajectories` (Marker) - Candidate paths
 - `/don/dwa/best_trajectory` (Marker) - Selected path
+
+---
+
+## Running Stacked A* + DWA
+
+This workflow runs A* as a global planner and DWA as a local controller — A* computes the global path and publishes it; DWA subscribes to that path and executes it while handling real-time obstacle avoidance. This mirrors the Nav2 planner/controller split.
+
+**Terminal 1 - Localization (AMCL):** *(same as above)*
+```bash
+ros2 launch turtlebot4_navigation localization.launch.py \
+    namespace:=/don \
+    map:=/path/to/your/map.yaml \
+    params_file:=/path/to/obstacle-avoidance-comps/ros2_ws/amcl_params.yaml
+```
+
+**Terminal 2 - RViz:**
+```bash
+source /opt/ros/jazzy/setup.bash
+source /etc/turtlebot4_discovery/setup.bash
+
+ros2 launch turtlebot4_viz view_robot.launch.py namespace:=/don
+```
+
+**Terminal 3 - A* (Global Planner, stacked):**
+```bash
+source /opt/ros/jazzy/setup.bash
+source /etc/turtlebot4_discovery/setup.bash
+cd ~/obstacle-avoidance-comps/ros2_ws
+source install/setup.bash
+
+MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav --ros-args -p namespace:=/don -p stacked:=true
+```
+
+**Terminal 4 - DWA (Local Controller, stacked):**
+```bash
+source /opt/ros/jazzy/setup.bash
+source /etc/turtlebot4_discovery/setup.bash
+cd ~/obstacle-avoidance-comps/ros2_ws
+source install/setup.bash
+
+ros2 run dwa_package dwa_node --ros-args -p namespace:=/don -p stacked:=true
+```
+
+`stacked:=true` on A* puts it in planner-only mode: it publishes the global path to `/{namespace}/a_star/plan` but does not drive the robot. `stacked:=true` on DWA tells it to subscribe to that path and control the robot, avoiding obstacles in real time.
+
+**Usage:**
+1. Set initial pose in RViz with **"2D Pose Estimate"**
+2. Send a goal with **"2D Goal Pose"** — A* receives the goal, plans the path, and publishes it
+3. DWA reads the path and controls the robot, avoiding obstacles in real time
 
 ---
 
@@ -288,13 +337,13 @@ colcon build --packages-select a_star
 source install/local_setup.bash
 
 # Run A* in standalone mode (plan + drive)
-MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav
+MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav --ros-args -p namespace:=/don
 
 # Run A* in planner-only mode (for stacking with DWA)
-STANDALONE=false MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav
+MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav --ros-args -p namespace:=/don -p stacked:=true
 
-# With custom safety parameters
-MAP_YAML=/path/to/your/map.yaml ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.05 ros2 run a_star a_star_nav
+# With custom safety parameters (defaults: ROBOT_RADIUS=0.25, SAFETY_CLEARANCE=0.05)
+MAP_YAML=/path/to/your/map.yaml ROBOT_RADIUS=0.25 SAFETY_CLEARANCE=0.05 ros2 run a_star a_star_nav --ros-args -p namespace:=/don
 
 # Run interactive visualizer
 ros2 run a_star visualizer
@@ -437,18 +486,20 @@ Then in RViz:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `weights.goal` | 0.5 | Reward for progress toward goal |
+| `weights.goal` | 0.4 | Reward for progress toward goal |
 | `weights.heading` | 0.05 | Reward for pointing at goal |
-| `weights.velocity` | 0.2 | Reward for higher speeds |
+| `weights.velocity` | 0.1 | Reward for higher speeds |
 | `weights.smoothness` | 0.05 | Reward for less angular velocity |
-| `weights.obstacle` | 0.1 | Incentivizes being further from objects |
+| `weights.obstacle` | 0.2 | Incentivizes being further from objects |
+| `weights.dist_path` | 0.15 | Penalizes lateral deviation from global path (stacked mode only) |
+| `weights.heading_path` | 0.05 | Penalizes misalignment with path tangent direction (stacked mode only) |
 
 **Safety Distances** (meters):
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `critical_radius` | 0.18 | Hard rejection boundary |
-| `safe_distance` | 0.60 | Distance for max obstacle score |
+| `safe_distance` | 0.60 | Reserved; currently unused |
 | `emergency_stop_distance` | 0.17 | Triggers immediate stop |
 
 **Example:** Run with custom weights:

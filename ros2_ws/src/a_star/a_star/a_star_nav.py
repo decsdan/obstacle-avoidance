@@ -22,10 +22,10 @@ Subscribes to:
     - /{namespace}/goal_pose (PoseStamped): Goal from RViz 2D Goal Pose
 
 Usage:
-    ros2 run a_star a_star_nav
+    MAP_YAML=/path/to/map.yaml ros2 run a_star a_star_nav --ros-args -p namespace:=/don
 
     With custom parameters:
-    ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.05 ros2 run a_star a_star_nav
+    MAP_YAML=/path/to/map.yaml ROBOT_RADIUS=0.25 SAFETY_CLEARANCE=0.05 ros2 run a_star a_star_nav --ros-args -p namespace:=/don
 
 Architecture:
     - Hybrid obstacle checking near start position for escaping tight spaces
@@ -59,7 +59,7 @@ class NavigatorConstants:
 
     # Robot Physical Parameters (meters)
     ROBOT_RADIUS = 0.25      # TurtleBot4 radius
-    SAFETY_CLEARANCE = 0.00     # Additional safety margin
+    SAFETY_CLEARANCE = 0.05     # Additional safety margin
 
     # Control Parameters
     LINEAR_SPEED = 0.2           # Forward speed (m/s)
@@ -74,12 +74,8 @@ class NavigatorConstants:
     MAX_PATH_WAYPOINTS = 20      # Maximum waypoints after simplification
     TIGHT_SPACE_RADIUS = 3       # Grid cells to use original grid near start
 
-    # Robot namespace (e.g., '/don' for the physical robot)
-    NAMESPACE = '/mikey'
-
-    # Publishing/Subscribing Paths (derived from NAMESPACE)
-    CMD_VEL = NAMESPACE + '/cmd_vel'
-    ODOMETRY = NAMESPACE + '/odom'
+    # Default robot namespace — overridden at runtime by 'namespace' ROS param
+    DEFAULT_NAMESPACE = '/don'
 
 
 
@@ -105,14 +101,27 @@ class AStarNavigator(Node):
             map_yaml: Path to map YAML file (default from MAP_YAML env var or prompts user)
             map_pgm: Path to map PGM file (default from MAP_PGM env var or derived from YAML)
         """
+        super().__init__('astar_navigator')
+
+        # ====================================================================
+        # INITIALIZATION - Namespace (ROS param, must come first)
+        # ====================================================================
+
+        # Robot namespace: set via --ros-args -p namespace:=/don
+        # Controls all topic prefixes and TF remapping.
+        self.declare_parameter('namespace', NavigatorConstants.DEFAULT_NAMESPACE)
+        self.ns = self.get_parameter('namespace').value
+
         # Remap /tf and /tf_static to the robot's namespaced TF topics
-        # so that TransformListener receives frames from the namespaced robot
-        ns = NavigatorConstants.NAMESPACE
-        super().__init__('astar_navigator', cli_args=[
-            '--ros-args',
-            '-r', f'/tf:={ns}/tf',
-            '-r', f'/tf_static:={ns}/tf_static',
-        ])
+        # so that TransformListener receives frames from the namespaced robot.
+        # This mirrors what cli_args remapping would do, but works with the param.
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(
+            self.tf_buffer, self,
+            qos=10,
+            tf_topic=f'{self.ns}/tf',
+            tf_static_topic=f'{self.ns}/tf_static',
+        )
 
         # ====================================================================
         # INITIALIZATION - Robot Parameters
@@ -132,18 +141,19 @@ class AStarNavigator(Node):
         # In standalone mode, A* plans AND drives via cmd_vel (original behavior).
         # In planner-only mode, A* only publishes nav_msgs/Path for a local
         # planner (e.g. DWA) to follow — mirroring the Nav2 planner/controller split.
-        self.standalone = os.getenv('STANDALONE', 'true').lower() in ('true', '1', 'yes')
+        self.declare_parameter('stacked', False)
+        self.standalone = not self.get_parameter('stacked').value
 
         # Global plan publisher (nav_msgs/Path) — always active so the path
         # can be visualized or consumed by a downstream local planner.
         self.plan_pub = self.create_publisher(
             Path,
-            NavigatorConstants.NAMESPACE + '/a_star/plan', #/don/a_star/plan
+            self.ns + '/a_star/plan',
             10
         )
 
         # Command velocity publisher (only used in standalone mode)
-        self.cmd_vel_pub = self.create_publisher(TwistStamped, NavigatorConstants.CMD_VEL, 10)
+        self.cmd_vel_pub = self.create_publisher(TwistStamped, self.ns + '/cmd_vel', 10)
 
         # Odometry subscriber (best-effort QoS to match publisher)
         qos_profile = QoSProfile(
@@ -153,7 +163,7 @@ class AStarNavigator(Node):
         )
         self.odom_sub = self.create_subscription(
             Odometry,
-            NavigatorConstants.ODOMETRY,
+            self.ns + '/odom',
             self.odom_callback,
             qos_profile
         )
@@ -161,14 +171,10 @@ class AStarNavigator(Node):
         # Goal pose subscriber (for RViz 2D Goal Pose)
         self.goal_sub = self.create_subscription(
             PoseStamped,
-            NavigatorConstants.NAMESPACE + '/goal_pose',
+            self.ns + '/goal_pose',
             self.goal_callback,
             10
         )
-
-        # TF2 for map frame localization
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # ====================================================================
         # INITIALIZATION - Frame tracking
@@ -255,7 +261,8 @@ class AStarNavigator(Node):
         self.get_logger().info(f'Robot radius: {self.robot_radius}m, Safety clearance: {self.safety_clearance}m')
         self.get_logger().info(f'Total obstacle inflation: {self.robot_radius + self.safety_clearance}m')
         self.get_logger().info(f'Planning frame: {self.active_frame}')
-        self.get_logger().info(f'Global plan topic: {NavigatorConstants.NAMESPACE}/a_star/plan')
+        self.get_logger().info(f'Namespace: {self.ns}')
+        self.get_logger().info(f'Global plan topic: {self.ns}/a_star/plan')
 
     # ========================================================================
     # MAP LOADING AND PROCESSING
@@ -474,21 +481,26 @@ class AStarNavigator(Node):
         path_msg.header.stamp = self.get_clock().now().to_msg()
         path_msg.header.frame_id = 'map'
 
-        for (wx, wy) in self.path:
+        yaw = 0.0
+        for i, (wx, wy) in enumerate(self.path):
             pose = PoseStamped()
             pose.header = path_msg.header
             pose.pose.position.x = float(wx)
             pose.pose.position.y = float(wy)
             pose.pose.position.z = 0.0
-            # Orientation: point toward next waypoint (identity for last)
-            pose.pose.orientation.w = 1.0
+            # Orientation: tangent toward next waypoint; last pose reuses prior tangent
+            if i + 1 < len(self.path):
+                nx, ny = self.path[i + 1]
+                yaw = math.atan2(ny - wy, nx - wx)
+            pose.pose.orientation.z = math.sin(yaw / 2.0)
+            pose.pose.orientation.w = math.cos(yaw / 2.0)
             path_msg.poses.append(pose)
 
         self.latest_plan_msg = path_msg
         self.plan_pub.publish(path_msg)
         self.get_logger().info(
             f'Published global plan ({len(path_msg.poses)} poses) on '
-            f'{NavigatorConstants.NAMESPACE}/a_star/plan'
+            f'{self.ns}/a_star/plan'
         )
 
     def republish_plan(self):
@@ -912,12 +924,15 @@ def main(args=None):
     Initializes ROS2, creates the navigator node, and spins waiting for goals.
     Goals are received via the goal_pose topic (use RViz 2D Goal Pose tool).
 
-    Configuration via environment variables:
-        ROBOT_RADIUS: Robot radius in meters (default 0.22)
-        SAFETY_CLEARANCE: Safety margin in meters (default 0.05)
-        MAP_YAML: Path to map YAML file (required)
-        MAP_PGM: Path to map PGM file (derived from MAP_YAML if not set)
-        STANDALONE: 'true' = plan + drive (default), 'false' = publish path only
+    Configuration:
+        ROS params (--ros-args -p key:=value):
+            namespace:    Robot namespace (default '/don')
+            stacked:      Planner-only mode, no cmd_vel (default False)
+        Environment variables:
+            ROBOT_RADIUS:     Robot radius in meters (default 0.25)
+            SAFETY_CLEARANCE: Safety margin in meters (default 0.05)
+            MAP_YAML:         Path to map YAML file (required)
+            MAP_PGM:          Path to map PGM file (derived from MAP_YAML if not set)
     """
     # Get parameters from environment or use defaults
     robot_radius = float(os.getenv('ROBOT_RADIUS', str(NavigatorConstants.ROBOT_RADIUS)))
@@ -940,7 +955,7 @@ def main(args=None):
     print("\n" + "="*60)
     print("TurtleBot4 A* Navigator (with AMCL/TF2 Localization)")
     print("="*60)
-    print(f"\nMode: {mode_label}  (set via STANDALONE env var)")
+    print(f"\nMode: {mode_label}  (set via --ros-args -p stacked:=true)")
     print(f"\nRobot Configuration:")
     print(f"  Robot radius: {robot_radius}m (set via ROBOT_RADIUS env var)")
     print(f"  Safety clearance: {safety_clearance}m (set via SAFETY_CLEARANCE env var)")
@@ -951,7 +966,7 @@ def main(args=None):
         print("  2. Click '2D Goal Pose' and click on the map to send goals")
         print("  3. Robot will navigate to goal, then wait for next goal")
     else:
-        print(f"\nPublishing global plan on: {NavigatorConstants.NAMESPACE}/a_star/plan")
+        print(f"\nPublishing global plan on: {navigator.ns}/a_star/plan")
         print("  1. Set initial pose using '2D Pose Estimate' in RViz")
         print("  2. Click '2D Goal Pose' to send goals")
         print("  3. A* publishes the path — start your local planner (e.g. DWA)")

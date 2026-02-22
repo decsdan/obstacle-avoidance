@@ -357,7 +357,7 @@ def get_path_cost(path, distanceGrid):
         if distanceGrid[y, x] <= 0:
             cost = math.inf
         else:
-            cost = math.exp(-0.3 * distanceGrid[y, x])
+            cost = math.exp(-0.5 * distanceGrid[y, x])
         totalCost += cost
     return totalCost
 
@@ -371,8 +371,13 @@ def normalize_path_costs(allCosts):
     minVal = min(finiteCosts)
     maxVal = max(finiteCosts)
 
+    #prevent divide by 0 but also prevent scoring issues and robot freezing
+    cost_range = maxVal - minVal
+    if cost_range == 0:
+        return [0.0 if math.isfinite(cost) else cost for cost in allCosts]
+
     normalizedCosts = [
-        (cost - minVal) / (maxVal - minVal+1) if math.isfinite(cost) else cost
+        (cost - minVal) / cost_range if math.isfinite(cost) else cost
         for cost in allCosts
     ]
     return normalizedCosts
@@ -401,7 +406,7 @@ def get_all_path_costs_with_grid(allPaths, prebuilt_dist_grid, curr_x=0.0, curr_
     gy_c = np.clip(gy, 0, 160)
     dist_vals = prebuilt_dist_grid[gy_c, gx_c].astype(float)
     # OOB points dropped (0 cost), obstacle points inf, valid points exp decay
-    point_costs = np.where(in_bounds, np.where(dist_vals > 0, np.exp(-0.3 * dist_vals), np.inf), 0.0)
+    point_costs = np.where(in_bounds, np.where(dist_vals > 0, np.exp(-0.5 * dist_vals), np.inf), 0.0)
     # fully OOB paths or any obstacle-crossing path -> inf
     all_oob = ~in_bounds.any(axis=1)
     has_inf = np.isinf(point_costs).any(axis=1)
