@@ -147,7 +147,7 @@ class DWA(Node):
         self.active_frame = 'odom'
         
 #subs
-        self.declare_parameter('namespace', '/mikey')
+        self.declare_parameter('namespace', '/don')
         self.namespace = self.get_parameter('namespace').value
         if(self.stacked == True):
             self.global_path_sub = self.create_subscription(Path, f"{self.namespace}/a_star/plan", self.global_path_callback, 10)

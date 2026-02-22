@@ -34,6 +34,7 @@ Architecture:
     - Path simplification to reduce waypoint count
 """
 
+import sys
 import rclpy
 import rclpy.time
 import rclpy.duration
@@ -101,27 +102,30 @@ class AStarNavigator(Node):
             map_yaml: Path to map YAML file (default from MAP_YAML env var or prompts user)
             map_pgm: Path to map PGM file (default from MAP_PGM env var or derived from YAML)
         """
-        super().__init__('astar_navigator')
+        # Read namespace early from sys.argv so TF remapping can be set at node
+        # init time via cli_args. The param is also declared after super().__init__()
+        # so it shows up in `ros2 param list` and can be introspected normally.
+        _ns = NavigatorConstants.DEFAULT_NAMESPACE
+        for i, arg in enumerate(sys.argv):
+            if arg.startswith('namespace:='):
+                _ns = arg.split(':=', 1)[1]
+            elif arg == '-p' and i + 1 < len(sys.argv) and sys.argv[i+1].startswith('namespace:='):
+                _ns = sys.argv[i+1].split(':=', 1)[1]
+
+        super().__init__('astar_navigator', cli_args=[
+            '--ros-args',
+            '-r', f'/tf:={_ns}/tf',
+            '-r', f'/tf_static:={_ns}/tf_static',
+        ])
 
         # ====================================================================
-        # INITIALIZATION - Namespace (ROS param, must come first)
+        # INITIALIZATION - Namespace (ROS param)
         # ====================================================================
 
-        # Robot namespace: set via --ros-args -p namespace:=/don
-        # Controls all topic prefixes and TF remapping.
+        # Declare so the param is visible via `ros2 param list`.
+        # The value was already parsed from sys.argv above for TF remapping.
         self.declare_parameter('namespace', NavigatorConstants.DEFAULT_NAMESPACE)
         self.ns = self.get_parameter('namespace').value
-
-        # Remap /tf and /tf_static to the robot's namespaced TF topics
-        # so that TransformListener receives frames from the namespaced robot.
-        # This mirrors what cli_args remapping would do, but works with the param.
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(
-            self.tf_buffer, self,
-            qos=10,
-            tf_topic=f'{self.ns}/tf',
-            tf_static_topic=f'{self.ns}/tf_static',
-        )
 
         # ====================================================================
         # INITIALIZATION - Robot Parameters
@@ -175,6 +179,10 @@ class AStarNavigator(Node):
             self.goal_callback,
             10
         )
+
+        # TF2 for map frame localization (remapped to namespaced topics via cli_args above)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # ====================================================================
         # INITIALIZATION - Frame tracking

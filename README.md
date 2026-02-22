@@ -499,7 +499,6 @@ Then in RViz:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `critical_radius` | 0.18 | Hard rejection boundary |
-| `safe_distance` | 0.60 | Reserved; currently unused |
 | `emergency_stop_distance` | 0.17 | Triggers immediate stop |
 
 **Example:** Run with custom weights:
