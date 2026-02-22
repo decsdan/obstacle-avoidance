@@ -96,18 +96,18 @@ class DWA(Node):
         
 # cost weights
         self.declare_parameter('weights.goal', 0.4)
-        self.declare_parameter('weights.heading', 0.05)
+        self.declare_parameter('weights.heading', 0.03)
         self.declare_parameter('weights.velocity', 0.1)
-        self.declare_parameter('weights.smoothness', 0.05)
+        self.declare_parameter('weights.smoothness', 0.00)
         self.declare_parameter('weights.obstacle', 0.2)
+        self.declare_parameter('weights.dist_path', 0.2)
+        self.declare_parameter('weights.heading_path', 0.03)
 
         self.w_goal = self.get_parameter('weights.goal').value
         self.w_heading = self.get_parameter('weights.heading').value
         self.w_velocity = self.get_parameter('weights.velocity').value
         self.w_smoothness = self.get_parameter('weights.smoothness').value
         self.w_obstacle = self.get_parameter('weights.obstacle').value
-        self.declare_parameter('weights.dist_path', 0.15)
-        self.declare_parameter('weights.heading_path', 0.05)
         self.w_dist_path = self.get_parameter('weights.dist_path').value
         self.w_heading_path = self.get_parameter('weights.heading_path').value
         
