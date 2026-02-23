@@ -48,8 +48,8 @@ class DWA(Node):
 
 #relevant hyperparams,,,, can edit here or test diff with command line
 #stacked algo hyperprams
-        self.declare_parameter('stacked', True)
-        self.declare_parameter('lookahead', 0.5)
+        self.declare_parameter('stacked', False)
+        self.declare_parameter('lookahead', 1.0)
 
         self.stacked = self.get_parameter('stacked').value
         self.lookahead = self.get_parameter('lookahead').value
@@ -95,13 +95,13 @@ class DWA(Node):
         self.max_lidar_range = self.get_parameter('max_lidar_range').value
         
 # cost weights
-        self.declare_parameter('weights.goal', 0.4)
-        self.declare_parameter('weights.heading', 0.03)
-        self.declare_parameter('weights.velocity', 0.1)
+        self.declare_parameter('weights.goal', 0.5)
+        self.declare_parameter('weights.heading', 0.05)
+        self.declare_parameter('weights.velocity', 0.2)
         self.declare_parameter('weights.smoothness', 0.00)
         self.declare_parameter('weights.obstacle', 0.2)
-        self.declare_parameter('weights.dist_path', 0.2)
-        self.declare_parameter('weights.heading_path', 0.03)
+        self.declare_parameter('weights.dist_path', 0.01)
+        self.declare_parameter('weights.heading_path', 0.01)
 
         self.w_goal = self.get_parameter('weights.goal').value
         self.w_heading = self.get_parameter('weights.heading').value
@@ -125,7 +125,7 @@ class DWA(Node):
         self.visualize_trajectories = self.get_parameter('visualize_trajectories').value
         self.traj_downsample = self.get_parameter('trajectory_visualization_downsample').value
         
-        self.declare_parameter('goal_tolerance', 0.3)
+        self.declare_parameter('goal_tolerance', 0.4)
         self.goal_tolerance = self.get_parameter('goal_tolerance').value
 
         self.timer = self.create_timer(self.dt, self.nav_loop)
@@ -141,6 +141,12 @@ class DWA(Node):
         self._cached_grid_x = None
         self._cached_grid_y = None
         self._cached_obs_count = 0
+        self.start_time = None
+        self.total_distance = 0.0
+        self.last_position = None
+
+        self.start_time = self.get_clock().now()
+        self.total_distance = 0.0
 
         # Track which frame is actively used for pose/obstacles
         # Updated each nav_loop tick based on TF2 availability
@@ -426,6 +432,16 @@ class DWA(Node):
         final_pos = trajectories[:, -1, :2]
         curr_dist = np.linalg.norm(self.goal - np.array([curr_x, curr_y]))
         goal_dists = np.linalg.norm(self.goal - final_pos, axis=1)
+
+         #updating the window based on distance to goal, discrete and changes only @ a distance of 1 meters
+        if not self.stacked:
+            if curr_dist < 1:
+                self.max_v = curr_dist / 1 + 0.1
+                self.w_heading = 0.25
+                self.w_goal = 0.7
+                self.w_obstacle = 0.05
+            
+        
         
         if self.stacked and self.global_path is not None and len(self.global_path.poses) >= 2:
 
@@ -625,6 +641,8 @@ class DWA(Node):
                 return
             
 
+
+        
         # get pose (try map frame, else odom)
         map_pose = self.get_robot_pose_map_frame()
         if map_pose is not None:
@@ -637,6 +655,20 @@ class DWA(Node):
             self.active_frame = 'odom'
         curr_v = self.odom_msg.twist.twist.linear.x
         curr_w = self.odom_msg.twist.twist.angular.z
+
+        if self.last_position is None:
+            dx = 0
+            dy = 0
+            self.total_distance = 0.0
+            self.last_position = (curr_x, curr_y)
+
+        if self.last_position is not None:
+            dx = curr_x - self.last_position[0]
+            dy = curr_y - self.last_position[1]
+            distance_increment = math.sqrt(dx**2 + dy**2)
+            self.total_distance += distance_increment
+            self.last_position = (curr_x, curr_y)
+
 
         if self.stacked:
             result = self.get_moving_goal(curr_x, curr_y)
@@ -664,6 +696,14 @@ class DWA(Node):
             stop_cmd.twist.angular.z = 0.0
             self.twist_publish.publish(stop_cmd)
             self.goal = None
+
+
+            if self.start_time is not None:
+                elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+                self.get_logger().info(f'Total distance traveled: {self.total_distance:.2f} meters')
+                self.get_logger().info(f'Total time elapsed: {elapsed_time:.2f} seconds')
+
+
             if self.stacked:
                 self.global_path = None
             return 
