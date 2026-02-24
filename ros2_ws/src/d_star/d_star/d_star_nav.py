@@ -1705,7 +1705,13 @@ class DStarNavigator(Node):
         grid_msg.header.frame_id = 'map'
 
         # Set map metadata
-        grid_msg.info.resolution = self.resolution
+        # Use local costmap resolution if available, so published changes match
+        # the resolution of the source data (local costmap at 0.6m vs SLAM at 0.5m)
+        grid_msg.info.resolution = (
+            self.local_costmap_info.resolution
+            if self.local_costmap_info is not None
+            else self.resolution
+        )
         grid_msg.info.width = self.grid_dynamic.shape[1]
         grid_msg.info.height = self.grid_dynamic.shape[0]
         grid_msg.info.origin.position.x = self.origin[0]
