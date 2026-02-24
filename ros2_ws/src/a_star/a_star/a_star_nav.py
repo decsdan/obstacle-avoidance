@@ -70,14 +70,14 @@ class NavigatorConstants:
     TIGHT_SPACE_RADIUS = 3       # Grid cells to use original grid near start
 
     # Publishing/Subscribing Paths
-    NAMESPACE = '/mikey'
+    NAMESPACE = '/leo'
     CMD_VEL = f'{NAMESPACE}/cmd_vel'
     ODOMETRY = f'{NAMESPACE}/odom'
     PATH = f'{NAMESPACE}/a_star_path'
 
     # Pgm and yaml paths
-    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/static_test_map2.yaml'
-    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/static_test_map2.pgm'
+    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/complex_add_test.yaml'
+    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/complex_add_test.pgm'
 
 
 

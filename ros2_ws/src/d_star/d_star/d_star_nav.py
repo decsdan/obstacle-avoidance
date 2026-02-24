@@ -55,7 +55,7 @@ class PlannerConstants:
     """
 
     # -------- Robot Physical Parameters (meters) --------
-    NAMESPACE = '/mikey'          # Name of the physical robot
+    NAMESPACE = '/don'          # Name of the physical robot
     ROBOT_RADIUS = 0.22           # Physical radius of the robot body
     SAFETY_CLEARANCE = 0.05      # Extra safety buffer around obstacles
                                   # Total inflation = ROBOT_RADIUS + SAFETY_CLEARANCE
