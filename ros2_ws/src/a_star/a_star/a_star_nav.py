@@ -73,7 +73,7 @@ class NavigatorConstants:
 
     # Path Planning
     MAX_PATH_WAYPOINTS = 20      # Maximum waypoints after simplification
-    TIGHT_SPACE_RADIUS = 3       # Grid cells to use original grid near start
+    TIGHT_SPACE_RADIUS = 5       # Grid cells to use original grid near start
 
     # Default robot namespace — overridden at runtime by 'namespace' ROS param
     DEFAULT_NAMESPACE = '/don'
@@ -591,12 +591,13 @@ class AStarNavigator(Node):
         if not path_grid:
             return []
 
-        # Convert to world coordinates and simplify
+        #use 50 waypoints in stacked, otherwise use default for A*
         path_world = [self.grid_to_world(gx, gy) for gx, gy in path_grid]
-        #only simplify the path if actually navigating along the path it created, otherwise we use the full path.
         if not self.standalone:
-            MAX_PATH_WAYPOINTS = 50
-        simplified_path = self.simplify_path(path_world)
+            max_wps = 50
+            simplified_path = self.simplify_path(path_world, max_points=max_wps)
+        else:
+            simplified_path = self.simplify_path(path_world)
         return simplified_path
 
     def astar(self, start, goal):

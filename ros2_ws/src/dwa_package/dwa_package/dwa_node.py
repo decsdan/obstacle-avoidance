@@ -48,8 +48,8 @@ class DWA(Node):
 
 #relevant hyperparams,,,, can edit here or test diff with command line
 #stacked algo hyperprams
-        self.declare_parameter('stacked', False)
-        self.declare_parameter('lookahead', 1.0)
+        self.declare_parameter('stacked', True)
+        self.declare_parameter('lookahead', 0.85)
 
         self.stacked = self.get_parameter('stacked').value
         self.lookahead = self.get_parameter('lookahead').value
@@ -59,8 +59,8 @@ class DWA(Node):
         self.declare_parameter('max_angular_velocity', 1.8)
         self.declare_parameter('min_angular_velocity', -1.8)
         self.declare_parameter('max_linear_acceleration', 0.5)
-        self.declare_parameter('max_angular_acceleration', 1.5)
-        self.declare_parameter('v_samples', 8) 
+        self.declare_parameter('max_angular_acceleration', 2.0)
+        self.declare_parameter('v_samples', 20)
         self.declare_parameter('w_samples', 20)
         self.declare_parameter('lidar_angle_offset', 1.5708) # for whatever reason, the real life turtlebot needs to be shifted 90 degrees
 
@@ -78,16 +78,18 @@ class DWA(Node):
 # planning
         self.declare_parameter('dt', 0.1)
         self.declare_parameter('prediction_steps', 25)
-        self.declare_parameter('window_steps', 8)
+        self.declare_parameter('window_steps', 5)
         self.declare_parameter('LIDAR_downsample', 1)
+        self.declare_parameter('max_path_deviation', 1.0)
 
         self.dt = self.get_parameter('dt').value
         self.steps = self.get_parameter('prediction_steps').value
         self.window_steps = self.get_parameter('window_steps').value
         self.LIDAR_downsample = self.get_parameter('LIDAR_downsample').value
+        self.max_path_deviation = self.get_parameter('max_path_deviation').value
         
 # bubbles
-        self.declare_parameter('critical_radius', 0.18)
+        self.declare_parameter('critical_radius', 0.20)
         self.declare_parameter('emergency_stop_distance', 0.17)
         self.declare_parameter('max_lidar_range', 8.0)
         self.critical_radius = self.get_parameter('critical_radius').value
@@ -95,16 +97,16 @@ class DWA(Node):
         self.max_lidar_range = self.get_parameter('max_lidar_range').value
         
 # cost weights
-        self.declare_parameter('weights.goal', 0.5)
-        self.declare_parameter('weights.heading', 0.05)
-        self.declare_parameter('weights.velocity', 0.2)
-        self.declare_parameter('weights.smoothness', 0.00)
-        self.declare_parameter('weights.obstacle', 0.2)
-        self.declare_parameter('weights.dist_path', 0.01)
-        self.declare_parameter('weights.heading_path', 0.01)
+        self.declare_parameter('weights.goal', 0.35)
+        self.declare_parameter('weights.heading', 0.10)
+        self.declare_parameter('weights.velocity', 0.05)
+        self.declare_parameter('weights.smoothness', 0.05)
+        self.declare_parameter('weights.obstacle', 0.40)
+        self.declare_parameter('weights.dist_path', 0.10)
+        self.declare_parameter('weights.heading_path', 0.05)
 
         self.w_goal = self.get_parameter('weights.goal').value
-        self.w_heading = self.get_parameter('weights.heading').value
+        self.w_heading = 0.0 if self.stacked else self.get_parameter('weights.heading').value #only use heading if DWA is not stacked
         self.w_velocity = self.get_parameter('weights.velocity').value
         self.w_smoothness = self.get_parameter('weights.smoothness').value
         self.w_obstacle = self.get_parameter('weights.obstacle').value
@@ -114,6 +116,7 @@ class DWA(Node):
 # recovery
         self.declare_parameter('recovery.linear_velocity', 0.0)
         self.declare_parameter('recovery.angular_velocity', 0.5)
+
 
         self.recovery_v = self.get_parameter('recovery.linear_velocity').value
         self.recovery_w = self.get_parameter('recovery.angular_velocity').value
@@ -125,7 +128,7 @@ class DWA(Node):
         self.visualize_trajectories = self.get_parameter('visualize_trajectories').value
         self.traj_downsample = self.get_parameter('trajectory_visualization_downsample').value
         
-        self.declare_parameter('goal_tolerance', 0.4)
+        self.declare_parameter('goal_tolerance', 0.2)
         self.goal_tolerance = self.get_parameter('goal_tolerance').value
 
         self.timer = self.create_timer(self.dt, self.nav_loop)
@@ -176,8 +179,9 @@ class DWA(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self) 
         self.sync = ApproximateTimeSynchronizer([self.odom_sub, self.scan_sub], 10, 0.1)
         self.sync.registerCallback(self.synchronized_callback)
-    
-    #TODO this can be solved by an action server such that it doesnt need to be done regularly
+        
+        
+#callbacks    
     def global_path_callback(self, msg):
         if self.global_path is None or self.global_path.poses != msg.poses:
             self.global_path = msg
@@ -194,15 +198,20 @@ class DWA(Node):
         self.scan_msg = scan_msg
         self.odom_msg = odom_msg
 
+
+
+    
+#helper funcs
+
+    #creates an array the same size as the number of items in the path,
+    # where each value at each index is the total displacement from one waypoint to the next (used in get moving goal)
     def get_path_displacement(self):
-        #creates an array the same size as the number of items in the path, where each value at each index is the total displacement from one waypoint to the next
         if self.global_path is None or len(self.global_path.poses) == 0:
             return None
         self.global_path_displacement = []
         prev_x = None
         prev_y = None
         for pose in self.global_path.poses:
-            #calc dist between current x val and previous x val, then pass along prev x for next pose x and y
             x = pose.pose.position.x
             y = pose.pose.position.y
 
@@ -219,10 +228,9 @@ class DWA(Node):
             prev_y = y
             self.global_path_displacement.append(math.sqrt(dx*dx + dy*dy))
 
-
-# helper funcs
+    #function to create a rolling goal, based on some "lookahead" value, such that the waypoint is further away than the 
+    # lookahead value in relation to the robot along the path
     def get_moving_goal(self, curr_x, curr_y):
-        #function to create a rolling goal, based on some "lookahead" value, such that the waypoint is further away than the lookahead value in relation to the robot along the path
         if self.global_path is None or len(self.global_path.poses) == 0:
             return None
         distances = []
@@ -255,11 +263,7 @@ class DWA(Node):
         return goal_x, goal_y, goal_theta
 
 
-
-
-
-
-
+    #3d to 2d convert for theta
     def quat_to_yaw(self, q):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
@@ -390,8 +394,6 @@ class DWA(Node):
         else:
             return np.array([])
 
-        
-        #TODO May have to downsample for Turtlebot performance, LIDAR_downsample currently set to 1
         ranges = np.array(self.scan_msg.ranges)[::self.LIDAR_downsample]
         angles = np.linspace(
             self.scan_msg.angle_min,
@@ -416,7 +418,8 @@ class DWA(Node):
         
 
 
-    def cost_function(self, trajectories, final_vs, final_ws, obstacles, curr_x, curr_y):
+    def cost_function(self, trajectories, final_vs, final_ws, obstacles, curr_x, curr_y,
+                      dist_to_final_goal, final_goal_pos):
         """Score each candidate trajectory with a weighted sum of:
           - goal:         how much closer the trajectory endpoint gets to the goal
           - heading:      alignment between final heading and direction to goal
@@ -427,77 +430,74 @@ class DWA(Node):
           - heading_path: alignment of final heading with path tangent (stacked only)
 
         Trajectories whose closest obstacle is within critical_radius get
-        hard-rejected (score = -inf)."""
-        
+        hard-rejected (score = -inf).
+
+        dist_to_final_goal: distance to the true final goal, not just the rolling goal
+          (so that near-goal weight blending triggers at the right moment in both modes).
+        final_goal_pos: np.array([x, y]) of the true final goal — g_score measures
+          progress toward this point so the robot is always rewarded for getting closer
+          to the actual destination, not just the rolling carrot."""
+
         final_pos = trajectories[:, -1, :2]
-        curr_dist = np.linalg.norm(self.goal - np.array([curr_x, curr_y]))
-        goal_dists = np.linalg.norm(self.goal - final_pos, axis=1)
+        curr_dist = dist_to_final_goal
+        goal_dists = np.linalg.norm(final_goal_pos - final_pos, axis=1)
+        
+        #edited weights to change slowly as the robot approaches the goal for within 1.0 meters, rather than just hard changing
+        if curr_dist < 1.0:
+            near_t = 1.0 - curr_dist
+            w_goal_eff      = self.w_goal      + near_t * (0.60 - self.w_goal)
+            w_heading_eff   = self.w_heading   + near_t * (0.25 - self.w_heading)
+            w_obstacle_eff  = max(0.15, self.w_obstacle * (1.0 - near_t * 0.5))
+            w_velocity_eff  = self.w_velocity  * (1.0 - near_t)
+            w_dist_path_eff      = self.w_dist_path      * (1.0 - near_t * 0.7)
+            w_heading_path_eff   = self.w_heading_path   * (1.0 - near_t * 0.7)
+        else:
+            w_goal_eff           = self.w_goal
+            w_heading_eff        = self.w_heading
+            w_obstacle_eff       = self.w_obstacle
+            w_velocity_eff       = self.w_velocity
+            w_dist_path_eff      = self.w_dist_path
+            w_heading_path_eff   = self.w_heading_path
 
-         #updating the window based on distance to goal, discrete and changes only @ a distance of 1 meters
-        if not self.stacked:
-            if curr_dist < 1:
-                self.max_v = curr_dist / 1 + 0.1
-                self.w_heading = 0.25
-                self.w_goal = 0.7
-                self.w_obstacle = 0.05
-            
-        
-        
+
+        #used for calcualted distance from path scoring and heading to path scoring        
         if self.stacked and self.global_path is not None and len(self.global_path.poses) >= 2:
-
-            #put ROS path into numpy array of length N, with (x,y) for each waypoint as values
             path_pts = []
             for p in self.global_path.poses:
                 path_pts.append([p.pose.position.x, p.pose.position.y])
-            path_pts = np.array(path_pts) #[W0, W1, W2, ... WN]
-            #for creating the vectors between each waypoint
-            A = path_pts[:-1] #[W0, W1, W2, ... WN-1]
-            B = path_pts[1:]  #[W1, W2, W3, ... WN]
-            AB = B - A #a set of vector values [dx,dy] for all paths from [W0 to W1], [W1 to W2].... [WN-1 to WN]
-
-            #vector magnitude (handles 0 if two waypoints are the same)
+            path_pts = np.array(path_pts)
+            A = path_pts[:-1]
+            B = path_pts[1:]
+            AB = B - A
             AB_len_sq = np.maximum(np.sum(AB ** 2, axis=1), 1e-10)
-
-            #holds the vector from every waypoint start to every trajectory endpoint (such that we can compare the distance from each trajectory endpoint to every waypoint vector)
-            #so PA[i,j] is the vector from waypoint A[j] to trajectory endpoint i, all pairs simultaneously
-            PA = final_pos[:, None, :] - A[None, :, :]
             
-            #for every Endpoint in trajectories (has them all set as a vector from A[n] to every P) looks at the vector between waypoint A[i] and B[i], 
-            #and determines how far along that vector the endpoint is (clipped between 0 and 1 so if the endpoint doesnt lie along that vector, its just a 0 or 1 depending on what side its on)
+            
+            
+            PA = final_pos[:, None, :] - A[None, :, :]
             t = np.clip(np.sum(PA * AB[None, :, :], axis=2) / AB_len_sq[None, :],0.0, 1.0)
-
-            #closest point on each segment to each trajectory endpoint: A + t*(B-A)
-            #t=0 gives A, t=1 gives B, values in between give points along the segment
-            #so this very specifically gets, for each endpoint, what the exact point along the path(not just waypoints, but every vector between each waypoint) is the closest, and the specific value as well
             closest = A[None, :, :] + t[:, :, None] * AB[None, :, :]
-
-            #basic distance calc, done for every permutation of waypoint->endpoint and its respective closest val
             seg_dists = np.linalg.norm(final_pos[:, None, :] - closest, axis=2)
-
-            #finds the minimum dist for each specific trajectory endpoint, regardless of waypoint (via the collapsing axis), then normalizes it.
             min_path_dists = np.min(seg_dists, axis=1)
-            #max dev is what distance from the path will give you a 0, anything over 1.0 meters from the path will give you a 0
-            max_dev = 1.0
-            dp_score = np.clip(1.0 - (min_path_dists / max_dev), 0.0, 1.0)
+        
+        #discance from path score
+            dp_score = np.sqrt(np.clip(1.0 - (min_path_dists / self.max_path_deviation), 0.0, 1.0))
 
-            #heading_to_path: now that seg_dists can give what point is the closest to each endpoint, heading can be used
-            #compute that segment's tangent angle, then score how closely the trajectory's final
-            #heading aligns with that tangent (1.0 = perfectly aligned, 0.0 = opposite direction)
+
+
             nearest_seg_idx = np.argmin(seg_dists, axis=1)
             seg_tangents = np.arctan2(AB[:, 1], AB[:, 0])
             path_theta = seg_tangents[nearest_seg_idx]
             final_theta = trajectories[:, -1, 2]
-
             heading_err = np.abs(np.arctan2(np.sin(path_theta - final_theta),np.cos(path_theta - final_theta)))
-            hp_score = 1.0 - (heading_err / np.pi) # normalize
+        #heading to path score
+            hp_score = 1.0 - (heading_err / np.pi) 
         else:
-            # not in stacked mode or no path yet — neutral score of 1.0 so these terms have no effect
             dp_score = np.ones(len(final_vs))
             hp_score = np.ones(len(final_vs))
 
 
         #goal score
-        max_prog = self.max_v * self.dt * self.steps
+        max_prog = max(dist_to_final_goal, self.max_v * self.dt * trajectories.shape[1])
         progress = curr_dist - goal_dists
         g_score = np.clip((progress + max_prog) / (2 * max_prog), 0.0, 1.0)
         
@@ -512,7 +512,7 @@ class DWA(Node):
         ))
         h_score = 1.0 - (heading_err / np.pi)
         
-        #obstacle score — min_dists used for hard-rejection below
+        #obstacle score
         if len(obstacles) > 0:
             all_pts = trajectories[:, :, :2]
             diffs = obstacles[None, None, :, :] - all_pts[:, :, None, :]
@@ -520,7 +520,8 @@ class DWA(Node):
             min_dists = np.min(dists, axis=(1, 2))
         else:
             min_dists = np.full(len(final_vs), self.max_lidar_range)
-
+            
+        #instead of rebuilding the costmap every step, rebuild if it doesnt exist yet or if it is very different from what the lidar sees
         rebuild = (
             self._cached_dist_grid is None or
             self._cached_grid_x is None or
@@ -542,33 +543,30 @@ class DWA(Node):
         v_score = np.clip(final_vs / self.max_v, 0.0, 1.0)
         w_score = np.clip(1.0 - (np.abs(final_ws) / self.max_w), 0.0, 1.0)
         
-        #combine
+        #combine the effective weights (which change as robot appraoches within 1m )
         scores = (
-            self.w_goal * g_score +
-            self.w_heading * h_score +
-            self.w_velocity * v_score +
-            self.w_smoothness * w_score +
-            self.w_obstacle * o_score +
-            self.w_dist_path * dp_score +
-            self.w_heading_path * hp_score
+            w_goal_eff         * g_score +
+            w_heading_eff      * h_score +
+            w_velocity_eff     * v_score +
+            self.w_smoothness  * w_score +
+            w_obstacle_eff     * o_score +
+            w_dist_path_eff    * dp_score +
+            w_heading_path_eff * hp_score
         )
         
-        #hard reject if too close to objects
+        #hard reject path if too close to objects
         crit = np.where(np.abs(final_vs) > 0.1, self.critical_radius, self.emergency_stop_dist + 0.01)
         scores[min_dists < crit] = -np.inf
         
         return scores, min_dists
     
         
-    # changed to do vector mult,, similar logic but applies to all v w 
     def predict_trajectories(self, v_arr, w_arr, curr_x, curr_y, curr_theta, steps=30, dt=0.1):
         """Forward-simulate all (v, w) pairs in parallel using vectorized cumulative sums.
         Each pair is held constant for `steps` timesteps of length `dt`.
         Returns (trajectories, final_vs, final_ws) where trajectories is (N, steps, 3)
         with columns [x, y, theta]."""
         
-                
-        #copy over v and w across array
         vs = np.tile(v_arr[:, None], (1, steps))
         ws = np.tile(w_arr[:, None], (1, steps))
         
@@ -679,14 +677,16 @@ class DWA(Node):
                 self.get_logger().info(f"New Goal Assigned: {goal_x, goal_y, goal_theta}")
                 self.goal = np.array([goal_x, goal_y])
 
+
         if self.stacked:
-            final_goal = np.array([
+            final_goal_pos = np.array([
                 self.global_path.poses[-1].pose.position.x,
                 self.global_path.poses[-1].pose.position.y
             ])
-            dist = np.linalg.norm(final_goal - np.array([curr_x, curr_y]))
         else:
-            dist = np.linalg.norm(self.goal - np.array([curr_x, curr_y]))
+            final_goal_pos = self.goal
+            
+        dist = np.linalg.norm(final_goal_pos - np.array([curr_x, curr_y]))
         if dist < self.goal_tolerance:
             self.get_logger().info("Goal reached!")
             stop_cmd = TwistStamped()
@@ -709,18 +709,30 @@ class DWA(Node):
             return 
 
 
+        #cut max speed as final goal comes closer
+        effective_max_v = float(np.clip(self.max_v * (dist / 1.0), 0.15, self.max_v))
+        _saved_max_v = self.max_v
+        self.max_v = effective_max_v
         poss_v_max, poss_v_min, poss_w_max, poss_w_min = self.dynamic_window(curr_v, curr_w)
-        poss_v = np.linspace(poss_v_min, poss_v_max, self.v_samples)  
+        self.max_v = _saved_max_v
+
+        #reduce the amount of steps forward the trajectories are as final goal comes closer, 
+        # so turtlebot doesnt keep doing victory laps
+        effective_steps = max(10, int(self.steps * min(1.0, dist / 1.0)))
+
+        poss_v = np.linspace(poss_v_min, poss_v_max, self.v_samples)
         poss_w = np.linspace(poss_w_min, poss_w_max, self.w_samples)
         v_arr, w_arr = np.meshgrid(poss_v, poss_w)
         v_arr = v_arr.flatten()
         w_arr = w_arr.flatten()
         trajectories, final_vs, final_ws = self.predict_trajectories(
-            v_arr, w_arr, curr_x, curr_y, curr_theta, self.steps, self.dt
+            v_arr, w_arr, curr_x, curr_y, curr_theta, effective_steps, self.dt
         )
 
 
-        #view what DWA sees as obstacles in RVIZ (should also be adjusted to map frame now)
+
+
+        #for displaying what obstacles LIDAR sees,,, can remove this if things are slow
         obstacles = self.get_obstacles()
         if len(obstacles) > 0:
             marker = Marker()
@@ -742,7 +754,7 @@ class DWA(Node):
                 p.z = 0.0
                 marker.points.append(p)
             self.debug_pub.publish(marker)
-        scores, min_dists = self.cost_function(trajectories, final_vs, final_ws, obstacles, curr_x, curr_y)
+        scores, min_dists = self.cost_function(trajectories, final_vs, final_ws, obstacles, curr_x, curr_y, dist, final_goal_pos)
         best_idx = np.argmax(scores)
         self.publish_trajectory_markers(trajectories, scores, best_idx)
             
