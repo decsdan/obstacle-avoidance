@@ -114,7 +114,7 @@ class DWA(Node):
         self.w_heading_path = self.get_parameter('weights.heading_path').value
         
 # recovery
-        self.declare_parameter('recovery.linear_velocity', -0.15)
+        self.declare_parameter('recovery.linear_velocity', 0.0)
         self.declare_parameter('recovery.angular_velocity', 0.5)
 
 
