@@ -89,7 +89,7 @@ class DWA(Node):
         self.max_path_deviation = self.get_parameter('max_path_deviation').value
         
 # bubbles
-        self.declare_parameter('critical_radius', 0.20)
+        self.declare_parameter('critical_radius', 0.18)
         self.declare_parameter('emergency_stop_distance', 0.17)
         self.declare_parameter('max_lidar_range', 8.0)
         self.critical_radius = self.get_parameter('critical_radius').value
@@ -98,10 +98,10 @@ class DWA(Node):
         
 # cost weights
         self.declare_parameter('weights.goal', 0.35)
-        self.declare_parameter('weights.heading', 0.10)
-        self.declare_parameter('weights.velocity', 0.05)
+        self.declare_parameter('weights.heading', 0.00)
+        self.declare_parameter('weights.velocity', 0.10)
         self.declare_parameter('weights.smoothness', 0.05)
-        self.declare_parameter('weights.obstacle', 0.40)
+        self.declare_parameter('weights.obstacle', 0.35)
         self.declare_parameter('weights.dist_path', 0.10)
         self.declare_parameter('weights.heading_path', 0.05)
 
@@ -114,7 +114,7 @@ class DWA(Node):
         self.w_heading_path = self.get_parameter('weights.heading_path').value
         
 # recovery
-        self.declare_parameter('recovery.linear_velocity', 0.0)
+        self.declare_parameter('recovery.linear_velocity', -0.15)
         self.declare_parameter('recovery.angular_velocity', 0.5)
 
 
@@ -442,9 +442,9 @@ class DWA(Node):
         curr_dist = dist_to_final_goal
         goal_dists = np.linalg.norm(final_goal_pos - final_pos, axis=1)
         
-        #edited weights to change slowly as the robot approaches the goal for within 1.0 meters, rather than just hard changing
-        if curr_dist < 1.0:
-            near_t = 1.0 - curr_dist
+        #edited weights to change slowly as the robot approaches the goal for within 0.5 meters, rather than just hard changing
+        if curr_dist < 0.5:
+            near_t = 1.0 - (curr_dist / 0.5)
             w_goal_eff      = self.w_goal      + near_t * (0.60 - self.w_goal)
             w_heading_eff   = self.w_heading   + near_t * (0.25 - self.w_heading)
             w_obstacle_eff  = max(0.15, self.w_obstacle * (1.0 - near_t * 0.5))
@@ -710,7 +710,7 @@ class DWA(Node):
 
 
         #cut max speed as final goal comes closer
-        effective_max_v = float(np.clip(self.max_v * (dist / 1.0), 0.15, self.max_v))
+        effective_max_v = float(np.clip(self.max_v * min(1.0, dist / 0.5), 0.15, self.max_v))
         _saved_max_v = self.max_v
         self.max_v = effective_max_v
         poss_v_max, poss_v_min, poss_w_max, poss_w_min = self.dynamic_window(curr_v, curr_w)
@@ -718,7 +718,7 @@ class DWA(Node):
 
         #reduce the amount of steps forward the trajectories are as final goal comes closer, 
         # so turtlebot doesnt keep doing victory laps
-        effective_steps = max(10, int(self.steps * min(1.0, dist / 1.0)))
+        effective_steps = max(10, int(self.steps * min(1.0, dist / 0.5)))
 
         poss_v = np.linspace(poss_v_min, poss_v_max, self.v_samples)
         poss_w = np.linspace(poss_w_min, poss_w_max, self.w_samples)
