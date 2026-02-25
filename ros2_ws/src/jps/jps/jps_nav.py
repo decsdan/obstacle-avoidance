@@ -54,7 +54,7 @@ class NavigatorConstants:
 
     # Robot Physical Parameters (meters)
     ROBOT_RADIUS = 0.22          # TurtleBot4 radius
-    SAFETY_CLEARANCE = 0.20      # Additional safety margin
+    SAFETY_CLEARANCE = 0.00      # Additional safety margin
 
     # Control Parameters
     LINEAR_SPEED = 0.2           # Forward speed (m/s)
@@ -70,12 +70,12 @@ class NavigatorConstants:
     TIGHT_SPACE_RADIUS = 3       # Grid cells to use original grid near start
 
     # Publishing/Subscribing Paths - CRITICAL: MUST MATCH YOUR ROBOT
-    CMD_VEL = '/mikey/cmd_vel'   # Change 'mikey' to your robot name if different
-    ODOMETRY = '/mikey/odom'     # Change 'mikey' to your robot name if different
+    CMD_VEL = '/leo/cmd_vel'   # Change 'mikey' to your robot name if different
+    ODOMETRY = '/leo/odom'     # Change 'mikey' to your robot name if different
 
     # Pgm and yaml paths - MUST match A* paths
-    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/olin304.yaml'
-    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/olin304.pgm'
+    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/complex_add_test.yaml'
+    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/complex_add_test.pgm'
 
 
 # ============================================================================
@@ -159,6 +159,15 @@ class JPSNavigator(Node):
         self.angular_speed = NavigatorConstants.ANGULAR_SPEED
         self.position_tolerance = NavigatorConstants.POSITION_TOLERANCE
         self.angle_tolerance = NavigatorConstants.ANGLE_TOLERANCE
+
+        # ====================================================================
+        # INITIALIZATION - Distance and Time Tracking
+        # ====================================================================
+
+        self.start_time = None
+        self.total_distance = 0.0  # Total distance traveled in meters
+        self.last_position = None  # Last position for distance calculation
+
 
         # ====================================================================
         # INITIALIZATION - Control Loop Timer
@@ -320,7 +329,12 @@ class JPSNavigator(Node):
 
         if self.path:
             self.current_waypoint_idx = 0
+            # Initialize distance and time tracking
+            self.start_time = self.get_clock().now()
+            self.total_distance = 0.0
+            self.last_position = (start_x, start_y)
             self.get_logger().info(f'✓ Path found with {len(self.path)} waypoints')
+            self.get_logger().info('Started tracking distance and time')
             self.print_path()
             return True
         else:
@@ -732,10 +746,27 @@ class JPSNavigator(Node):
         if not self.path or self.current_pose is None:
             return
 
+        # Update distance traveled
+        if self.last_position is not None:
+            current_x = self.current_pose['x']
+            current_y = self.current_pose['y']
+            dx = current_x - self.last_position[0]
+            dy = current_y - self.last_position[1]
+            distance_increment = math.sqrt(dx**2 + dy**2)
+            self.total_distance += distance_increment
+            self.last_position = (current_x, current_y)
+
         # Check if goal reached
         if self.current_waypoint_idx >= len(self.path):
             self.stop_robot()
-            self.get_logger().info('🎯 Goal reached!')
+            # Calculate elapsed time
+            if self.start_time is not None:
+                elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+                self.get_logger().info('🎯 Goal reached!')
+                self.get_logger().info(f'Total distance traveled: {self.total_distance:.2f} meters')
+                self.get_logger().info(f'Total time elapsed: {elapsed_time:.2f} seconds')
+            else:
+                self.get_logger().info('🎯 Goal reached!')
             self.path = []
             return
 

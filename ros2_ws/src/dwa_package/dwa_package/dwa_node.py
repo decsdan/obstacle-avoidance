@@ -560,7 +560,8 @@ class DWA(Node):
         o_score_list = dg.get_all_path_costs_with_grid(trajectories, self._cached_dist_grid, curr_x, curr_y)
         o_score = np.array(o_score_list)
         
-        #velocity and smoothness
+        #velocity and smoothnesso_score_list = dg.get_all_path_costs(trajectories, obstacles)
+        # o_score = np.array(o_score_list)
         v_score = np.clip(final_vs / self.max_v, 0.0, 1.0)
         w_score = np.clip(1.0 - (np.abs(final_ws) / self.max_w), 0.0, 1.0)
         
@@ -794,7 +795,6 @@ class DWA(Node):
         self.message.twist.linear.x = best_v
         self.message.twist.angular.z = best_w
         self.twist_publish.publish(self.message)
-
 
 
 def main(args=None):

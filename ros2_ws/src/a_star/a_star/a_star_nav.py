@@ -162,6 +162,9 @@ class AStarNavigator(Node):
         # Command velocity publisher (only used in standalone mode)
         self.cmd_vel_pub = self.create_publisher(TwistStamped, self.ns + '/cmd_vel', 10)
 
+        # Path publisher for RViz visualization
+        self.path_pub = self.create_publisher(Path, NavigatorConstants.PATH, 10)
+
         # Odometry subscriber (best-effort QoS to match publisher)
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -223,7 +226,15 @@ class AStarNavigator(Node):
         self.angle_tolerance = NavigatorConstants.ANGLE_TOLERANCE
 
         # ====================================================================
-        # INITIALIZATION - Control Loop Timer (standalone mode only)
+        # INITIALIZATION - Distance and Time Tracking
+        # ====================================================================
+
+        self.start_time = None
+        self.total_distance = 0.0  # Total distance traveled in meters
+        self.last_position = None  # Last position for distance calculation
+
+        # ====================================================================
+        # INITIALIZATION - Control Loop Timer
         # ====================================================================
 
         if self.standalone:
@@ -454,19 +465,14 @@ class AStarNavigator(Node):
 
         if self.path:
             self.current_waypoint_idx = 0
-            self.get_logger().info(f'Path found with {len(self.path)} waypoints')
+            # Initialize distance and time tracking
+            self.start_time = self.get_clock().now()
+            self.total_distance = 0.0
+            self.last_position = (start_x, start_y)
+            self.get_logger().info(f'✓ Path found with {len(self.path)} waypoints')
+            self.get_logger().info('Started tracking distance and time')
             self.print_path()
-
-            # Always publish the global plan (consumed by local planners or RViz)
-            self.publish_global_plan()
-
-            if not self.standalone:
-                self.get_logger().info(
-                    'Planner-only mode: path published, waiting for next goal.'
-                )
-                # Clear path so control_loop (if somehow active) does nothing
-                self.path = []
-
+            self.publish_path()
             return True
         else:
             self.get_logger().error('No path found! Check if start/goal are valid and reachable')
@@ -790,6 +796,24 @@ class AStarNavigator(Node):
         simplified.append(path[-1])  # Always include goal
         return simplified
 
+    def publish_path(self):
+        """Publish the planned path as a nav_msgs/Path for RViz visualization."""
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = 'map'
+
+        for x, y in self.path:
+            pose = PoseStamped()
+            pose.header.stamp = path_msg.header.stamp
+            pose.header.frame_id = 'map'
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+            pose.pose.position.z = 0.0
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+
+        self.path_pub.publish(path_msg)
+
     def print_path(self):
         """Print the planned path waypoints to logger."""
         self.get_logger().info('Planned waypoints:')
@@ -811,10 +835,27 @@ class AStarNavigator(Node):
         if not self.path or self.current_pose is None:
             return
 
+        # Update distance traveled
+        if self.last_position is not None:
+            current_x = self.current_pose['x']
+            current_y = self.current_pose['y']
+            dx = current_x - self.last_position[0]
+            dy = current_y - self.last_position[1]
+            distance_increment = math.sqrt(dx**2 + dy**2)
+            self.total_distance += distance_increment
+            self.last_position = (current_x, current_y)
+
         # Check if goal reached
         if self.current_waypoint_idx >= len(self.path):
             self.stop_robot()
-            self.get_logger().info('Goal reached!')
+            # Calculate elapsed time
+            if self.start_time is not None:
+                elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+                self.get_logger().info('🎯 Goal reached!')
+                self.get_logger().info(f'Total distance traveled: {self.total_distance:.2f} meters')
+                self.get_logger().info(f'Total time elapsed: {elapsed_time:.2f} seconds')
+            else:
+                self.get_logger().info('🎯 Goal reached!')
             self.path = []
             return
 
@@ -1000,3 +1041,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+    

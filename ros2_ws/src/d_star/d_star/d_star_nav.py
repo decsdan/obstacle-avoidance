@@ -31,7 +31,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
-from nav_msgs.msg import Odometry, OccupancyGrid
+from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from map_msgs.msg import OccupancyGridUpdate
 import numpy as np
 import heapq
@@ -55,7 +55,7 @@ class PlannerConstants:
     """
 
     # -------- Robot Physical Parameters (meters) --------
-    NAMESPACE = '/mikey'          # Name of the physical robot
+    NAMESPACE = '/don'          # Name of the physical robot
     ROBOT_RADIUS = 0.22           # Physical radius of the robot body
     SAFETY_CLEARANCE = 0.05      # Extra safety buffer around obstacles
                                   # Total inflation = ROBOT_RADIUS + SAFETY_CLEARANCE
@@ -77,6 +77,7 @@ class PlannerConstants:
     OCCUPANCY_GRID = f'{NAMESPACE}/map'
     DYNAMIC_GRID = f'{NAMESPACE}/dynamic_grid'
     GOAL_POSE = f'{NAMESPACE}/d_star_goal_pose'
+    PATH = f'{NAMESPACE}/d_star_path'
 
     # Local costmap topics (Nav2)
     LOCAL_COSTMAP = f'{NAMESPACE}/local_costmap/costmap'
@@ -468,6 +469,7 @@ class DStarNavigator(Node):
         # ROS2 publishers
         self.cmd_vel_pub = self.create_publisher(TwistStamped, PlannerConstants.CMD_VEL, 10)
         self.dynamic_grid_pub = self.create_publisher(OccupancyGrid, PlannerConstants.DYNAMIC_GRID, 10)
+        self.path_pub = self.create_publisher(Path, PlannerConstants.PATH, 10)
 
         # ROS2 subscribers
         self._setup_subscribers()
@@ -509,6 +511,11 @@ class DStarNavigator(Node):
         self.replanning_needed = False
         self.last_replan_time = self.get_clock().now()
         self.blocked_waypoint_idx = None  # Track which waypoint is blocked by obstacle
+
+        # Distance and time tracking
+        self.start_time = None
+        self.total_distance = 0.0  # Total distance traveled in meters
+        self.last_position = None  # Last position for distance calculation
 
         # Control loop timer (10 Hz)
         self.control_timer = self.create_timer(0.1, self.control_loop)
@@ -667,26 +674,39 @@ class DStarNavigator(Node):
         )
         self.local_costmap_info = msg.info
 
-        # Process entire costmap to update obstacles
+        # Process entire costmap to update obstacles.
+        # Iterate over SLAM grid cells within the costmap footprint (pull approach)
+        # so every 0.5m SLAM cell is covered — avoids gaps caused by the 0.6m→0.5m
+        # resolution difference when pushing costmap cells into the SLAM grid.
         obstacles_found = 0
-        out_of_bounds = 0
         changed_cells = []
 
-        for local_y in range(msg.info.height):
-            for local_x in range(msg.info.width):
-                cost = self.local_costmap[local_y, local_x]
+        # Determine which SLAM cells fall inside the costmap's world footprint
+        slam_x_min, slam_y_min = self.world_to_grid(
+            msg.info.origin.position.x,
+            msg.info.origin.position.y
+        )
+        slam_x_max, slam_y_max = self.world_to_grid(
+            msg.info.origin.position.x + msg.info.width * msg.info.resolution,
+            msg.info.origin.position.y + msg.info.height * msg.info.resolution
+        )
+        slam_x_min = max(0, slam_x_min)
+        slam_y_min = max(0, slam_y_min)
+        slam_x_max = min(self.grid_dynamic.shape[1] - 1, slam_x_max)
+        slam_y_max = min(self.grid_dynamic.shape[0] - 1, slam_y_max)
 
-                # Convert local costmap coordinates to world coordinates
-                world_x = (msg.info.origin.position.x + local_x * msg.info.resolution)
-                world_y = (msg.info.origin.position.y + local_y * msg.info.resolution)
+        for grid_y in range(slam_y_min, slam_y_max + 1):
+            for grid_x in range(slam_x_min, slam_x_max + 1):
+                # Convert SLAM cell centre to world, then to costmap cell index
+                world_x = self.origin[0] + grid_x * self.resolution
+                world_y = self.origin[1] + grid_y * self.resolution
+                local_x = int((world_x - msg.info.origin.position.x) / msg.info.resolution)
+                local_y = int((world_y - msg.info.origin.position.y) / msg.info.resolution)
 
-                # Convert world coordinates to our grid coordinates
-                grid_x, grid_y = self.world_to_grid(world_x, world_y)
-
-                # Check bounds
-                if not self._in_bounds(grid_x, grid_y):
-                    out_of_bounds += 1
+                if not (0 <= local_x < msg.info.width and 0 <= local_y < msg.info.height):
                     continue
+
+                cost = self.local_costmap[local_y, local_x]
 
                 # Convert Nav2 cost (0-254) to binary obstacle (0 or 1)
                 is_obstacle = 1 if cost > PlannerConstants.LOCAL_COSTMAP_OBSTACLE_THRESHOLD else 0
@@ -708,10 +728,6 @@ class DStarNavigator(Node):
                             self.grid_dynamic[grid_y, grid_x] = is_obstacle
                             changed_cells.append((grid_x, grid_y))
 
-        self.get_logger().info(
-            f'Full costmap processed: {obstacles_found} obstacles, '
-            f'{out_of_bounds} out of bounds, {len(changed_cells)} cells changed'
-        )
 
         # Update D* Lite planner and trigger replan if needed
         if changed_cells and self.dstar_planner:
@@ -765,26 +781,13 @@ class DStarNavigator(Node):
 
         changed_cells = []
         obstacles_detected = 0
-        out_of_bounds = 0
+
+        costmap_res = self.local_costmap_info.resolution  # 0.6 m
 
         for i, cost in enumerate(msg.data):
-            # Calculate position in local costmap
+            # Calculate position in local costmap (0.6 m cells)
             local_x = msg.x + (i % msg.width)
             local_y = msg.y + (i // msg.width)
-
-            # Convert local costmap coordinates to world coordinates
-            world_x = (self.local_costmap_info.origin.position.x +
-                      local_x * self.local_costmap_info.resolution)
-            world_y = (self.local_costmap_info.origin.position.y +
-                      local_y * self.local_costmap_info.resolution)
-
-            # Convert world coordinates to our grid coordinates
-            grid_x, grid_y = self.world_to_grid(world_x, world_y)
-
-            # Check bounds
-            if not self._in_bounds(grid_x, grid_y):
-                out_of_bounds += 1
-                continue
 
             # Convert Nav2 cost (0-254) to binary obstacle (0 or 1)
             is_obstacle = 1 if cost > PlannerConstants.LOCAL_COSTMAP_OBSTACLE_THRESHOLD else 0
@@ -792,22 +795,38 @@ class DStarNavigator(Node):
             if is_obstacle:
                 obstacles_detected += 1
 
-            # Update the local costmap layer (survives SLAM resets)
-            if self.grid_local_costmap is not None:
-                self.grid_local_costmap[grid_y, grid_x] = is_obstacle
-                # Mark this cell as having costmap data (so it overrides SLAM)
-                if self.grid_local_costmap_mask is not None:
-                    self.grid_local_costmap_mask[grid_y, grid_x] = 1
+            # Compute the world-space footprint of this 0.6 m costmap cell
+            world_x0 = self.local_costmap_info.origin.position.x + local_x * costmap_res
+            world_y0 = self.local_costmap_info.origin.position.y + local_y * costmap_res
+            world_x1 = world_x0 + costmap_res
+            world_y1 = world_y0 + costmap_res
 
-            # Track changes for D* Lite incremental update
-            if self.grid_dynamic[grid_y, grid_x] != is_obstacle:
-                self.grid_dynamic[grid_y, grid_x] = is_obstacle
-                changed_cells.append((grid_x, grid_y))
+            # Map footprint corners to SLAM grid (0.5 m) and clamp to bounds
+            gx0, gy0 = self.world_to_grid(world_x0, world_y0)
+            gx1, gy1 = self.world_to_grid(world_x1, world_y1)
+            gx0 = max(0, gx0)
+            gy0 = max(0, gy0)
+            gx1 = min(self.grid_dynamic.shape[1] - 1, gx1)
+            gy1 = min(self.grid_dynamic.shape[0] - 1, gy1)
+
+            # Update every 0.5 m SLAM cell that falls inside this costmap cell
+            for grid_y in range(gy0, gy1 + 1):
+                for grid_x in range(gx0, gx1 + 1):
+                    # Update the local costmap layer (survives SLAM resets)
+                    if self.grid_local_costmap is not None:
+                        self.grid_local_costmap[grid_y, grid_x] = is_obstacle
+                        if self.grid_local_costmap_mask is not None:
+                            self.grid_local_costmap_mask[grid_y, grid_x] = 1
+
+                    # Track changes for D* Lite incremental update
+                    if self.grid_dynamic[grid_y, grid_x] != is_obstacle:
+                        self.grid_dynamic[grid_y, grid_x] = is_obstacle
+                        changed_cells.append((grid_x, grid_y))
 
         # Log summary
         self.get_logger().info(
             f'Costmap processing: {obstacles_detected} obstacles detected, '
-            f'{out_of_bounds} out of bounds, {len(changed_cells)} cells changed in grid_dynamic'
+            f'{len(changed_cells)} cells changed in grid_dynamic'
         )
 
         # Update D* Lite planner with changed cells and trigger replan
@@ -1069,12 +1088,6 @@ class DStarNavigator(Node):
             # Where costmap has data (mask==1), use costmap value (overrides SLAM)
             # Where no costmap data (mask==0), use SLAM value
             # This makes costmap the "truth" over SLAM since it's real-time sensor data
-            costmap_cells_count = np.sum(self.grid_local_costmap_mask)
-            costmap_obstacles_count = np.sum((self.grid_local_costmap_mask == 1) & (self.grid_local_costmap == 1))
-            self.get_logger().info(
-                f'SLAM merge: Applying costmap override to {costmap_cells_count} cells '
-                f'({costmap_obstacles_count} obstacles from costmap)'
-            )
             self.grid_dynamic = np.where(self.grid_local_costmap_mask == 1,
                                         self.grid_local_costmap,
                                         self.grid_dynamic)
@@ -1163,7 +1176,13 @@ class DStarNavigator(Node):
 
         if self.path:
             self.current_waypoint_idx = 0
+            # Initialize distance and time tracking
+            self.start_time = self.get_clock().now()
+            self.total_distance = 0.0
+            self.last_position = (start_x, start_y)
             self.get_logger().info(f'Path found with {len(self.path)} waypoints')
+            self.get_logger().info('Started tracking distance and time')
+            self.publish_path()
             return True
         else:
             self.get_logger().error('No path found!')
@@ -1527,6 +1546,16 @@ class DStarNavigator(Node):
         """
         if not self.path or self.current_pose is None:
             return
+        
+        # Update distance traveled
+        if self.last_position is not None:
+            current_x = self.current_pose['x']
+            current_y = self.current_pose['y']
+            dx = current_x - self.last_position[0]
+            dy = current_y - self.last_position[1]
+            distance_increment = math.sqrt(dx**2 + dy**2)
+            self.total_distance += distance_increment
+            self.last_position = (current_x, current_y)
 
         if self.replanning_needed:
             self._handle_replanning()
@@ -1534,7 +1563,14 @@ class DStarNavigator(Node):
 
         if self.current_waypoint_idx >= len(self.path):
             self.stop_robot()
-            self.get_logger().info('Goal reached! 😎')
+            # Calculate elapsed time
+            if self.start_time is not None:
+                elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+                self.get_logger().info('Goal reached! 😎')
+                self.get_logger().info(f'Total distance traveled: {self.total_distance:.2f} meters')
+                self.get_logger().info(f'Total time elapsed: {elapsed_time:.2f} seconds')
+            else:
+                self.get_logger().info('Goal reached! 😎')
             self.path = []
             return
 
@@ -1590,6 +1626,7 @@ class DStarNavigator(Node):
 
                 self.get_logger().info(f'Replanning successful! Path: {len(self.path)} waypoints '
                                       f'({len(preserved_waypoints)} preserved + {len(new_path)} new)')
+                self.publish_path()
             else:
                 self.get_logger().error('Replanning failed! Stopping navigation.')
                 self.path = []
@@ -1649,6 +1686,24 @@ class DStarNavigator(Node):
     # ========================================================================
     # UTILITY METHODS
     # ========================================================================
+
+    def publish_path(self):
+        """Publish the planned path as a nav_msgs/Path for RViz visualization."""
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = 'map'
+
+        for x, y in self.path:
+            pose = PoseStamped()
+            pose.header.stamp = path_msg.header.stamp
+            pose.header.frame_id = 'map'
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+            pose.pose.position.z = 0.0
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+
+        self.path_pub.publish(path_msg)
 
     def publish_dynamic_grid(self):
         """
@@ -1878,3 +1933,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+    
