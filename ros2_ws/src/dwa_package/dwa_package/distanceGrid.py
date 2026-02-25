@@ -260,11 +260,11 @@ def place_obstacles(grid, occupiedPoints):
         #grid[row][col]
         grid[point[1], point[0]] = 100
 
-def clean_points(points):
+def clean_points(points, curr_x=0.0, curr_y=0.0):
     transformedPoints = []
     for point in points:
-        transformedX = int(point[0]*10) + 80
-        transformedY = int(point[1]*10) + 80
+        transformedX = int((point[0] - curr_x) * 10) + 80
+        transformedY = int((point[1] - curr_y) * 10) + 80
         if transformedX < 0 or transformedX > 160 or transformedY < 0 or transformedY > 160:
             continue
         transformedPoints.append((transformedX, transformedY))
@@ -286,7 +286,7 @@ def distance_from_obstacles(obstacleGrid: np.ndarray) -> np.ndarray:
     # find all spots where there's an obstacle and add it to queue
     obstacle_coords = np.argwhere(obstacleGrid == 100)
     for y, x in obstacle_coords:
-        dist_grid[y, x] = -2
+        dist_grid[y, x] = 0
         queue.append((y, x))
     
     # manahttan distance neighbors
@@ -350,12 +350,14 @@ def get_path_given_points(trajectory):
     return finalPath
 
 def get_path_cost(path, distanceGrid):
+    if not path:
+        return math.inf
     totalCost = 0
     for x,y in path:
         if distanceGrid[y, x] <= 0:
             cost = math.inf
         else:
-            cost = math.exp(-1 * distanceGrid[y, x])
+            cost = math.exp(-0.5 * distanceGrid[y, x])
         totalCost += cost
     return totalCost
 
@@ -363,25 +365,58 @@ def normalize_path_costs(allCosts):
     # these are all of the non infinite values
     finiteCosts = [cost for cost in allCosts if math.isfinite(cost)]
 
+    if not finiteCosts:
+        return [math.inf] * len(allCosts)
+
     minVal = min(finiteCosts)
     maxVal = max(finiteCosts)
 
+    #prevent divide by 0 but also prevent scoring issues and robot freezing
+    cost_range = maxVal - minVal
+    if cost_range == 0:
+        return [0.0 if math.isfinite(cost) else cost for cost in allCosts]
+
     normalizedCosts = [
-        (cost - minVal) / (maxVal - minVal+1) if math.isfinite(cost) else cost
+        (cost - minVal) / cost_range if math.isfinite(cost) else cost
         for cost in allCosts
     ]
     return normalizedCosts
 
-def get_all_path_costs(allPaths, occupiedPoints):
-    occupiedPoints = clean_points(occupiedPoints)
+def get_all_path_costs(allPaths, occupiedPoints, curr_x=0.0, curr_y=0.0):
+    occupiedPoints = clean_points(occupiedPoints, curr_x, curr_y)
     obstacleGrid = generate_obstacle_grid(occupiedPoints)
     distanceGrid = distance_from_obstacles(obstacleGrid)
     allCosts = []
     for path in allPaths:
-        path = get_path_given_points(clean_points(path))
+        path = get_path_given_points(clean_points(path, curr_x, curr_y))
         allCosts.append(get_path_cost(path, distanceGrid))
     normalizedCosts = normalize_path_costs(allCosts)
     invertedCosts = []
     for cost in normalizedCosts:
         invertedCosts.append(1-cost)
     return invertedCosts
+
+def get_all_path_costs_with_grid(allPaths, prebuilt_dist_grid, curr_x=0.0, curr_y=0.0):
+    pts = allPaths[:, :, :2]
+    grid_pts = ((pts - np.array([curr_x, curr_y])) * 10 + 80).astype(int)
+    gx = grid_pts[:, :, 0]
+    gy = grid_pts[:, :, 1]
+    in_bounds = (gx >= 0) & (gx <= 160) & (gy >= 0) & (gy <= 160)
+    gx_c = np.clip(gx, 0, 160)
+    gy_c = np.clip(gy, 0, 160)
+    dist_vals = prebuilt_dist_grid[gy_c, gx_c].astype(float)
+    # OOB points dropped (0 cost), obstacle points inf, valid points exp decay
+    point_costs = np.where(in_bounds, np.where(dist_vals > 0, np.exp(-0.5 * dist_vals), np.inf), 0.0)
+    # fully OOB paths or any obstacle-crossing path -> inf
+    all_oob = ~in_bounds.any(axis=1)
+    has_inf = np.isinf(point_costs).any(axis=1)
+    # Score by the mean cost of the last 20% of trajectory steps rather than the full sum.
+    # This measures where the trajectory ENDS UP relative to obstacles, not how it got there.
+    # A trajectory that swings close to an obstacle to navigate around it is no longer
+    # penalised for the early close-approach steps that were necessary to make the turn.
+    n_tail = max(1, point_costs.shape[1] // 5)
+    tail_mean = point_costs[:, -n_tail:].mean(axis=1)
+    total = np.where(all_oob | has_inf, np.inf, tail_mean)
+    allCosts = total.tolist()
+    normalizedCosts = normalize_path_costs(allCosts)
+    return [1 - cost for cost in normalizedCosts]
