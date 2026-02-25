@@ -48,7 +48,7 @@ class DWA(Node):
 
 #relevant hyperparams,,,, can edit here or test diff with command line
 #stacked algo hyperprams
-        self.declare_parameter('stacked', True)
+        self.declare_parameter('stacked', False)
         self.declare_parameter('lookahead', 0.85)
 
         self.stacked = self.get_parameter('stacked').value
@@ -79,7 +79,7 @@ class DWA(Node):
         self.declare_parameter('dt', 0.1)
         self.declare_parameter('prediction_steps', 25)
         self.declare_parameter('window_steps', 5)
-        self.declare_parameter('LIDAR_downsample', 1)
+        self.declare_parameter('LIDAR_downsample', 2)
         self.declare_parameter('max_path_deviation', 1.0)
 
         self.dt = self.get_parameter('dt').value
@@ -525,7 +525,7 @@ class DWA(Node):
         rebuild = (
             self._cached_dist_grid is None or
             self._cached_grid_x is None or
-            math.sqrt((curr_x - self._cached_grid_x)**2 + (curr_y - self._cached_grid_y)**2) > 0.05 or
+            math.sqrt((curr_x - self._cached_grid_x)**2 + (curr_y - self._cached_grid_y)**2) > 0.10 or
             abs(len(obstacles) - self._cached_obs_count) > 10
         )
         if rebuild:
