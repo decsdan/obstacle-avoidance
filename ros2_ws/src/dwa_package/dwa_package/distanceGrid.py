@@ -410,7 +410,13 @@ def get_all_path_costs_with_grid(allPaths, prebuilt_dist_grid, curr_x=0.0, curr_
     # fully OOB paths or any obstacle-crossing path -> inf
     all_oob = ~in_bounds.any(axis=1)
     has_inf = np.isinf(point_costs).any(axis=1)
-    total = np.where(all_oob | has_inf, np.inf, point_costs.sum(axis=1))
+    # Score by the mean cost of the last 20% of trajectory steps rather than the full sum.
+    # This measures where the trajectory ENDS UP relative to obstacles, not how it got there.
+    # A trajectory that swings close to an obstacle to navigate around it is no longer
+    # penalised for the early close-approach steps that were necessary to make the turn.
+    n_tail = max(1, point_costs.shape[1] // 5)
+    tail_mean = point_costs[:, -n_tail:].mean(axis=1)
+    total = np.where(all_oob | has_inf, np.inf, tail_mean)
     allCosts = total.tolist()
     normalizedCosts = normalize_path_costs(allCosts)
     return [1 - cost for cost in normalizedCosts]
