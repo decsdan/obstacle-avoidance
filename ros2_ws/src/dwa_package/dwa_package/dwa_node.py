@@ -29,9 +29,6 @@ class DWA(Node):
     
     
     def __init__(self):
-        # Read namespace early so we can remap TF topics at node init time.
-        # ROS2 param override (--ros-args -p namespace:=/foo) still works;
-        # the cli_args remaps just set up the TF subscriptions.
         import sys
         _ns = '/don'
         for i, arg in enumerate(sys.argv):
@@ -40,11 +37,16 @@ class DWA(Node):
             elif arg == '-p' and i + 1 < len(sys.argv) and sys.argv[i+1].startswith('namespace:='):
                 _ns = sys.argv[i+1].split(':=', 1)[1]
 
-        super().__init__('dynamic_window_approach', cli_args=[
-            '--ros-args',
-            '-r', f'/tf:={_ns}/tf',
-            '-r', f'/tf_static:={_ns}/tf_static',
-        ])
+        _user_args = sys.argv[1:]
+        _tf_remaps = ['-r', f'/tf:={_ns}/tf', '-r', f'/tf_static:={_ns}/tf_static']
+        if '--ros-args' in _user_args:
+            _combined = _user_args + _tf_remaps
+        else:
+            _combined = _user_args + ['--ros-args'] + _tf_remaps
+
+        super().__init__('dynamic_window_approach',
+                         cli_args=_combined,
+                         use_global_arguments=False)
 
 #relevant hyperparams,,,, can edit here or test diff with command line
 #stacked algo hyperprams
@@ -128,7 +130,7 @@ class DWA(Node):
         self.visualize_trajectories = self.get_parameter('visualize_trajectories').value
         self.traj_downsample = self.get_parameter('trajectory_visualization_downsample').value
         
-        self.declare_parameter('goal_tolerance', 0.3)
+        self.declare_parameter('goal_tolerance', 0.2)
         self.goal_tolerance = self.get_parameter('goal_tolerance').value
 
         self.timer = self.create_timer(self.dt, self.nav_loop)
@@ -147,9 +149,7 @@ class DWA(Node):
         self.start_time = None
         self.total_distance = 0.0
         self.last_position = None
-
-        self.start_time = self.get_clock().now()
-        self.total_distance = 0.0
+        self._tracked_final_goal = None
 
         # Track which frame is actively used for pose/obstacles
         # Updated each nav_loop tick based on TF2 availability
@@ -188,9 +188,30 @@ class DWA(Node):
             self.get_logger().info("New global path has been grabbed!")
             self.get_path_displacement()
 
+            #for time/dist tracking,, only reset time and distance when the final goal pose changes
+            if msg.poses:
+                last = msg.poses[-1].pose.position
+                new_final = np.array([last.x, last.y])
+                if (self._tracked_final_goal is None or
+                        np.linalg.norm(new_final - self._tracked_final_goal) > 0.5):
+                    self._tracked_final_goal = new_final
+                    self.start_time = self.get_clock().now()
+                    self.total_distance = 0.0
+                    self.last_position = None
+                    self.get_logger().info(
+                        f"Tracking reset for new destination: ({new_final[0]:.2f}, {new_final[1]:.2f})"
+                    )
+
     def goal_callback(self, msg):
-        self.goal = np.array([msg.pose.position.x, msg.pose.position.y])
+        new_goal = np.array([msg.pose.position.x, msg.pose.position.y])
+        self.goal = new_goal
         self.get_logger().info(f"New Goal Set: {self.goal}")
+        #Standalone mode: reset tracking on every new goal
+        if not self.stacked:
+            self._tracked_final_goal = new_goal
+            self.start_time = self.get_clock().now()
+            self.total_distance = 0.0
+            self.last_position = None
 
     def emergency_lidar_callback(self, msg: LaserScan):
         self.emergency_scan_msg = msg        
@@ -447,7 +468,7 @@ class DWA(Node):
             near_t = 1.0 - (curr_dist / 0.5)
             w_goal_eff      = self.w_goal      + near_t * (0.60 - self.w_goal)
             w_heading_eff   = self.w_heading   + near_t * (0.25 - self.w_heading)
-            w_obstacle_eff  = max(0.15, self.w_obstacle * (1.0 - near_t * 0.5))
+            w_obstacle_eff  = self.w_obstacle
             w_velocity_eff  = self.w_velocity  * (1.0 - near_t)
             w_dist_path_eff      = self.w_dist_path      * (1.0 - near_t * 0.7)
             w_heading_path_eff   = self.w_heading_path   * (1.0 - near_t * 0.7)
@@ -710,7 +731,7 @@ class DWA(Node):
 
 
         #cut max speed as final goal comes closer
-        effective_max_v = float(np.clip(self.max_v * min(1.0, dist / 0.5), 0.15, self.max_v))
+        effective_max_v = float(np.clip(self.max_v * min(1.0, dist / 0.3), 0.15, self.max_v))
         _saved_max_v = self.max_v
         self.max_v = effective_max_v
         poss_v_max, poss_v_min, poss_w_max, poss_w_min = self.dynamic_window(curr_v, curr_w)

@@ -473,8 +473,10 @@ cd ~/obstacle-avoidance-comps/ros2_ws
 colcon build
 source install/setup.bash
 
-ros2 run dwa_package dwa_node
+ros2 run dwa_package dwa_node --ros-args -p namespace:=/don
 ```
+
+> **Note:** For stacked A* + DWA mode, see the [Stacked Algorithm section](#stacked-a--dwa-mode) above — both nodes need `--ros-args -p namespace:=/don -p stacked:=true`.
 
 Then in RViz:
 1. Set initial pose with "2D Pose Estimate"
@@ -487,10 +489,10 @@ Then in RViz:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `weights.goal` | 0.35 | Reward for progress toward goal |
-| `weights.heading` | 0.10 | Reward for pointing directly at goal — automatically set to 0 in stacked mode (superseded by `weights.heading_path`) |
-| `weights.velocity` | 0.05 | Reward for higher speeds — kept low to avoid fighting deceleration near goal |
+| `weights.heading` | 0.05 | Reward for pointing directly at goal — set to 0 in stacked mode (superseded by `weights.heading_path`) |
+| `weights.velocity` | 0.10 | Reward for higher speeds — kept low to avoid fighting deceleration near goal |
 | `weights.smoothness` | 0.05 | Reward for less angular velocity |
-| `weights.obstacle` | 0.35 | Incentivizes being further from objects — dominates near obstacles |
+| `weights.obstacle` | 0.40 | Incentivizes being further from objects — dominates near obstacles |
 | `weights.dist_path` | 0.10 | Soft guidance to stay near global path (stacked mode only) |
 | `weights.heading_path` | 0.05 | Penalizes misalignment with path tangent direction (stacked mode only) |
 
@@ -498,14 +500,14 @@ Then in RViz:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `critical_radius` | 0.18 | Hard rejection boundary |
-| `emergency_stop_distance` | 0.17 | Triggers immediate stop |
-| `prediction_steps` | 16 | Trajectory simulation steps (× dt = sim time, 1.6s) — shorter avoids overshooting near goal |
-| `window_steps` | 4 | Dynamic window size (× dt = 0.4s) — tighter window improves direction-change response |
-| `v_samples` | 13 | Linear velocity samples — more gradations near zero for careful goal approach |
-| `lookahead` | 0.75 | Rolling carrot lookahead distance (m) — buffer before lookahead collapses to final goal |
+| `critical_radius` | 0.20 | Hard rejection boundary — trajectories whose closest point to any obstacle is within this radius are rejected outright |
+| `emergency_stop_distance` | 0.17 | Triggers immediate stop if robot center is within this distance of a LIDAR point |
+| `prediction_steps` | 25 | Trajectory simulation steps (× dt = sim time, 2.5s) — longer horizon improves obstacle anticipation |
+| `window_steps` | 5 | Dynamic window size (× dt = 0.5s) — constrains how aggressively v/w can change per cycle |
+| `v_samples` | 20 | Linear velocity samples across the dynamic window |
+| `lookahead` | 0.85 | Rolling carrot lookahead distance (m) in stacked mode — buffer before lookahead collapses to final goal |
 | `goal_tolerance` | 0.2 | Distance (m) at which goal is declared reached |
-| `max_path_deviation` | 1.5 | Distance from path (m) that scores 0 for dist_path — wider = more detour freedom |
+| `max_path_deviation` | 1.0 | Distance from path (m) that scores 0 for dist_path — wider = more detour freedom |
 
 **Example:** Run with custom weights:
 ```bash

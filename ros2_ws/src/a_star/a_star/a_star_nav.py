@@ -112,11 +112,14 @@ class AStarNavigator(Node):
             elif arg == '-p' and i + 1 < len(sys.argv) and sys.argv[i+1].startswith('namespace:='):
                 _ns = sys.argv[i+1].split(':=', 1)[1]
 
-        super().__init__('astar_navigator', cli_args=[
-            '--ros-args',
-            '-r', f'/tf:={_ns}/tf',
-            '-r', f'/tf_static:={_ns}/tf_static',
-        ])
+        _user_args = sys.argv[1:]
+        _tf_remaps = ['-r', f'/tf:={_ns}/tf', '-r', f'/tf_static:={_ns}/tf_static']
+        if '--ros-args' in _user_args:
+            _combined = _user_args + _tf_remaps
+        else:
+            _combined = _user_args + ['--ros-args'] + _tf_remaps
+
+        super().__init__('astar_navigator', cli_args=_combined, use_global_arguments=False)
 
         # ====================================================================
         # INITIALIZATION - Namespace (ROS param)
