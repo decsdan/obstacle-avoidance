@@ -162,9 +162,6 @@ class AStarNavigator(Node):
         # Command velocity publisher (only used in standalone mode)
         self.cmd_vel_pub = self.create_publisher(TwistStamped, self.ns + '/cmd_vel', 10)
 
-        # Path publisher for RViz visualization
-        self.path_pub = self.create_publisher(Path, NavigatorConstants.PATH, 10)
-
         # Odometry subscriber (best-effort QoS to match publisher)
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -472,7 +469,7 @@ class AStarNavigator(Node):
             self.get_logger().info(f'✓ Path found with {len(self.path)} waypoints')
             self.get_logger().info('Started tracking distance and time')
             self.print_path()
-            self.publish_path()
+            self.publish_global_plan()
             return True
         else:
             self.get_logger().error('No path found! Check if start/goal are valid and reachable')
@@ -505,7 +502,6 @@ class AStarNavigator(Node):
             pose.pose.position.x = float(wx)
             pose.pose.position.y = float(wy)
             pose.pose.position.z = 0.0
-            # Orientation: tangent toward next waypoint; last pose reuses prior tangent
             if i + 1 < len(self.path):
                 nx, ny = self.path[i + 1]
                 yaw = math.atan2(ny - wy, nx - wx)
@@ -526,7 +522,6 @@ class AStarNavigator(Node):
         (e.g. DWA node started after A* already planned) receive it.
         """
         if self.latest_plan_msg is not None:
-            # Update timestamp so the message isn't stale
             self.latest_plan_msg.header.stamp = self.get_clock().now().to_msg()
             self.plan_pub.publish(self.latest_plan_msg)
 
@@ -795,24 +790,6 @@ class AStarNavigator(Node):
         simplified = [path[i] for i in range(0, len(path), step)]
         simplified.append(path[-1])  # Always include goal
         return simplified
-
-    def publish_path(self):
-        """Publish the planned path as a nav_msgs/Path for RViz visualization."""
-        path_msg = Path()
-        path_msg.header.stamp = self.get_clock().now().to_msg()
-        path_msg.header.frame_id = 'map'
-
-        for x, y in self.path:
-            pose = PoseStamped()
-            pose.header.stamp = path_msg.header.stamp
-            pose.header.frame_id = 'map'
-            pose.pose.position.x = x
-            pose.pose.position.y = y
-            pose.pose.position.z = 0.0
-            pose.pose.orientation.w = 1.0
-            path_msg.poses.append(pose)
-
-        self.path_pub.publish(path_msg)
 
     def print_path(self):
         """Print the planned path waypoints to logger."""
