@@ -1,0 +1,24 @@
+obstacle_grid_node:
+  ros__parameters:
+    # Grid dimensions (overridden by SLAM map if use_slam_dimensions=True)
+    grid_width: 200
+    grid_height: 200
+    grid_resolution: 0.05
+    grid_origin_x: -5.0
+    grid_origin_y: -5.0
+    use_slam_dimensions: true
+
+    # LIDAR processing
+    max_lidar_range: 8.0
+    min_lidar_range: 0.05
+    lidar_downsample: 2
+
+    # Inflation (total = robot_radius + safety_clearance)
+    robot_radius: 0.22
+    safety_clearance: 0.05
+
+    # Temporal decay: unobserved obstacles clear after this many seconds
+    obstacle_decay_seconds: 2.5
+
+    # Publishing rate (Hz)
+    publish_rate: 10.0
