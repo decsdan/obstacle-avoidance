@@ -1,0 +1,3 @@
+# Cancels active navigation on the target planner.
+---
+bool confirmed                  # true if planner successfully cancelled

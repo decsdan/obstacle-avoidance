@@ -1,0 +1,20 @@
+# Goal
+string global_planner           # "a_star", "d_star", "jps"
+string local_planner            # "dwa", "none" (standalone, global planner drives)
+float64 goal_x
+float64 goal_y
+float64 goal_theta
+---
+# Result
+bool success
+float64 total_distance          # meters traveled
+float64 total_time              # seconds elapsed
+string final_state              # "reached", "cancelled", "timeout", "failed"
+---
+# Feedback
+float64 distance_to_goal
+float64 distance_traveled
+float64 elapsed_time
+string nav_state                # "planning", "navigating", "emergency_stopped", "recovering"
+float64 current_x
+float64 current_y
