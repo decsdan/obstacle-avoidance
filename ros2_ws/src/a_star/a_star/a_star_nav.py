@@ -84,10 +84,17 @@ class AStarNavigator(Node):
         self.declare_parameter('namespace', NavigatorConstants.DEFAULT_NAMESPACE)
         self.ns = self.get_parameter('namespace').value
 
-        default_radius = robot_radius if robot_radius is not None else \
-            float(os.getenv('ROBOT_RADIUS', str(NavigatorConstants.ROBOT_RADIUS)))
-        default_clearance = safety_clearance if safety_clearance is not None else \
-            float(os.getenv('SAFETY_CLEARANCE', str(NavigatorConstants.SAFETY_CLEARANCE)))
+        if robot_radius is not None:
+            default_radius = robot_radius
+        else:
+            default_radius = float(os.getenv('ROBOT_RADIUS', str(NavigatorConstants.ROBOT_RADIUS)))
+
+        if safety_clearance is not None:
+            default_clearance = safety_clearance
+        else:
+            default_clearance = float(
+                os.getenv('SAFETY_CLEARANCE', str(NavigatorConstants.SAFETY_CLEARANCE))
+            )
 
         self.declare_parameter('robot_radius', default_radius)
         self.declare_parameter('safety_clearance', default_clearance)
@@ -117,9 +124,17 @@ class AStarNavigator(Node):
             depth=10
         )
         self.odom_sub = self.create_subscription(
-            Odometry, self.ns + '/odom', self.odom_callback, qos_profile)
+            Odometry,
+            self.ns + '/odom',
+            self.odom_callback,
+            qos_profile,
+        )
         self.goal_sub = self.create_subscription(
-            PoseStamped, self.ns + '/goal_pose', self.goal_callback, 10)
+            PoseStamped,
+            self.ns + '/goal_pose',
+            self.goal_callback,
+            10,
+        )
 
         # TF remapped to namespaced topics via cli_args above
         self.tf_buffer = Buffer()
@@ -155,7 +170,9 @@ class AStarNavigator(Node):
 
         if self.standalone:
             self.control_timer = self.create_timer(
-                NavigatorConstants.CONTROL_TIMER_PERIOD, self.control_loop)
+                NavigatorConstants.CONTROL_TIMER_PERIOD,
+                self.control_loop,
+            )
 
         # Republish at 1 Hz so late-joining subscribers (e.g. DWA) receive the current plan.
         self.plan_republish_timer = self.create_timer(1.0, self.republish_plan)
@@ -167,7 +184,10 @@ class AStarNavigator(Node):
         self._goal_just_reached = False
         self.nav_status_pub = self.create_publisher(NavStatus, self.ns + '/a_star/status', 10)
         self.cancel_srv = self.create_service(
-            CancelNav, self.ns + '/a_star/cancel', self._handle_cancel)
+            CancelNav,
+            self.ns + '/a_star/cancel',
+            self._handle_cancel,
+        )
         self._status_timer = self.create_timer(0.5, self._publish_nav_status)
 
         if map_yaml is None:

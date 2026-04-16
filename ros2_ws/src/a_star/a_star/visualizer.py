@@ -39,10 +39,15 @@ class AStarVisualizer:
 
     def __init__(self, robot_radius=None, safety_clearance=None):
         """Initialize the visualizer with optional robot parameters."""
-        self.robot_radius = robot_radius if robot_radius is not None \
-            else VisualizerConstants.ROBOT_RADIUS
-        self.safety_clearance = safety_clearance if safety_clearance is not None \
-            else VisualizerConstants.SAFETY_CLEARANCE
+        if robot_radius is not None:
+            self.robot_radius = robot_radius
+        else:
+            self.robot_radius = VisualizerConstants.ROBOT_RADIUS
+
+        if safety_clearance is not None:
+            self.safety_clearance = safety_clearance
+        else:
+            self.safety_clearance = VisualizerConstants.SAFETY_CLEARANCE
 
         self.grid = None
         self.grid_original = None

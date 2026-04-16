@@ -89,8 +89,11 @@ class ObstacleGridNode(Node):
 
         self.scan_msg = None
         self.scan_sub = self.create_subscription(
-            LaserScan, f'{self.ns}/scan', self._scan_callback,
-            qos_profile_sensor_data)
+            LaserScan,
+            f'{self.ns}/scan',
+            self._scan_callback,
+            qos_profile_sensor_data,
+        )
 
         self._slam_initialized = False
         if self.get_parameter('use_slam_dimensions').value:
@@ -101,15 +104,21 @@ class ObstacleGridNode(Node):
                 depth=1
             )
             self.map_sub = self.create_subscription(
-                OccupancyGrid, f'{self.ns}/map', self._map_callback, map_qos)
+                OccupancyGrid,
+                f'{self.ns}/map',
+                self._map_callback,
+                map_qos,
+            )
         else:
             self._init_grid_from_params()
 
         self.grid_pub = self.create_publisher(
-            OccupancyGrid, f'{self.ns}/obstacle_grid', 10)
+            OccupancyGrid,
+            f'{self.ns}/obstacle_grid',
+            10,
+        )
 
-        self.update_timer = self.create_timer(
-            1.0 / self.publish_rate, self._update_cycle)
+        self.update_timer = self.create_timer(1.0 / self.publish_rate, self._update_cycle)
 
         self.get_logger().info(
             f'obstacle_grid initialized | ns={self.ns} res={self.resolution}m '
@@ -187,16 +196,27 @@ class ObstacleGridNode(Node):
         current_time = self.get_clock().now().nanoseconds / 1e9
 
         process_scan(
-            self.grid, self.last_occupied,
-            ranges, angles,
-            sensor_x, sensor_y, sensor_yaw,
-            self.origin_x, self.origin_y, self.resolution,
-            self.max_range, self.min_range,
-            current_time)
+            self.grid,
+            self.last_occupied,
+            ranges,
+            angles,
+            sensor_x,
+            sensor_y,
+            sensor_yaw,
+            self.origin_x,
+            self.origin_y,
+            self.resolution,
+            self.max_range,
+            self.min_range,
+            current_time,
+        )
 
         apply_temporal_decay(
-            self.grid, self.last_occupied,
-            current_time, self.decay_seconds)
+            self.grid,
+            self.last_occupied,
+            current_time,
+            self.decay_seconds,
+        )
 
         inflated = inflate_grid(self.grid, self.inflation_cells)
         self._publish_grid(inflated)
