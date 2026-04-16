@@ -15,8 +15,8 @@ setup(
     zip_safe=True,
     maintainer='devin',
     maintainer_email='devin@todo.todo',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='A* global path planner for ROS2 navigation',
+    license='',
     extras_require={
         'test': [
             'pytest',

@@ -1,110 +1,70 @@
 #!/usr/bin/env python3
+# Originally authored by the 2025 Carleton Senior Capstone Project
+# (see AUTHORS.md). Substantially rewritten by Daniel Scheider, 2026.
+"""A* global path planner for ROS2 with hybrid obstacle checking.
 
-"""
-A* Navigator for ROS2 TurtleBot4
-
-This ROS2 node provides autonomous navigation using the A* pathfinding algorithm.
-Features hybrid obstacle checking to handle tight spaces while maintaining safety.
-
-Features:
-    - A* pathfinding with 8-connected grid movement
-    - Hybrid obstacle validation (tight spaces + safety margins)
-    - Pure pursuit-style waypoint following
-    - Interactive goal selection via terminal input
-    - Environment variable configuration for robot parameters
-
-Publishes to:
-    - /{namespace}/cmd_vel (TwistStamped): Velocity commands (standalone mode)
-    - /{namespace}/a_star/plan (nav_msgs/Path): Global plan for local planners
-
-Subscribes to:
-    - /{namespace}/odom (Odometry): Robot odometry
-    - /{namespace}/goal_pose (PoseStamped): Goal from RViz 2D Goal Pose
-
-Usage:
-    MAP_YAML=/path/to/map.yaml ros2 run a_star a_star_nav --ros-args -p namespace:=/don
-
-    With custom parameters:
-    MAP_YAML=/path/to/map.yaml ROBOT_RADIUS=0.25 SAFETY_CLEARANCE=0.05 ros2 run a_star a_star_nav --ros-args -p namespace:=/don
-
-Architecture:
-    - Hybrid obstacle checking near start position for escaping tight spaces
-    - Standard inflated grid checking for safety in open areas
-    - Simple proportional controller for robot movement
-    - Path simplification to reduce waypoint count
+Supports standalone mode (plans and drives via cmd_vel) and stacked mode
+(publishes nav_msgs/Path for a downstream local planner). Requires a
+pre-built static map loaded via the MAP_YAML env var.
 """
 
-import sys
-import rclpy
-import rclpy.time
-import rclpy.duration
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from geometry_msgs.msg import TwistStamped, PoseStamped
-from nav_msgs.msg import Odometry, Path
-from tf2_ros import Buffer, TransformListener
-import numpy as np
-import yaml
-from PIL import Image
 import heapq
 import math
 import os
+import sys
 
+import numpy as np
+import yaml
+from PIL import Image
+from scipy.interpolate import CubicSpline
 
-# ============================================================================
-# CONSTANTS
-# ============================================================================
+import rclpy
+import rclpy.duration
+import rclpy.time
+from geometry_msgs.msg import PoseStamped, TwistStamped
+from nav_interfaces.msg import NavStatus
+from nav_interfaces.srv import CancelNav
+from nav_msgs.msg import Odometry, Path
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from tf2_ros import Buffer, TransformListener
+
 
 class NavigatorConstants:
-    """Configuration constants for the A* navigator"""
+    """Default configuration constants for the A* navigator."""
 
-    # Robot Physical Parameters (meters)
-    ROBOT_RADIUS = 0.25      # TurtleBot4 radius
-    SAFETY_CLEARANCE = 0.05     # Additional safety margin
+    ROBOT_RADIUS = 0.25
+    SAFETY_CLEARANCE = 0.05
 
-    # Control Parameters
-    LINEAR_SPEED = 0.2           # Forward speed (m/s)
-    ANGULAR_SPEED = 0.5          # Rotation speed (rad/s)
-    POSITION_TOLERANCE = 0.1     # Waypoint reached threshold (meters)
-    ANGLE_TOLERANCE = 0.1        # Angular alignment threshold (radians)
+    LINEAR_SPEED = 0.2
+    ANGULAR_SPEED = 0.5
+    POSITION_TOLERANCE = 0.1
+    ANGLE_TOLERANCE = 0.1
+    CONTROL_TIMER_PERIOD = 0.1
 
-    # Control Loop
-    CONTROL_TIMER_PERIOD = 0.1   # Control loop frequency (seconds)
+    MAX_PATH_WAYPOINTS = 20
+    TIGHT_SPACE_RADIUS = 5      # grid cells to use original grid near start
+    MAX_SEARCH_NODES = 100000
+    SIMPLIFICATION_EPSILON = 0.1
+    REPLAN_INTERVAL = 5.0
 
-    # Path Planning
-    MAX_PATH_WAYPOINTS = 20      # Maximum waypoints after simplification
-    TIGHT_SPACE_RADIUS = 5       # Grid cells to use original grid near start
-
-    # Default robot namespace — overridden at runtime by 'namespace' ROS param
     DEFAULT_NAMESPACE = '/don'
 
 
-
-# ============================================================================
-# MAIN NAVIGATOR CLASS
-# ============================================================================
-
 class AStarNavigator(Node):
-    """
-    ROS2 node for A* path planning and navigation.
-
-    Implements autonomous navigation using A* pathfinding with hybrid
-    obstacle checking to handle tight spaces while maintaining safety.
-    """
+    """ROS2 node for A* global path planning and waypoint following."""
 
     def __init__(self, robot_radius=None, safety_clearance=None, map_yaml=None, map_pgm=None):
-        """
-        Initialize the A* navigator.
+        """Initialize the A* navigator node.
 
         Args:
-            robot_radius: Robot radius in meters (default from constants or env)
-            safety_clearance: Safety margin in meters (default from constants or env)
-            map_yaml: Path to map YAML file (default from MAP_YAML env var or prompts user)
-            map_pgm: Path to map PGM file (default from MAP_PGM env var or derived from YAML)
+            robot_radius:     Robot footprint radius (m); falls back to ROBOT_RADIUS env var.
+            safety_clearance: Additional inflation beyond radius (m); falls back to SAFETY_CLEARANCE.
+            map_yaml:         Path to map YAML file; falls back to MAP_YAML env var.
+            map_pgm:          Path to map PGM file; derived from map_yaml if not provided.
         """
-        # Read namespace early from sys.argv so TF remapping can be set at node
-        # init time via cli_args. The param is also declared after super().__init__()
-        # so it shows up in `ros2 param list` and can be introspected normally.
+        # Parse namespace from sys.argv before super().__init__() so TF remapping
+        # can be passed via cli_args at construction time.
         _ns = NavigatorConstants.DEFAULT_NAMESPACE
         for i, arg in enumerate(sys.argv):
             if arg.startswith('namespace:='):
@@ -121,263 +81,163 @@ class AStarNavigator(Node):
 
         super().__init__('astar_navigator', cli_args=_combined, use_global_arguments=False)
 
-        # ====================================================================
-        # INITIALIZATION - Namespace (ROS param)
-        # ====================================================================
-
-        # Declare so the param is visible via `ros2 param list`.
-        # The value was already parsed from sys.argv above for TF remapping.
         self.declare_parameter('namespace', NavigatorConstants.DEFAULT_NAMESPACE)
         self.ns = self.get_parameter('namespace').value
 
-        # ====================================================================
-        # INITIALIZATION - Robot Parameters
-        # ====================================================================
+        default_radius = robot_radius if robot_radius is not None else \
+            float(os.getenv('ROBOT_RADIUS', str(NavigatorConstants.ROBOT_RADIUS)))
+        default_clearance = safety_clearance if safety_clearance is not None else \
+            float(os.getenv('SAFETY_CLEARANCE', str(NavigatorConstants.SAFETY_CLEARANCE)))
 
-        # Use provided values, environment variables, or defaults
-        self.robot_radius = robot_radius if robot_radius is not None else \
-                           float(os.getenv('ROBOT_RADIUS', str(NavigatorConstants.ROBOT_RADIUS)))
-        self.safety_clearance = safety_clearance if safety_clearance is not None else \
-                               float(os.getenv('SAFETY_CLEARANCE', str(NavigatorConstants.SAFETY_CLEARANCE)))
+        self.declare_parameter('robot_radius', default_radius)
+        self.declare_parameter('safety_clearance', default_clearance)
+        self.robot_radius = self.get_parameter('robot_radius').value
+        self.safety_clearance = self.get_parameter('safety_clearance').value
 
-        # ====================================================================
-        # INITIALIZATION - ROS2 Publishers and Subscribers
-        # ====================================================================
+        self.declare_parameter('linear_speed', NavigatorConstants.LINEAR_SPEED)
+        self.declare_parameter('angular_speed', NavigatorConstants.ANGULAR_SPEED)
+        self.declare_parameter('position_tolerance', NavigatorConstants.POSITION_TOLERANCE)
+        self.declare_parameter('angle_tolerance', NavigatorConstants.ANGLE_TOLERANCE)
+        self.declare_parameter('max_path_waypoints', NavigatorConstants.MAX_PATH_WAYPOINTS)
+        self.declare_parameter('tight_space_radius', NavigatorConstants.TIGHT_SPACE_RADIUS)
+        self.declare_parameter('max_search_nodes', NavigatorConstants.MAX_SEARCH_NODES)
+        self.declare_parameter('simplification_epsilon', NavigatorConstants.SIMPLIFICATION_EPSILON)
+        self.declare_parameter('replan_interval', NavigatorConstants.REPLAN_INTERVAL)
 
-        # ---- Mode: standalone (drive robot) vs planner-only (publish path) ----
-        # In standalone mode, A* plans AND drives via cmd_vel (original behavior).
-        # In planner-only mode, A* only publishes nav_msgs/Path for a local
-        # planner (e.g. DWA) to follow — mirroring the Nav2 planner/controller split.
+        # standalone: plan + drive via cmd_vel. stacked: publish path only for a local planner.
         self.declare_parameter('stacked', False)
         self.standalone = not self.get_parameter('stacked').value
 
-        # Global plan publisher (nav_msgs/Path) — always active so the path
-        # can be visualized or consumed by a downstream local planner.
-        self.plan_pub = self.create_publisher(
-            Path,
-            self.ns + '/a_star/plan',
-            10
-        )
-
-        # Command velocity publisher (only used in standalone mode)
+        self.plan_pub = self.create_publisher(Path, self.ns + '/a_star/plan', 10)
         self.cmd_vel_pub = self.create_publisher(TwistStamped, self.ns + '/cmd_vel', 10)
 
-        # Odometry subscriber (best-effort QoS to match publisher)
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=10
         )
         self.odom_sub = self.create_subscription(
-            Odometry,
-            self.ns + '/odom',
-            self.odom_callback,
-            qos_profile
-        )
-
-        # Goal pose subscriber (for RViz 2D Goal Pose)
+            Odometry, self.ns + '/odom', self.odom_callback, qos_profile)
         self.goal_sub = self.create_subscription(
-            PoseStamped,
-            self.ns + '/goal_pose',
-            self.goal_callback,
-            10
-        )
+            PoseStamped, self.ns + '/goal_pose', self.goal_callback, 10)
 
-        # TF2 for map frame localization (remapped to namespaced topics via cli_args above)
+        # TF remapped to namespaced topics via cli_args above
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # ====================================================================
-        # INITIALIZATION - Frame tracking
-        # ====================================================================
-
-        # Track which frame is actively being used for pose
-        # A* plans in map frame (static map coordinates = map frame)
         self.active_frame = 'map'
 
-        # ====================================================================
-        # INITIALIZATION - Map Data
-        # ====================================================================
+        self.grid = None
+        self.grid_original = None
+        self.resolution = None
+        self.origin = None
 
-        self.grid = None                # Inflated grid for safety
-        self.grid_original = None       # Original grid before inflation
-        self.resolution = None          # Meters per grid cell
-        self.origin = None              # Map origin [x, y, theta]
+        self.current_pose = None
+        self.path = []
+        self.current_waypoint_idx = 0
+        self.latest_plan_msg = None
 
-        # ====================================================================
-        # INITIALIZATION - Navigation State
-        # ====================================================================
-
-        self.current_pose = None        # Current robot pose {x, y, theta}
-        self.path = []                  # Planned path as list of (x, y) in world coords
-        self.current_waypoint_idx = 0   # Index of current target waypoint
-        self.latest_plan_msg = None     # Cached nav_msgs/Path for republishing
-
-        # ====================================================================
-        # INITIALIZATION - Control Parameters
-        # ====================================================================
-
-        self.linear_speed = NavigatorConstants.LINEAR_SPEED
-        self.angular_speed = NavigatorConstants.ANGULAR_SPEED
-        self.position_tolerance = NavigatorConstants.POSITION_TOLERANCE
-        self.angle_tolerance = NavigatorConstants.ANGLE_TOLERANCE
-
-        # ====================================================================
-        # INITIALIZATION - Distance and Time Tracking
-        # ====================================================================
+        self.linear_speed = self.get_parameter('linear_speed').value
+        self.angular_speed = self.get_parameter('angular_speed').value
+        self.position_tolerance = self.get_parameter('position_tolerance').value
+        self.angle_tolerance = self.get_parameter('angle_tolerance').value
+        self.max_path_waypoints = self.get_parameter('max_path_waypoints').value
+        self.tight_space_radius = self.get_parameter('tight_space_radius').value
+        self.max_search_nodes = self.get_parameter('max_search_nodes').value
+        self.simplification_epsilon = self.get_parameter('simplification_epsilon').value
+        self.replan_interval = self.get_parameter('replan_interval').value
 
         self.start_time = None
-        self.total_distance = 0.0  # Total distance traveled in meters
-        self.last_position = None  # Last position for distance calculation
+        self.total_distance = 0.0
+        self.last_position = None
 
-        # ====================================================================
-        # INITIALIZATION - Control Loop Timer
-        # ====================================================================
+        self._active_goal = None
 
         if self.standalone:
             self.control_timer = self.create_timer(
-                NavigatorConstants.CONTROL_TIMER_PERIOD,
-                self.control_loop
-            )
+                NavigatorConstants.CONTROL_TIMER_PERIOD, self.control_loop)
 
-        # Republish the global plan at 1 Hz so late-joining subscribers
-        # (e.g. DWA starting after A* already planned) can pick it up.
+        # Republish at 1 Hz so late-joining subscribers (e.g. DWA) receive the current plan.
         self.plan_republish_timer = self.create_timer(1.0, self.republish_plan)
 
-        # ====================================================================
-        # INITIALIZATION - Load Map
-        # ====================================================================
+        if self.replan_interval > 0:
+            self.replan_timer = self.create_timer(self.replan_interval, self._replan_callback)
 
-        # Resolve map paths: constructor args > env vars > prompt user
+        self._planner_state = 'idle'
+        self._goal_just_reached = False
+        self.nav_status_pub = self.create_publisher(NavStatus, self.ns + '/a_star/status', 10)
+        self.cancel_srv = self.create_service(
+            CancelNav, self.ns + '/a_star/cancel', self._handle_cancel)
+        self._status_timer = self.create_timer(0.5, self._publish_nav_status)
+
         if map_yaml is None:
             map_yaml = os.getenv('MAP_YAML')
         if map_pgm is None:
             map_pgm = os.getenv('MAP_PGM')
 
         if map_yaml is None:
-            self.get_logger().error(
-                'No map provided. Set MAP_YAML env var or pass --ros-args -p map_yaml:=<path>'
-            )
+            self.get_logger().error('No map provided. Set MAP_YAML env var.')
             raise SystemExit('Map YAML path required. Set MAP_YAML env var.')
 
         map_yaml = os.path.expanduser(map_yaml)
         if map_pgm is None:
-            # Derive PGM path from YAML path (replace .yaml with .pgm)
             map_pgm = map_yaml.rsplit('.', 1)[0] + '.pgm'
         else:
             map_pgm = os.path.expanduser(map_pgm)
 
         self.load_map(map_yaml, map_pgm)
 
-        # ====================================================================
-        # INITIALIZATION - Logging
-        # ====================================================================
-
-        mode_str = 'STANDALONE (plan + drive)' if self.standalone else \
-                   'PLANNER-ONLY (publish path for local planner)'
-        self.get_logger().info('A* Navigator initialized')
-        self.get_logger().info(f'Mode: {mode_str}')
-        self.get_logger().info(f'Robot radius: {self.robot_radius}m, Safety clearance: {self.safety_clearance}m')
-        self.get_logger().info(f'Total obstacle inflation: {self.robot_radius + self.safety_clearance}m')
-        self.get_logger().info(f'Planning frame: {self.active_frame}')
-        self.get_logger().info(f'Namespace: {self.ns}')
-        self.get_logger().info(f'Global plan topic: {self.ns}/a_star/plan')
-
-    # ========================================================================
-    # MAP LOADING AND PROCESSING
-    # ========================================================================
+        mode_str = 'standalone' if self.standalone else 'stacked'
+        self.get_logger().info(
+            f'a_star_navigator initialized | ns={self.ns} mode={mode_str} '
+            f'radius={self.robot_radius}m clearance={self.safety_clearance}m')
 
     def load_map(self, yaml_file, pgm_file):
-        """
-        Load map from YAML and PGM files.
-
-        Loads the static map, applies coordinate transforms to match Gazebo,
-        and inflates obstacles by robot radius + safety clearance.
+        """Load static map from YAML and PGM, then inflate obstacles.
 
         Args:
-            yaml_file: Path to map metadata YAML file
-            pgm_file: Path to map image PGM file
+            yaml_file: Path to map YAML metadata file.
+            pgm_file:  Path to map PGM image file.
+
+        Changes:
+            self.grid, self.grid_original, self.resolution, self.origin
         """
         try:
-            # Load map metadata
             with open(yaml_file, 'r') as f:
                 map_data = yaml.safe_load(f)
 
             self.resolution = map_data['resolution']
             self.origin = map_data['origin']
 
-            # Load map image
             img = Image.open(pgm_file)
             occupancy_grid = np.array(img)
 
-            # Convert to binary: 0=free, 1=occupied
-            # PGM: 255=free, <250=occupied/unknown
             self.grid = np.zeros_like(occupancy_grid)
-            self.grid[occupancy_grid < 250] = 1  # Occupied/unknown
-            self.grid[occupancy_grid >= 250] = 0  # Free space
-
-            # Flip map vertically to match Gazebo coordinate system
+            self.grid[occupancy_grid < 250] = 1
+            self.grid[occupancy_grid >= 250] = 0
             self.grid = np.flipud(self.grid)
-
-            # Store original grid before inflation
             self.grid_original = self.grid.copy()
 
-            # Inflate obstacles for robot safety
             total_inflation = self.robot_radius + self.safety_clearance
             self.inflate_obstacles(total_inflation)
 
-            # Log map information
-            self.get_logger().info(f'Map loaded: {self.grid.shape}, resolution: {self.resolution}')
-            self.get_logger().info(f'Map origin: {self.origin}')
             self.get_logger().info(
-                f'Obstacles inflated by {total_inflation}m ({int(total_inflation/self.resolution)} pixels)'
-            )
-
-            # Log map bounds
-            map_width = self.grid.shape[1] * self.resolution
-            map_height = self.grid.shape[0] * self.resolution
-            self.get_logger().info(
-                f'Map bounds: X=[{self.origin[0]:.2f}, {self.origin[0]+map_width:.2f}], '
-                f'Y=[{self.origin[1]:.2f}, {self.origin[1]+map_height:.2f}]'
-            )
+                f'Map loaded: {self.grid.shape} res={self.resolution}m '
+                f'inflation={total_inflation:.2f}m')
         except Exception as e:
             self.get_logger().error(f'Failed to load map: {e}')
 
     def inflate_obstacles(self, inflation_radius):
-        """
-        Inflate obstacles by specified radius using morphological dilation.
-
-        Creates a safety buffer around all obstacles equal to robot_radius +
-        safety_clearance. This ensures the robot's center can safely follow
-        paths without collision.
-
-        Args:
-            inflation_radius: Inflation distance in meters
-        """
+        """Inflate obstacles by inflation_radius using morphological dilation."""
         from scipy.ndimage import binary_dilation
 
-        # Convert radius to pixels
         radius_pixels = int(inflation_radius / self.resolution)
         kernel_size = 2 * radius_pixels + 1
         kernel = np.ones((kernel_size, kernel_size))
-
-        # Apply dilation to original grid
         self.grid = binary_dilation(self.grid_original, kernel).astype(int)
 
-    # ========================================================================
-    # ODOMETRY CALLBACK
-    # ========================================================================
-
     def odom_callback(self, msg):
-        """
-        Update current robot pose from odometry.
-
-        Extracts position and orientation from odometry message and
-        updates internal state for navigation control.
-
-        Args:
-            msg: Odometry message from /{namespace}/odom
-        """
+        """Update current pose from odometry."""
         self.current_pose = {
             'x': msg.pose.pose.position.x,
             'y': msg.pose.pose.position.y,
@@ -385,38 +245,21 @@ class AStarNavigator(Node):
         }
 
     def goal_callback(self, msg):
-        """
-        Handle goal pose from RViz 2D Goal Pose tool.
-        
-        Automatically plans and starts navigation to the received goal.
-        Uses current TF2 position as start.
-        
-        Args:
-            msg: PoseStamped message from goal_pose topic
-        """
+        """Handle goal pose from RViz 2D Goal Pose tool and start navigation."""
         goal_x = msg.pose.position.x
         goal_y = msg.pose.position.y
         self.get_logger().info(f'Received goal from RViz: ({goal_x:.2f}, {goal_y:.2f})')
-        
-        # Get current position from TF2 (map frame)
+
         start_pose = self.get_robot_pose_map_frame()
         if start_pose is None:
             self.get_logger().error('Cannot get robot position from TF2. Is localization running?')
             return
-        
+
         start_x, start_y, _ = start_pose
-        self.get_logger().info(f'Current position (map frame): ({start_x:.2f}, {start_y:.2f})')
-        
-        # Plan and start navigation
         self.navigate_to_goal(start_x, start_y, goal_x, goal_y)
 
     def get_robot_pose_map_frame(self):
-        """
-        Get robot pose from TF2 map->base_link transform.
-        
-        Returns:
-            tuple: (x, y, theta) in map frame, or None if transform unavailable
-        """
+        """Return (x, y, theta) in map frame from TF2 map->base_link, or None."""
         try:
             transform = self.tf_buffer.lookup_transform(
                 'map',
@@ -429,65 +272,56 @@ class AStarNavigator(Node):
             q = transform.transform.rotation
             theta = self.quaternion_to_yaw(q)
             return (x, y, theta)
-        except Exception as e:
+        except Exception:
             return None
 
-    # ========================================================================
-    # NAVIGATION INTERFACE
-    # ========================================================================
-
     def navigate_to_goal(self, start_x, start_y, goal_x, goal_y):
-        """
-        Plan path and start navigation from start to goal.
+        """Plan path from start to goal and begin navigation.
 
-        In standalone mode, plans a path AND drives the robot via cmd_vel.
-        In planner-only mode, plans a path and publishes it as nav_msgs/Path
-        for a downstream local planner (e.g. DWA) to follow.
+        In standalone mode, drives via cmd_vel. In planner-only mode, publishes
+        nav_msgs/Path for a downstream local planner to follow.
 
         Args:
-            start_x: Start X coordinate in world frame (meters)
-            start_y: Start Y coordinate in world frame (meters)
-            goal_x: Goal X coordinate in world frame (meters)
-            goal_y: Goal Y coordinate in world frame (meters)
+            start_x: Start X in world frame (m).
+            start_y: Start Y in world frame (m).
+            goal_x:  Goal X in world frame (m).
+            goal_y:  Goal Y in world frame (m).
 
         Returns:
-            bool: True if path found and navigation started, False otherwise
+            True if a path was found and navigation started, False otherwise.
+
+        Changes:
+            self.path, self._active_goal, self._planner_state, self.start_time,
+            self.total_distance, self.last_position, self.current_waypoint_idx
         """
         self.get_logger().info(
             f'Planning path from ({start_x:.2f}, {start_y:.2f}) to ({goal_x:.2f}, {goal_y:.2f})'
         )
 
-        # Plan path using A*
+        self._active_goal = (goal_x, goal_y)
+        self._planner_state = 'planning'
+        self._goal_just_reached = False
+
         self.path = self.plan_path(start_x, start_y, goal_x, goal_y)
 
         if self.path:
             self.current_waypoint_idx = 0
-            # Initialize distance and time tracking
             self.start_time = self.get_clock().now()
             self.total_distance = 0.0
             self.last_position = (start_x, start_y)
-            self.get_logger().info(f'✓ Path found with {len(self.path)} waypoints')
-            self.get_logger().info('Started tracking distance and time')
+            self.get_logger().info(f'Path found with {len(self.path)} waypoints')
+            self._planner_state = 'ready'
             self.print_path()
             self.publish_global_plan()
             return True
         else:
             self.get_logger().error('No path found! Check if start/goal are valid and reachable')
             self.latest_plan_msg = None
+            self._planner_state = 'idle'
             return False
 
-    # ========================================================================
-    # GLOBAL PLAN PUBLISHING (for stacked planner/controller architecture)
-    # ========================================================================
-
     def publish_global_plan(self):
-        """
-        Publish the current path as a nav_msgs/Path message.
-
-        Follows the Nav2 convention: the global planner publishes a Path in
-        the 'map' frame. A downstream local planner (e.g. DWA) subscribes
-        and tracks the path while handling reactive obstacle avoidance.
-        """
+        """Build and publish the current path as nav_msgs/Path."""
         if not self.path:
             return
 
@@ -512,120 +346,149 @@ class AStarNavigator(Node):
         self.latest_plan_msg = path_msg
         self.plan_pub.publish(path_msg)
         self.get_logger().info(
-            f'Published global plan ({len(path_msg.poses)} poses) on '
-            f'{self.ns}/a_star/plan'
+            f'Published global plan ({len(path_msg.poses)} poses) on {self.ns}/a_star/plan'
         )
 
     def republish_plan(self):
-        """
-        Periodically republish the latest plan so late-joining subscribers
-        (e.g. DWA node started after A* already planned) receive it.
-        """
+        """Periodically republish the latest plan so late-joining subscribers receive it."""
         if self.latest_plan_msg is not None:
             self.latest_plan_msg.header.stamp = self.get_clock().now().to_msg()
             self.plan_pub.publish(self.latest_plan_msg)
 
-    # ========================================================================
-    # PATH PLANNING
-    # ========================================================================
+    def _handle_cancel(self, request, response):
+        """CancelNav service handler -- stop planning and driving."""
+        self.get_logger().info('Cancel requested via service')
+        self._active_goal = None
+        self.path = []
+        self.current_waypoint_idx = 0
+        self._planner_state = 'idle'
+        empty_path = Path()
+        empty_path.header.stamp = self.get_clock().now().to_msg()
+        empty_path.header.frame_id = 'map'
+        self.plan_pub.publish(empty_path)
+        self.latest_plan_msg = None
+        if self.standalone:
+            self.stop_robot()
+        response.confirmed = True
+        return response
+
+    def _publish_nav_status(self):
+        """Publish NavStatus at 2 Hz for the navigation server to consume."""
+        msg = NavStatus()
+        msg.nav_state = self._planner_state
+        msg.has_active_goal = self._active_goal is not None
+        msg.distance_traveled = self.total_distance
+
+        if self.start_time is not None:
+            msg.elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+        else:
+            msg.elapsed_time = 0.0
+
+        pose = self.get_robot_pose_map_frame()
+        if pose is not None:
+            msg.current_x = pose[0]
+            msg.current_y = pose[1]
+            if self._active_goal is not None:
+                dx = self._active_goal[0] - pose[0]
+                dy = self._active_goal[1] - pose[1]
+                msg.distance_to_goal = math.sqrt(dx**2 + dy**2)
+            else:
+                msg.distance_to_goal = -1.0
+        else:
+            msg.current_x = 0.0
+            msg.current_y = 0.0
+            msg.distance_to_goal = -1.0
+
+        msg.goal_reached = self._goal_just_reached
+        self.nav_status_pub.publish(msg)
+
+    def _replan_callback(self):
+        """Periodically replan from current TF2 position to the active goal."""
+        if self._active_goal is None or not self.path:
+            return
+
+        start_pose = self.get_robot_pose_map_frame()
+        if start_pose is None:
+            return
+
+        start_x, start_y, _ = start_pose
+        goal_x, goal_y = self._active_goal
+
+        dist = math.sqrt((goal_x - start_x)**2 + (goal_y - start_y)**2)
+        if dist < self.position_tolerance * 2:
+            return
+
+        self.get_logger().info(
+            f'Replanning from ({start_x:.2f}, {start_y:.2f}) to ({goal_x:.2f}, {goal_y:.2f})')
+        new_path = self.plan_path(start_x, start_y, goal_x, goal_y)
+        if new_path:
+            self.path = new_path
+            self.current_waypoint_idx = 0
+            self.publish_global_plan()
 
     def plan_path(self, start_x, start_y, goal_x, goal_y):
-        """
-        Plan path from start to goal using A*.
-
-        Converts world coordinates to grid coordinates, validates positions,
-        runs A* pathfinding, and converts result back to world coordinates.
+        """Validate positions, run A*, and return a simplified world-coordinate path.
 
         Args:
-            start_x: Start X in world frame (meters)
-            start_y: Start Y in world frame (meters)
-            goal_x: Goal X in world frame (meters)
-            goal_y: Goal Y in world frame (meters)
+            start_x: Start X in world frame (m).
+            start_y: Start Y in world frame (m).
+            goal_x:  Goal X in world frame (m).
+            goal_y:  Goal Y in world frame (m).
 
         Returns:
-            list: Path as list of (x, y) tuples in world coordinates, or empty if no path
+            List of (x, y) tuples in world coordinates, or [] if no path found.
         """
-        # Convert to grid coordinates
         start_grid = self.world_to_grid(start_x, start_y)
         goal_grid = self.world_to_grid(goal_x, goal_y)
 
         self.get_logger().info(f'Grid coordinates: Start {start_grid}, Goal {goal_grid}')
 
-        # Verify conversion is reversible (debug)
-        start_world_check = self.grid_to_world(start_grid[0], start_grid[1])
-        goal_world_check = self.grid_to_world(goal_grid[0], goal_grid[1])
-        self.get_logger().info(
-            f'World coords check: Start ({start_world_check[0]:.2f}, {start_world_check[1]:.2f}), '
-            f'Goal ({goal_world_check[0]:.2f}, {goal_world_check[1]:.2f})'
-        )
-
-        # Validate start position in original grid (robot is already there)
         if not self.is_valid_in_original_grid(start_grid):
             self.get_logger().error(
-                f'Start position ({start_x:.2f}, {start_y:.2f}) is invalid or in actual obstacle!'
-            )
+                f'Start position ({start_x:.2f}, {start_y:.2f}) is in an obstacle.')
             return []
 
-        # Validate goal position in inflated grid (for safety)
         if not self.is_valid(goal_grid):
             self.get_logger().error(
-                f'Goal position ({goal_x:.2f}, {goal_y:.2f}) is invalid or too close to obstacles!'
-            )
+                f'Goal position ({goal_x:.2f}, {goal_y:.2f}) is invalid or too close to obstacles.')
             return []
 
-        # Check connectivity from start (debug)
         neighbors_valid = sum(
             1 for dx, dy in [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]
             if self.is_valid((start_grid[0] + dx, start_grid[1] + dy))
         )
-        self.get_logger().info(f'Start has {neighbors_valid}/8 valid neighbors in inflated grid')
 
         if neighbors_valid == 0:
-            self.get_logger().warn('Start position is surrounded by inflated obstacles!')
             self.get_logger().warn(
-                f'Consider reducing safety_clearance (current: {self.safety_clearance}m) '
-                f'or robot_radius (current: {self.robot_radius}m)'
-            )
-            self.get_logger().warn(f'Current total inflation: {self.robot_radius + self.safety_clearance}m')
+                f'Start surrounded by inflated obstacles. '
+                f'Consider reducing robot_radius ({self.robot_radius}m) '
+                f'or safety_clearance ({self.safety_clearance}m).')
 
-        # Run A* pathfinding
-        self.get_logger().info('Running A* pathfinding...')
         path_grid = self.astar(start_grid, goal_grid)
 
         if not path_grid:
             return []
 
-        #use 50 waypoints in stacked, otherwise use default for A*
         path_world = [self.grid_to_world(gx, gy) for gx, gy in path_grid]
         if not self.standalone:
-            max_wps = 50
-            simplified_path = self.simplify_path(path_world, max_points=max_wps)
+            simplified_path = self.simplify_path(path_world, max_points=50)
         else:
             simplified_path = self.simplify_path(path_world)
         return simplified_path
 
     def astar(self, start, goal):
-        """
-        A* pathfinding algorithm with hybrid obstacle checking.
-
-        Uses original grid near start position (tight spaces) and inflated
-        grid far from start (safety). This allows the robot to escape from
-        tight spaces while maintaining safety margins in open areas.
+        """A* search with hybrid obstacle checking (original grid near start, inflated elsewhere).
 
         Args:
-            start: Start position as (grid_x, grid_y)
-            goal: Goal position as (grid_x, grid_y)
+            start: (grid_x, grid_y) start cell.
+            goal:  (grid_x, grid_y) goal cell.
 
         Returns:
-            list: Path as list of (grid_x, grid_y) tuples, or empty list if no path
+            List of (grid_x, grid_y) tuples from start to goal, or [] if unreachable.
         """
-        # Heuristic: Euclidean distance
         def heuristic(a, b):
             return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
 
-        rows, cols = self.grid.shape
-
-        # Initialize A* data structures
         open_set = []
         heapq.heappush(open_set, (0, start))
         came_from = {}
@@ -633,255 +496,236 @@ class AStarNavigator(Node):
         f_score = {start: heuristic(start, goal)}
         nodes_explored = 0
 
-        # A* main loop
         while open_set:
             _, current = heapq.heappop(open_set)
             nodes_explored += 1
 
-            # Check if reached goal
+            if nodes_explored >= self.max_search_nodes:
+                self.get_logger().error(
+                    f'A* exceeded {self.max_search_nodes} nodes -- goal may be unreachable.')
+                return []
+
             if current == goal:
-                # Reconstruct path
                 path = []
                 while current in came_from:
                     path.append(current)
                     current = came_from[current]
                 path.append(start)
-                self.get_logger().info(f'A* explored {nodes_explored} nodes')
-                return path[::-1]  # Reverse to get start->goal order
+                self.get_logger().info(f'A* found path, explored {nodes_explored} nodes')
+                return path[::-1]
 
-            # Explore 8-connected neighbors
             for dx, dy in [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]:
                 neighbor = (current[0] + dx, current[1] + dy)
 
-                # HYBRID VALIDATION: Use original grid near start (tight spaces)
-                # and inflated grid far from start (safety)
                 distance_from_start = abs(neighbor[0] - start[0]) + abs(neighbor[1] - start[1])
-
-                if distance_from_start <= NavigatorConstants.TIGHT_SPACE_RADIUS:
-                    # Close to start - use original grid to escape tight spaces
+                if distance_from_start <= self.tight_space_radius:
+                    # close to start -- use original grid to escape tight spaces
                     if not self.is_valid_in_original_grid(neighbor):
                         continue
                 else:
-                    # Far from start - use inflated grid for safety
+                    # farther out -- use inflated grid for safety
                     if not self.is_valid(neighbor):
                         continue
 
-                # Diagonal moves cost sqrt(2) ≈ 1.414
-                move_cost = 1.414 if dx != 0 and dy != 0 else 1.0
+                move_cost = 1.414 if dx != 0 and dy != 0 else 1.0  # diagonal = sqrt(2)
                 tentative_g = g_score[current] + move_cost
 
-                # Update if better path found
                 if neighbor not in g_score or tentative_g < g_score[neighbor]:
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g
                     f_score[neighbor] = tentative_g + heuristic(neighbor, goal)
                     heapq.heappush(open_set, (f_score[neighbor], neighbor))
 
-        # No path found
         self.get_logger().error(f'A* failed after exploring {nodes_explored} nodes')
         return []
 
-    # ========================================================================
-    # GRID VALIDATION
-    # ========================================================================
-
     def is_valid(self, grid_pos):
-        """
-        Check if grid position is valid and free in inflated grid.
-
-        Args:
-            grid_pos: Tuple (grid_x, grid_y) to check
-
-        Returns:
-            bool: True if position is valid and free, False otherwise
-        """
+        """Return True if grid_pos is in-bounds and free in the inflated grid."""
         gx, gy = grid_pos
         rows, cols = self.grid.shape
-
-        # Check bounds
         if gx < 0 or gx >= cols or gy < 0 or gy >= rows:
             return False
-
-        # Check if free (0 = free, 1 = occupied)
-        return self.grid[gy, gx] == 0  # Note: grid is [row, col] = [y, x]
+        return self.grid[gy, gx] == 0
 
     def is_valid_in_original_grid(self, grid_pos):
-        """
-        Check if grid position is valid and free in original grid (before inflation).
-
-        Used for checking positions near the start to allow escape from tight spaces.
-
-        Args:
-            grid_pos: Tuple (grid_x, grid_y) to check
-
-        Returns:
-            bool: True if position is valid and free, False otherwise
-        """
+        """Return True if grid_pos is in-bounds and free in the original (uninflated) grid."""
         gx, gy = grid_pos
         rows, cols = self.grid_original.shape
-
-        # Check bounds
         if gx < 0 or gx >= cols or gy < 0 or gy >= rows:
             return False
-
-        # Check if free (0 = free, 1 = occupied)
-        return self.grid_original[gy, gx] == 0  # Note: grid is [row, col] = [y, x]
-
-    # ========================================================================
-    # COORDINATE CONVERSION
-    # ========================================================================
+        return self.grid_original[gy, gx] == 0
 
     def world_to_grid(self, x, y):
-        """
-        Convert world coordinates (meters) to grid indices (cells).
-
-        Args:
-            x: X coordinate in world frame (meters)
-            y: Y coordinate in world frame (meters)
-
-        Returns:
-            tuple: (grid_x, grid_y) in grid cell coordinates
-        """
+        """Convert world coordinates in meters to grid cell indices."""
         grid_x = int((x - self.origin[0]) / self.resolution)
         grid_y = int((y - self.origin[1]) / self.resolution)
         return (grid_x, grid_y)
 
     def grid_to_world(self, grid_x, grid_y):
-        """
-        Convert grid indices (cells) to world coordinates (meters).
-
-        Args:
-            grid_x: X index in grid coordinates
-            grid_y: Y index in grid coordinates
-
-        Returns:
-            tuple: (x, y) in world frame (meters)
-        """
+        """Convert grid cell indices to world coordinates in meters."""
         x = grid_x * self.resolution + self.origin[0]
         y = grid_y * self.resolution + self.origin[1]
         return (x, y)
 
-    # ========================================================================
-    # PATH MANAGEMENT
-    # ========================================================================
-
     def simplify_path(self, path, max_points=None):
-        """
-        Simplify path by keeping only key waypoints.
-
-        Reduces the number of waypoints to improve navigation smoothness
-        while maintaining the overall path shape.
+        """Simplify path with Ramer-Douglas-Peucker, then smooth with cubic spline.
 
         Args:
-            path: List of (x, y) tuples in world coordinates
-            max_points: Maximum waypoints to keep (default from constants)
+            path:       List of (x, y) tuples in world coordinates.
+            max_points: Max waypoints in output (default: self.max_path_waypoints).
 
         Returns:
-            list: Simplified path as list of (x, y) tuples
+            Simplified and smoothed list of (x, y) tuples.
         """
         if max_points is None:
-            max_points = NavigatorConstants.MAX_PATH_WAYPOINTS
+            max_points = self.max_path_waypoints
 
-        if len(path) <= max_points:
+        if len(path) <= 2:
             return path
 
-        # Downsample to max_points waypoints
-        step = len(path) // max_points
-        simplified = [path[i] for i in range(0, len(path), step)]
-        simplified.append(path[-1])  # Always include goal
-        return simplified
+        rdp_path = self._rdp(path, self.simplification_epsilon)
+
+        if len(rdp_path) >= 4:
+            smoothed = self._smooth_path(rdp_path, max_points)
+        else:
+            smoothed = rdp_path
+
+        smoothed[0] = path[0]
+        smoothed[-1] = path[-1]
+        return smoothed
+
+    @staticmethod
+    def _rdp(points, epsilon):
+        """Ramer-Douglas-Peucker line simplification.
+
+        Recursively removes points that deviate less than epsilon from the line
+        between the current endpoints.
+        """
+        if len(points) <= 2:
+            return list(points)
+
+        start = np.array(points[0])
+        end = np.array(points[-1])
+        line_vec = end - start
+        line_len = np.linalg.norm(line_vec)
+
+        if line_len < 1e-10:
+            return [points[0], points[-1]]
+
+        line_unit = line_vec / line_len
+        max_dist = 0.0
+        max_idx = 0
+
+        for i in range(1, len(points) - 1):
+            pt = np.array(points[i])
+            proj = np.dot(pt - start, line_unit)
+            proj = np.clip(proj, 0, line_len)
+            closest = start + proj * line_unit
+            dist = np.linalg.norm(pt - closest)
+            if dist > max_dist:
+                max_dist = dist
+                max_idx = i
+
+        if max_dist > epsilon:
+            left = AStarNavigator._rdp(points[:max_idx + 1], epsilon)
+            right = AStarNavigator._rdp(points[max_idx:], epsilon)
+            return left[:-1] + right
+        else:
+            return [points[0], points[-1]]
+
+    @staticmethod
+    def _smooth_path(waypoints, max_points):
+        """Smooth waypoints with cubic spline interpolation.
+
+        Fits a parametric spline through the waypoints and resamples at even
+        intervals to remove grid-aligned staircase artifacts.
+        """
+        pts = np.array(waypoints)
+        diffs = np.diff(pts, axis=0)
+        chord_lengths = np.sqrt(np.sum(diffs**2, axis=1))
+        t = np.concatenate([[0], np.cumsum(chord_lengths)])
+        total_length = t[-1]
+
+        if total_length < 1e-10:
+            return list(waypoints)
+
+        cs_x = CubicSpline(t, pts[:, 0])
+        cs_y = CubicSpline(t, pts[:, 1])
+
+        n_out = min(max_points, max(len(waypoints), 10))
+        t_new = np.linspace(0, total_length, n_out)
+        x_new = cs_x(t_new)
+        y_new = cs_y(t_new)
+
+        return list(zip(x_new.tolist(), y_new.tolist()))
 
     def print_path(self):
-        """Print the planned path waypoints to logger."""
+        """Log the planned path waypoints."""
         self.get_logger().info('Planned waypoints:')
         for i, (x, y) in enumerate(self.path):
             self.get_logger().info(f'  {i+1}. ({x:.2f}, {y:.2f})')
 
-    # ========================================================================
-    # ROBOT CONTROL
-    # ========================================================================
-
     def control_loop(self):
-        """
-        Main control loop for waypoint following.
-
-        Called periodically by ROS2 timer. Implements simple proportional
-        control to follow waypoints: rotate towards target, then drive forward.
-        """
-        # Check if navigation active
+        """Waypoint-following control loop, called at 10 Hz."""
         if not self.path or self.current_pose is None:
             return
 
-        # Update distance traveled
         if self.last_position is not None:
             current_x = self.current_pose['x']
             current_y = self.current_pose['y']
             dx = current_x - self.last_position[0]
             dy = current_y - self.last_position[1]
-            distance_increment = math.sqrt(dx**2 + dy**2)
-            self.total_distance += distance_increment
+            self.total_distance += math.sqrt(dx**2 + dy**2)
             self.last_position = (current_x, current_y)
 
-        # Check if goal reached
         if self.current_waypoint_idx >= len(self.path):
             self.stop_robot()
-            # Calculate elapsed time
             if self.start_time is not None:
-                elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
-                self.get_logger().info('🎯 Goal reached!')
-                self.get_logger().info(f'Total distance traveled: {self.total_distance:.2f} meters')
-                self.get_logger().info(f'Total time elapsed: {elapsed_time:.2f} seconds')
+                elapsed = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+                self.get_logger().info(
+                    f'Goal reached | dist={self.total_distance:.2f}m time={elapsed:.2f}s')
             else:
-                self.get_logger().info('🎯 Goal reached!')
+                self.get_logger().info('Goal reached')
             self.path = []
+            self._active_goal = None
+            self._planner_state = 'idle'
+            self._goal_just_reached = True
             return
 
-        # Get current target waypoint
         target = self.path[self.current_waypoint_idx]
         tx, ty = target
 
-        # Get pose from TF2 (map frame) — path is planned in map frame,
-        # so odom fallback would cause drift-induced navigation errors.
+        # Path is planned in map frame -- odom fallback would cause drift-induced errors.
         map_pose = self.get_robot_pose_map_frame()
         if map_pose is not None:
             curr_x, curr_y, curr_theta = map_pose
             self.active_frame = 'map'
         else:
             self.get_logger().warn(
-                'TF2 map->base_link unavailable. Stopping until localization recovers. '
-                'Is AMCL running? Check TF remapping for namespace.'
-            )
+                'TF2 map->base_link unavailable -- stopping until localization recovers.')
             self.stop_robot()
             return
 
-        # Calculate distance and angle to target
         dx = tx - curr_x
         dy = ty - curr_y
         distance = math.sqrt(dx**2 + dy**2)
         target_angle = math.atan2(dy, dx)
         angle_diff = self.normalize_angle(target_angle - curr_theta)
 
-        # Create velocity command (TwistStamped for Jazzy, Twist for Humble)
         cmd = TwistStamped()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.header.frame_id = 'base_link'
 
-        # Check if waypoint reached
         if distance < self.position_tolerance:
             self.current_waypoint_idx += 1
             self.get_logger().info(
-                f'Waypoint {self.current_waypoint_idx}/{len(self.path)} reached'
-            )
+                f'Waypoint {self.current_waypoint_idx}/{len(self.path)} reached')
             return
 
-        # Simple proportional control:
-        # 1. Rotate towards target if not aligned
         if abs(angle_diff) > self.angle_tolerance:
             cmd.twist.angular.z = self.angular_speed if angle_diff > 0 else -self.angular_speed
         else:
-            # 2. Drive forward once aligned
             cmd.twist.linear.x = min(self.linear_speed, distance)
-            # Small angular correction while moving
             cmd.twist.angular.z = 0.3 * angle_diff
 
         self.cmd_vel_pub.publish(cmd)
@@ -891,86 +735,40 @@ class AStarNavigator(Node):
         cmd = TwistStamped()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.header.frame_id = 'base_link'
-        # cmd.twist is already zeros by default
         self.cmd_vel_pub.publish(cmd)
 
     def get_current_position(self):
-        """
-        Get the current robot position from odometry.
-
-        Returns:
-            tuple: (x, y) position in world frame, or None if no odometry data
-        """
+        """Return current (x, y) from odometry, or None if unavailable."""
         if self.current_pose is None:
             self.get_logger().warn('No odometry data available yet')
             return None
         return (self.current_pose['x'], self.current_pose['y'])
 
-    # ========================================================================
-    # UTILITY METHODS
-    # ========================================================================
-
     @staticmethod
     def quaternion_to_yaw(q):
-        """
-        Convert quaternion to yaw angle.
-
-        Args:
-            q: Quaternion with w, x, y, z components
-
-        Returns:
-            float: Yaw angle in radians
-        """
+        """Extract yaw angle from a quaternion."""
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         return math.atan2(siny_cosp, cosy_cosp)
 
     @staticmethod
     def normalize_angle(angle):
-        """
-        Normalize angle to [-pi, pi] range.
+        """Normalize angle to [-pi, pi] range."""
+        return (angle + math.pi) % (2 * math.pi) - math.pi
 
-        Args:
-            angle: Angle in radians
-
-        Returns:
-            float: Normalized angle in [-pi, pi]
-        """
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
-
-
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
 
 def main(args=None):
-    """
-    Main entry point for the A* navigator.
+    """Entry point: read env vars, create navigator node, spin.
 
-    Initializes ROS2, creates the navigator node, and spins waiting for goals.
-    Goals are received via the goal_pose topic (use RViz 2D Goal Pose tool).
-
-    Configuration:
-        ROS params (--ros-args -p key:=value):
-            namespace:    Robot namespace (default '/don')
-            stacked:      Planner-only mode, no cmd_vel (default False)
-        Environment variables:
-            ROBOT_RADIUS:     Robot radius in meters (default 0.25)
-            SAFETY_CLEARANCE: Safety margin in meters (default 0.05)
-            MAP_YAML:         Path to map YAML file (required)
-            MAP_PGM:          Path to map PGM file (derived from MAP_YAML if not set)
+    Requires MAP_YAML env var pointing to the map YAML file.
+    MAP_PGM defaults to the same path with .pgm extension.
+    ROBOT_RADIUS and SAFETY_CLEARANCE fall back to NavigatorConstants.
     """
-    # Get parameters from environment or use defaults
     robot_radius = float(os.getenv('ROBOT_RADIUS', str(NavigatorConstants.ROBOT_RADIUS)))
     safety_clearance = float(os.getenv('SAFETY_CLEARANCE', str(NavigatorConstants.SAFETY_CLEARANCE)))
     map_yaml = os.getenv('MAP_YAML')
     map_pgm = os.getenv('MAP_PGM')
 
-    # Initialize ROS2
     rclpy.init(args=args)
     navigator = AStarNavigator(
         robot_radius=robot_radius,
@@ -979,43 +777,15 @@ def main(args=None):
         map_pgm=map_pgm,
     )
 
-    # Print usage information
-    standalone = navigator.standalone
-    mode_label = 'STANDALONE' if standalone else 'PLANNER-ONLY (stacked)'
-    print("\n" + "="*60)
-    print("TurtleBot4 A* Navigator (with AMCL/TF2 Localization)")
-    print("="*60)
-    print(f"\nMode: {mode_label}  (set via --ros-args -p stacked:=true)")
-    print(f"\nRobot Configuration:")
-    print(f"  Robot radius: {robot_radius}m (set via ROBOT_RADIUS env var)")
-    print(f"  Safety clearance: {safety_clearance}m (set via SAFETY_CLEARANCE env var)")
-    print(f"  Total inflation: {robot_radius + safety_clearance}m")
-    if standalone:
-        print("\nWaiting for goals via RViz 2D Goal Pose tool...")
-        print("  1. Set initial pose using '2D Pose Estimate' in RViz")
-        print("  2. Click '2D Goal Pose' and click on the map to send goals")
-        print("  3. Robot will navigate to goal, then wait for next goal")
-    else:
-        print(f"\nPublishing global plan on: {navigator.ns}/a_star/plan")
-        print("  1. Set initial pose using '2D Pose Estimate' in RViz")
-        print("  2. Click '2D Goal Pose' to send goals")
-        print("  3. A* publishes the path — start your local planner (e.g. DWA)")
-        print("     to subscribe and drive the robot")
-    print("\nPress Ctrl+C to stop.")
-    print("="*60 + "\n")
-
-    # Spin and wait for goals (event-driven)
     try:
         rclpy.spin(navigator)
     except KeyboardInterrupt:
-        print("\nStopping navigation...")
-
-    # Cleanup
-    navigator.stop_robot()
-    navigator.destroy_node()
-    rclpy.shutdown()
+        pass
+    finally:
+        navigator.stop_robot()
+        navigator.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
     main()
-    
