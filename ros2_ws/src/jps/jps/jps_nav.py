@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Originally authored by the 2025 Carleton Senior Capstone Project
+# (see AUTHORS.md). Substantially rewritten by Daniel Scheider, 2026.
 """JPS global path planner for ROS2 with hybrid obstacle checking.
 
 Supports standalone mode (plans and drives via cmd_vel) and stacked mode
