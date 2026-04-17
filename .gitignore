@@ -10,3 +10,7 @@
 **/build/
 **/install/
 **/log/
+
+# Python bytecode caches
+**/__pycache__/
+*.pyc
