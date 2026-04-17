@@ -1,0 +1,5 @@
+# Navigation server parameters
+navigation_server:
+  ros__parameters:
+    namespace: /don
+    navigation_timeout: 300.0  # seconds (0 = no timeout)
