@@ -15,8 +15,8 @@ setup(
     zip_safe=True,
     maintainer='devin',
     maintainer_email='devin@todo.todo',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='D* Lite incremental pathfinding with dynamic replanning for TurtleBot4 navigation',
+    license='',
     extras_require={
         'test': [
             'pytest',
@@ -25,8 +25,6 @@ setup(
     entry_points={
         'console_scripts': [
             'd_star_nav = d_star.d_star_nav:main',
-            'odom = d_star.odom_subscriber:main',
-            'visualizer = d_star.visualizer:main',
             'live_visualizer = d_star.live_visualizer:main',
         ],
     },

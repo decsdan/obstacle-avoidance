@@ -1,205 +1,95 @@
 #!/usr/bin/env python3
-"""
-D* Lite Navigator with Dynamic Replanning for ROS2 TurtleBot4
+# Originally authored by Devin Dennis as part of the 2025 Carleton Senior
+# Capstone Project (see AUTHORS.md). Updated by Daniel Scheider, 2026.
+"""D* Lite incremental global path planner for ROS2 with dynamic replanning.
 
-This module implements a complete navigation system using D* Lite pathfinding
-algorithm with dynamic replanning capabilities. It integrates with SLAM for
-persistent obstacle tracking and Nav2 local costmap for real-time obstacle
-detection with automatic clearing.
-
-Key Features:
-    - D* Lite incremental pathfinding (efficient replanning)
-    - SLAM integration for persistent obstacle tracking
-    - Nav2 local costmap integration for dynamic obstacle detection and clearing
-    - Optimistic planning mode for exploration
-    - Obstacle inflation for safety margins
-
-Architecture:
-    - DStarLite: Core pathfinding algorithm
-    - DStarNavigator: ROS2 node integrating planning, sensing, and control
-
-Grid Hierarchy:
-    - grid_original: Raw SLAM map (no inflation)
-    - grid: Inflated SLAM map (obstacles + safety buffer)
-    - grid_base: Accumulated SLAM obstacles (persistent)
-    - grid_dynamic: Current planning grid (updated by SLAM and local costmap)
-
-Authors: Devin Dennis, Assisted with Claude Code
+Supports standalone mode (plans and drives via cmd_vel) and stacked mode
+(publishes nav_msgs/Path for a downstream local planner). Integrates with
+SLAM for persistent obstacle tracking.
 """
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
-from nav_msgs.msg import Odometry, OccupancyGrid, Path
-from map_msgs.msg import OccupancyGridUpdate
-import numpy as np
 import heapq
 import math
 import os
+import sys
 from collections import defaultdict
+
+import numpy as np
 from scipy.ndimage import binary_dilation
 
+import rclpy
+from geometry_msgs.msg import PoseStamped, TwistStamped
+from nav_interfaces.msg import NavStatus
+from nav_interfaces.srv import CancelNav
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from tf2_ros import Buffer, TransformListener
 
-# ============================================================================
-# CONFIGURATION CONSTANTS
-# ============================================================================
 
 class PlannerConstants:
-    """
-    Centralized configuration for all planning and obstacle detection parameters.
+    """Default configuration constants for the D* Lite navigator."""
 
-    Adjust these values to tune robot behavior:
-    - Increase SAFETY_CLEARANCE for more cautious navigation
-    - Adjust LOCAL_COSTMAP_OBSTACLE_THRESHOLD for obstacle sensitivity
-    """
+    ROBOT_RADIUS = 0.22
+    SAFETY_CLEARANCE = 0.05
 
-    # -------- Robot Physical Parameters (meters) --------
-    NAMESPACE = '/don'          # Name of the physical robot
-    ROBOT_RADIUS = 0.22           # Physical radius of the robot body
-    SAFETY_CLEARANCE = 0.05      # Extra safety buffer around obstacles
-                                  # Total inflation = ROBOT_RADIUS + SAFETY_CLEARANCE
+    LINEAR_SPEED = 0.2
+    ANGULAR_SPEED = 0.5
+    POSITION_TOLERANCE = 0.1
+    ANGLE_TOLERANCE = 0.1
+    CONTROL_TIMER_PERIOD = 0.1
 
-    # -------- Grid Cell Tolerances (cells) --------
-    PATH_CHECK_RADIUS = 2             # Cells around waypoint to check for obstacles
-
-    # -------- Path Planning Parameters --------
-    MAX_PATH_ITERATIONS = 10000000    # Max D* Lite iterations before timeout
+    MAX_PATH_ITERATIONS = 10000000
     MAX_WAYPOINTS = 10
+    REPLAN_COOLDOWN = 1.0
+    ROBOT_CLEARANCE_CELLS = 3
+    PATH_CHECK_RADIUS = 2
 
-    # -------- Control Parameters --------
-    REPLAN_COOLDOWN = 1.0         # Minimum seconds between replans
-    ROBOT_CLEARANCE_CELLS = 3     # Cells around robot to keep free
+    DEFAULT_NAMESPACE = '/don'
 
-    # -------- Topic Names --------
-    CMD_VEL = f'{NAMESPACE}/cmd_vel'
-    ODOMETRY = f'{NAMESPACE}/odom'
-    OCCUPANCY_GRID = f'{NAMESPACE}/map'
-    DYNAMIC_GRID = f'{NAMESPACE}/dynamic_grid'
-    GOAL_POSE = f'{NAMESPACE}/d_star_goal_pose'
-    PATH = f'{NAMESPACE}/d_star_path'
-
-    # Local costmap topics (Nav2)
-    LOCAL_COSTMAP = f'{NAMESPACE}/local_costmap/costmap'
-    LOCAL_COSTMAP_UPDATES = f'{NAMESPACE}/local_costmap/costmap_updates'
-
-    # Local costmap configuration
-    LOCAL_COSTMAP_OBSTACLE_THRESHOLD = 75  # Cost value above which cell is considered obstacle (0-254)
-
-
-
-
-# ============================================================================
-# D* LITE PATHFINDING ALGORITHM
-# ============================================================================
 
 class DStarLite:
-    """
-    D* Lite incremental search algorithm for dynamic pathfinding.
+    """D* Lite incremental search algorithm for dynamic pathfinding."""
 
-    D* Lite is an optimized version of D* that efficiently handles changing
-    environments by only recomputing affected portions of the path when
-    obstacles appear or disappear.
-
-    Key Concepts:
-        - g(s): Cost-to-come from start to state s
-        - rhs(s): One-step lookahead value (min cost through neighbors)
-        - k_m: Heuristic offset for incremental search
-        - Locally consistent: g(s) == rhs(s)
-
-    Usage:
-        planner = DStarLite(grid, start, goal)
-        planner.compute_shortest_path()  # Initial plan
-        path = planner.extract_path()
-
-        # When obstacles change:
-        planner.update_start(new_start)
-        planner.update_obstacles(changed_cells)
-        planner.compute_shortest_path()  # Incremental replan
-        path = planner.extract_path()
-    """
-
-    def __init__(self, grid, start, goal):
-        """
-        Initialize D* Lite planner.
-
-        Args:
-            grid: 2D numpy array (0=free, 1=occupied)
-            start: Tuple (x, y) start position in grid coordinates
-            goal: Tuple (x, y) goal position in grid coordinates
-        """
+    def __init__(self, grid, start, goal, logger=None):
         self.grid = grid
         self.rows, self.cols = grid.shape
         self.start = start
         self.goal = goal
-        self.s_last = start  # Last start position for k_m calculation
-        self.k_m = 0         # Heuristic modifier for incremental search
+        self.s_last = start
+        self.k_m = 0
+        self.logger = logger
 
-        # Cost values (defaultdict for automatic infinity initialization)
-        self.g = defaultdict(lambda: float('inf'))    # Cost-to-come
-        self.rhs = defaultdict(lambda: float('inf'))  # One-step lookahead
-        self.open_list = []  # Priority queue of states to process
+        self.g = defaultdict(lambda: float('inf'))
+        self.rhs = defaultdict(lambda: float('inf'))
 
-        # Initialize goal
+        self.open_list = []
+        self._open_valid = {}
+
         self.rhs[self.goal] = 0
-        heapq.heappush(self.open_list, (self.calculate_key(self.goal), self.goal))
+        start_key = self.calculate_key(self.goal)
+        heapq.heappush(self.open_list, (start_key, self.goal))
+        self._open_valid[self.goal] = start_key
 
     def heuristic(self, s1, s2):
-        """
-        Euclidean distance heuristic.
-
-        Args:
-            s1: State (x, y)
-            s2: State (x, y)
-
-        Returns:
-            Euclidean distance between s1 and s2
-        """
+        """Euclidean distance heuristic."""
         return math.sqrt((s1[0] - s2[0])**2 + (s1[1] - s2[1])**2)
 
     def calculate_key(self, s):
-        """
-        Calculate priority key for state s.
-
-        The key is used to determine processing order in the priority queue.
-        States with lower keys are processed first.
-
-        Args:
-            s: State (x, y)
-
-        Returns:
-            Tuple (k1, k2) where k1 is primary key, k2 is tiebreaker
-        """
+        """Calculate priority key for state s."""
         g_rhs = min(self.g[s], self.rhs[s])
         return (g_rhs + self.heuristic(self.start, s) + self.k_m, g_rhs)
 
     def is_valid(self, pos):
-        """
-        Check if position is valid (in bounds and not an obstacle).
-
-        Args:
-            pos: Position (x, y)
-
-        Returns:
-            True if valid and free, False otherwise
-        """
+        """Check if position is valid (in bounds and not an obstacle)."""
         x, y = pos
         if x < 0 or x >= self.cols or y < 0 or y >= self.rows:
             return False
         return self.grid[y, x] == 0
 
     def get_neighbors(self, s):
-        """
-        Get valid 8-connected neighbors of state s.
-
-        Args:
-            s: State (x, y)
-
-        Returns:
-            List of valid neighbor states
-        """
+        """Get valid 8-connected neighbors of state s."""
         neighbors = []
-        # 8-connected grid: 4 cardinal + 4 diagonal directions
         for dx, dy in [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]:
             neighbor = (s[0] + dx, s[1] + dy)
             if self.is_valid(neighbor):
@@ -207,34 +97,42 @@ class DStarLite:
         return neighbors
 
     def cost(self, s1, s2):
-        """
-        Calculate movement cost between adjacent states.
-
-        Args:
-            s1: State (x, y)
-            s2: Adjacent state (x, y)
-
-        Returns:
-            Movement cost (1.0 for cardinal, 1.414 for diagonal)
-        """
+        """Calculate movement cost between adjacent states."""
         if not self.is_valid(s1) or not self.is_valid(s2):
             return float('inf')
-
         dx = abs(s1[0] - s2[0])
         dy = abs(s1[1] - s2[1])
-        return 1.414 if (dx + dy) == 2 else 1.0  # sqrt(2) for diagonal
+        return 1.414 if (dx + dy) == 2 else 1.0
+
+    def _open_push(self, key, u):
+        """Push u onto the open list with lazy deletion."""
+        heapq.heappush(self.open_list, (key, u))
+        self._open_valid[u] = key
+
+    def _open_remove(self, u):
+        """Mark u as removed from the open list."""
+        self._open_valid.pop(u, None)
+
+    def _open_pop(self):
+        """Pop the smallest valid entry."""
+        while self.open_list:
+            key, u = heapq.heappop(self.open_list)
+            if self._open_valid.get(u) == key:
+                del self._open_valid[u]
+                return key, u
+        return None, None
+
+    def _open_top(self):
+        """Peek at the smallest valid entry without removing it."""
+        while self.open_list:
+            key, u = self.open_list[0]
+            if self._open_valid.get(u) == key:
+                return key, u
+            heapq.heappop(self.open_list)
+        return None, None
 
     def update_vertex(self, u):
-        """
-        Update state u's cost values and priority queue status.
-
-        This is the core of D* Lite. Makes u locally consistent if possible,
-        otherwise adds it to the priority queue for further processing.
-
-        Args:
-            u: State (x, y) to update
-        """
-        # Update rhs value (one-step lookahead)
+        """Update state u's cost values and priority queue status."""
         if u != self.goal:
             min_cost = float('inf')
             for s_prime in self.get_neighbors(u):
@@ -242,43 +140,44 @@ class DStarLite:
                 min_cost = min(min_cost, cost)
             self.rhs[u] = min_cost
 
-        # Remove u from open list if present
-        self.open_list = [(k, s) for k, s in self.open_list if s != u]
-        heapq.heapify(self.open_list)
+        self._open_remove(u)
 
-        # If u is locally inconsistent, add to open list
         if self.g[u] != self.rhs[u]:
-            heapq.heappush(self.open_list, (self.calculate_key(u), u))
+            self._open_push(self.calculate_key(u), u)
 
     def compute_shortest_path(self):
-        """
-        Main D* Lite computation - processes states until start is consistent.
-
-        This implements the core D* Lite algorithm, processing states from the
-        priority queue until the start state has a consistent cost estimate.
+        """Process states until start is locally consistent.
 
         Returns:
-            True if path found, False if timeout or no path
+            True if path found, False if iteration limit reached.
         """
         iterations = 0
 
-        # Process until start is locally consistent and optimal
-        while (self.open_list and
-               (self.compare_keys(self.open_list[0][0], self.calculate_key(self.start)) or
-                self.rhs[self.start] != self.g[self.start])):
+        while True:
+            top_key, top_u = self._open_top()
+            if top_key is None:
+                break
+
+            start_key = self.calculate_key(self.start)
+            if not (self.compare_keys(top_key, start_key) or
+                    self.rhs[self.start] != self.g[self.start]):
+                break
 
             iterations += 1
             if iterations > PlannerConstants.MAX_PATH_ITERATIONS:
-                self.get_logger().info('Max path iterations timeout')
-                return False  # Timeout
-            
+                if self.logger:
+                    self.logger.warn('Max path iterations timeout')
+                return False
 
-            k_old, u = heapq.heappop(self.open_list)
+            k_old, u = self._open_pop()
+            if u is None:
+                break
+
             k_new = self.calculate_key(u)
 
             if self.compare_keys(k_old, k_new):
                 # Key has changed, re-insert with new key
-                heapq.heappush(self.open_list, (k_new, u))
+                self._open_push(k_new, u)
             elif self.g[u] > self.rhs[u]:
                 # Overconsistent: make consistent and propagate
                 self.g[u] = self.rhs[u]
@@ -294,32 +193,13 @@ class DStarLite:
         return True
 
     def compare_keys(self, k1, k2):
-        """
-        Compare two priority keys.
-
-        Args:
-            k1: Key tuple (k1_1, k1_2)
-            k2: Key tuple (k2_1, k2_2)
-
-        Returns:
-            True if k1 < k2
-        """
+        """Compare two priority keys. Returns True if k1 < k2."""
         return k1[0] < k2[0] or (k1[0] == k2[0] and k1[1] < k2[1])
 
     def extract_path(self, debug=False):
-        """
-        Extract path from start to goal by following gradient of g-values.
-
-        Starting from start, greedily moves to neighbor with lowest g-value
-        until reaching the goal.
-
-        Returns:
-            List of states [(x, y), ...] from start to goal, or [] if no path
-        """
+        """Extract path from start to goal by following gradient of g-values."""
         if self.g[self.start] == float('inf'):
-            if debug:
-                print(f'[DEBUG] extract_path failed: g[start] = inf')
-            return []  # No path exists
+            return []
 
         path = [self.start]
         current = self.start
@@ -328,38 +208,24 @@ class DStarLite:
 
         while current != self.goal:
             if len(path) > max_iterations:
-                if debug:
-                    print(f'[DEBUG] extract_path failed: loop detected at {current}')
-                return []  # Loop detected
+                return []
 
             neighbors = self.get_neighbors(current)
             if not neighbors:
-                if debug:
-                    print(f'[DEBUG] extract_path failed: dead end at {current}, no valid neighbors')
-                return []  # Dead end
+                return []
 
-            # Find valid neighbors not yet visited
             valid_neighbors = [
                 (n, self.g[n]) for n in neighbors
                 if self.g[n] != float('inf') and n not in visited
             ]
 
             if not valid_neighbors:
-                if debug:
-                    all_neighbor_g = [(n, self.g[n]) for n in neighbors]
-                    print(f'[DEBUG] extract_path failed: no valid moves from {current}')
-                    print(f'[DEBUG]   All neighbors and g-values: {all_neighbor_g}')
-                    print(f'[DEBUG]   Already visited: {[n for n in neighbors if n in visited]}')
-                return []  # No valid moves
+                return []
 
-            # Move to neighbor with lowest g-value
             next_state, min_g = min(valid_neighbors, key=lambda x: x[1])
 
-            # Safety: don't go uphill (except for floating point errors)
             if min_g > self.g[current] + 0.01 and next_state != self.goal:
-                if debug:
-                    print(f'[DEBUG] extract_path failed: going uphill from {current} (g={self.g[current]}) to {next_state} (g={min_g})')
-                return []  # Path is not optimal
+                return []
 
             visited.add(next_state)
             path.append(next_state)
@@ -368,534 +234,340 @@ class DStarLite:
         return path
 
     def update_start(self, new_start):
-        """
-        Update start position for replanning.
-
-        When the robot moves, update k_m to account for heuristic changes.
-        This is crucial for D* Lite's incremental search efficiency.
-
-        Args:
-            new_start: New start position (x, y)
-        """
+        """Update start position for replanning."""
         if new_start == self.start:
             return
-
-        # Update k_m to maintain heuristic consistency
         self.k_m += self.heuristic(self.s_last, self.start)
         self.s_last = self.start
         self.start = new_start
 
     def update_obstacles(self, changed_cells):
-        """
-        Update grid with changed obstacles and trigger replanning.
-
-        This is the key to D* Lite's efficiency - only cells near changes
-        are updated, not the entire grid.
-
-        Args:
-            changed_cells: List of (x, y) cells that changed occupancy
-        """
+        """Update grid with changed obstacles and trigger replanning."""
         all_affected = set()
 
-        # Collect all affected cells (changed cells + their neighbors)
         for cell in changed_cells:
             x, y = cell
             if 0 <= x < self.cols and 0 <= y < self.rows:
                 all_affected.add(cell)
-
-                # Add all 8-connected neighbors
                 for dx, dy in [(-1,0), (1,0), (0,-1), (0,1),
                                (-1,-1), (-1,1), (1,-1), (1,1)]:
                     nx, ny = x + dx, y + dy
                     if 0 <= nx < self.cols and 0 <= ny < self.rows:
                         all_affected.add((nx, ny))
 
-        # Update all affected vertices
         for vertex in all_affected:
             self.update_vertex(vertex)
 
 
-# ============================================================================
-# ROS2 NAVIGATOR NODE
-# ============================================================================
-
 class DStarNavigator(Node):
-    """
-    Complete navigation system using D* Lite with SLAM and Nav2 local costmap.
+    """ROS2 node for D* Lite path planning with SLAM-driven replanning."""
 
-    This node manages:
-    - Path planning with D* Lite
-    - SLAM map integration for persistent obstacles
-    - Nav2 local costmap for dynamic obstacle detection and clearing
-    - Robot motion control
-    - Automatic replanning when obstacles block the path
+    def __init__(self):
+        _ns = PlannerConstants.DEFAULT_NAMESPACE
+        for i, arg in enumerate(sys.argv):
+            if arg.startswith('namespace:='):
+                _ns = arg.split(':=', 1)[1]
+            elif arg == '-p' and i + 1 < len(sys.argv) and sys.argv[i+1].startswith('namespace:='):
+                _ns = sys.argv[i+1].split(':=', 1)[1]
 
-    Operating Modes:
-        OPTIMISTIC (default): Treats unexplored areas as free - good for exploration
-        CONSERVATIVE: Only plans through known free space - good for navigation
+        _user_args = sys.argv[1:]
+        _tf_remaps = ['-r', f'/tf:={_ns}/tf', '-r', f'/tf_static:={_ns}/tf_static']
+        if '--ros-args' in _user_args:
+            _combined = _user_args + _tf_remaps
+        else:
+            _combined = _user_args + ['--ros-args'] + _tf_remaps
 
-    Grid Hierarchy:
-        1. grid_original: Raw SLAM map (0=free, 1=occupied, no inflation)
-        2. grid: SLAM map with safety inflation (planning baseline)
-        3. grid_base: Accumulated SLAM obstacles (persistent)
-        4. grid_dynamic: Current planning grid (updated by SLAM and local costmap)
+        super().__init__('dstar_navigator', cli_args=_combined, use_global_arguments=False)
 
-    Replanning Triggers:
-        - SLAM discovers obstacles blocking current path
-        - Local costmap detects obstacle changes near path
-        - Cooldown prevents rapid replanning
-    """
+        self.declare_parameter('namespace', PlannerConstants.DEFAULT_NAMESPACE)
+        self.ns = self.get_parameter('namespace').value
 
-    # ========================================================================
-    # INITIALIZATION
-    # ========================================================================
+        default_radius = float(os.getenv('ROBOT_RADIUS', str(PlannerConstants.ROBOT_RADIUS)))
+        default_clearance = float(
+            os.getenv('SAFETY_CLEARANCE', str(PlannerConstants.SAFETY_CLEARANCE))
+        )
 
-    def __init__(self, robot_radius=0.22, safety_clearance=0.15, optimistic_planning=True):
-        """
-        Initialize the D* Lite navigator.
+        self.declare_parameter('robot_radius', default_radius)
+        self.declare_parameter('safety_clearance', default_clearance)
+        self.robot_radius = self.get_parameter('robot_radius').value
+        self.safety_clearance = self.get_parameter('safety_clearance').value
 
-        Args:
-            robot_radius: Physical radius of robot in meters
-            safety_clearance: Extra safety buffer around obstacles in meters
-            optimistic_planning: If True, treat unknown areas as free
-        """
-        super().__init__('dstar_navigator')
+        self.declare_parameter('linear_speed', PlannerConstants.LINEAR_SPEED)
+        self.declare_parameter('angular_speed', PlannerConstants.ANGULAR_SPEED)
+        self.declare_parameter('position_tolerance', PlannerConstants.POSITION_TOLERANCE)
+        self.declare_parameter('angle_tolerance', PlannerConstants.ANGLE_TOLERANCE)
+        self.declare_parameter('max_waypoints', PlannerConstants.MAX_WAYPOINTS)
+        self.declare_parameter('replan_cooldown', PlannerConstants.REPLAN_COOLDOWN)
+        self.declare_parameter('optimistic_planning', True)
 
-        # Robot configuration
-        self.robot_radius = robot_radius
-        self.safety_clearance = safety_clearance
-        self.optimistic_planning = optimistic_planning
+        self.linear_speed = self.get_parameter('linear_speed').value
+        self.angular_speed = self.get_parameter('angular_speed').value
+        self.position_tolerance = self.get_parameter('position_tolerance').value
+        self.angle_tolerance = self.get_parameter('angle_tolerance').value
+        self.optimistic_planning = self.get_parameter('optimistic_planning').value
 
-        # ROS2 publishers
-        self.cmd_vel_pub = self.create_publisher(TwistStamped, PlannerConstants.CMD_VEL, 10)
-        self.dynamic_grid_pub = self.create_publisher(OccupancyGrid, PlannerConstants.DYNAMIC_GRID, 10)
-        self.path_pub = self.create_publisher(Path, PlannerConstants.PATH, 10)
+        self.declare_parameter('stacked', False)
+        self.standalone = not self.get_parameter('stacked').value
 
-        # ROS2 subscribers
-        self._setup_subscribers()
+        self.path_pub = self.create_publisher(Path, f'{self.ns}/d_star/plan', 10)
 
-        # Map data - Grid hierarchy (see class docstring)
-        self.grid = None              # Inflated SLAM map
-        self.grid_original = None     # Original uninflated SLAM map
-        self.grid_base = None         # SLAM obstacles (persistent)
-        self.grid_dynamic = None      # grid_base + lidar obstacles (current)
-        self.grid_slam = None         # SLAM map for comparison
-        self.grid_unknown = None      # Track unexplored cells
-        self.resolution = None        # Meters per grid cell
-        self.origin = None            # Map origin [x, y] in world coordinates
-        self.map_received = False
-        self.use_live_slam = True
+        qos_cmd = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+        self.cmd_vel_pub = self.create_publisher(TwistStamped, f'{self.ns}/cmd_vel', qos_cmd)
+        self.dynamic_grid_pub = self.create_publisher(
+            OccupancyGrid, f'{self.ns}/dynamic_grid', 10)
 
-        # Robot state
-        self.current_pose = None      # {'x': float, 'y': float, 'theta': float}
-        self.path = []                # List of waypoints [(x, y), ...]
-        self.current_waypoint_idx = 0
-
-        # D* Lite planner state
-        self.dstar_planner = None
-        self.goal_grid = None
-        self.planner_grid_snapshot = None  # Snapshot for change detection
-        self.known_obstacles = set()       # Track obstacles already replanned for
-
-        # Local costmap state (Nav2 integration)
-        self.local_costmap = None           # Full local costmap data
-        self.local_costmap_info = None      # Costmap metadata (origin, resolution, size)
-        self.grid_local_costmap = None      # Separate layer for local costmap obstacles
-        self.grid_local_costmap_mask = None # Mask tracking which cells have costmap data (1=has data, 0=no data)
-
-        # Control parameters
-        self.linear_speed = 0.2
-        self.angular_speed = 0.5
-        self.position_tolerance = 0.1
-        self.angle_tolerance = 0.1
-        self.replanning_needed = False
-        self.last_replan_time = self.get_clock().now()
-        self.blocked_waypoint_idx = None  # Track which waypoint is blocked by obstacle
-
-        # Distance and time tracking
-        self.start_time = None
-        self.total_distance = 0.0  # Total distance traveled in meters
-        self.last_position = None  # Last position for distance calculation
-
-        # Control loop timer (10 Hz)
-        self.control_timer = self.create_timer(0.1, self.control_loop)
-
-        # Visualization timer (1 Hz) - slower updates to avoid flashing
-        self.viz_timer = self.create_timer(0.1, self.publish_dynamic_grid)
-
-        self.get_logger().info('Using SLAM-only mode')
-        self.get_logger().info('Grid will be initialized from first SLAM message')
-
-        self._log_initialization()
-
-    def _setup_subscribers(self):
-        """Setup ROS2 subscribers with appropriate QoS profiles."""
-        # Best-effort QoS for real-time data (odometry)
         qos_best_effort = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=10
+            depth=10,
         )
-
         self.odom_sub = self.create_subscription(
-            Odometry, PlannerConstants.ODOMETRY, self.odom_callback, qos_best_effort
+            Odometry,
+            f'{self.ns}/odom',
+            self.odom_callback,
+            qos_best_effort,
         )
 
-        # Reliable + transient-local QoS for maps (latched topic)
         map_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1
+            depth=1,
         )
-
         self.map_sub = self.create_subscription(
-            OccupancyGrid, PlannerConstants.OCCUPANCY_GRID, self.map_callback, map_qos
+            OccupancyGrid,
+            f'{self.ns}/map',
+            self.map_callback,
+            map_qos,
+        )
+        self.goal_sub = self.create_subscription(
+            PoseStamped,
+            f'{self.ns}/goal_pose',
+            self.goal_pose_callback,
+            10,
+        )
+        self.obstacle_grid_sub = self.create_subscription(
+            OccupancyGrid,
+            f'{self.ns}/obstacle_grid',
+            self.obstacle_grid_callback,
+            10,
         )
 
-        # Goal pose subscriber for receiving navigation goals
-        self.goal_pose_sub = self.create_subscription(
-            PoseStamped, PlannerConstants.GOAL_POSE, self.goal_pose_callback, 10
-        )
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # Local costmap subscribers (Nav2 integration for obstacle detection and clearing)
-        self.local_costmap_sub = self.create_subscription(
-            OccupancyGrid, PlannerConstants.LOCAL_COSTMAP, self.local_costmap_callback, 10
+        self._planner_state = 'idle'
+        self._goal_just_reached = False
+        self._active_goal = None
+
+        self.nav_status_pub = self.create_publisher(NavStatus, f'{self.ns}/d_star/status', 10)
+        self.cancel_srv = self.create_service(
+            CancelNav,
+            f'{self.ns}/d_star/cancel',
+            self._handle_cancel,
         )
-        self.local_costmap_update_sub = self.create_subscription(
-            OccupancyGridUpdate, PlannerConstants.LOCAL_COSTMAP_UPDATES,
-            self.local_costmap_update_callback, 10
+        self._status_timer = self.create_timer(0.5, self._publish_nav_status)
+
+        self.grid = None
+        self.grid_original = None
+        self.grid_base = None
+        self.grid_dynamic = None
+        self.grid_slam = None
+        self.grid_unknown = None
+        self.resolution = None
+        self.origin = None
+        self.map_received = False
+
+        self.current_pose = None
+        self.path = []
+        self.current_waypoint_idx = 0
+
+        self.dstar_planner = None
+        self.goal_grid = None
+        self.planner_grid_snapshot = None
+        self.known_obstacles = set()
+
+        self.replanning_needed = False
+        self.last_replan_time = self.get_clock().now()
+        self.blocked_waypoint_idx = None
+
+        self.start_time = None
+        self.total_distance = 0.0
+        self.last_position = None
+
+        self.control_timer = self.create_timer(
+            PlannerConstants.CONTROL_TIMER_PERIOD,
+            self.control_loop,
         )
+        self.viz_timer = self.create_timer(0.1, self.publish_dynamic_grid)
+        self._path_republish_timer = self.create_timer(1.0, self._republish_path)
+
+
+        mode_str = 'standalone' if self.standalone else 'stacked'
+        self.get_logger().info(
+            f'd_star_navigator initialized | ns={self.ns} mode={mode_str} '
+            f'radius={self.robot_radius}m clearance={self.safety_clearance}m')
+
+
+    def _handle_cancel(self, request, response):
+        """CancelNav service handler -- stop planning and driving."""
+        self.get_logger().info('Cancel requested via service')
+        self._active_goal = None
+        self.path = []
+        self.current_waypoint_idx = 0
+        self._planner_state = 'idle'
+        self.replanning_needed = False
+
+        # Publish empty path so downstream knows to stop
+        empty_path = Path()
+        empty_path.header.stamp = self.get_clock().now().to_msg()
+        empty_path.header.frame_id = 'map'
+        self.path_pub.publish(empty_path)
+
+        if self.standalone:
+            self.stop_robot()
+
+        response.confirmed = True
+        return response
+
+    def _publish_nav_status(self):
+        """Publish NavStatus at 2 Hz for the navigation server to consume."""
+        msg = NavStatus()
+        msg.nav_state = self._planner_state
+        msg.has_active_goal = self._active_goal is not None
+        msg.distance_traveled = self.total_distance
+
+        if self.start_time is not None:
+            msg.elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+        else:
+            msg.elapsed_time = 0.0
+
+        if self.current_pose is not None:
+            msg.current_x = self.current_pose['x']
+            msg.current_y = self.current_pose['y']
+            if self._active_goal is not None:
+                dx = self._active_goal[0] - self.current_pose['x']
+                dy = self._active_goal[1] - self.current_pose['y']
+                msg.distance_to_goal = math.sqrt(dx**2 + dy**2)
+            else:
+                msg.distance_to_goal = -1.0
+        else:
+            msg.current_x = 0.0
+            msg.current_y = 0.0
+            msg.distance_to_goal = -1.0
+
+        msg.goal_reached = self._goal_just_reached
+
+        self.nav_status_pub.publish(msg)
+
+    def _republish_path(self):
+        """Republish current path at 1 Hz for late-joining RViz subscribers."""
+        if self.path:
+            self.publish_path()
+
 
     def goal_pose_callback(self, msg: PoseStamped):
-        """
-        Handle incoming goal pose messages.
-
-        Extracts x, y coordinates from the PoseStamped message and
-        initiates navigation from current position to the goal.
-
-        Args:
-            msg: PoseStamped message containing the goal position
-        """
+        """Handle incoming goal pose from RViz 2D Goal Pose."""
         goal_x = msg.pose.position.x
         goal_y = msg.pose.position.y
 
-        self.get_logger().info(f'Received goal pose: ({goal_x:.2f}, {goal_y:.2f})')
+        self.get_logger().info(f'Goal received: ({goal_x:.2f}, {goal_y:.2f})')
 
         if self.current_pose is None:
             self.get_logger().warn('No odometry data yet, cannot navigate to goal')
             return
 
+        if not self.map_received:
+            self.get_logger().warn('No SLAM map received yet, cannot plan')
+            return
+
+        # Reset goal-reached flag
+        self._goal_just_reached = False
+        self._active_goal = (goal_x, goal_y)
+        self._planner_state = 'planning'
+
         start_x = self.current_pose['x']
         start_y = self.current_pose['y']
 
-        self.get_logger().info(f'Starting navigation from ({start_x:.2f}, {start_y:.2f}) to ({goal_x:.2f}, {goal_y:.2f})')
-
         if self.navigate_to_goal(start_x, start_y, goal_x, goal_y):
+            self._planner_state = 'navigating'
             self.get_logger().info('Navigation started successfully')
         else:
+            self._planner_state = 'idle'
+            self._active_goal = None
             self.get_logger().error('Failed to plan path to goal')
 
-    def _log_initialization(self):
-        """Log initialization information."""
-        total_inflation = self.robot_radius + self.safety_clearance
-        self.get_logger().info('D* Lite Navigator initialized')
-        self.get_logger().info(f'Robot radius: {self.robot_radius}m, Safety: {self.safety_clearance}m, Total: {total_inflation}m')
-        self.get_logger().info(f'Listening for goal poses on: {PlannerConstants.GOAL_POSE}')
-
-        self.get_logger().info('MAP MODE: SLAM-only')
-        self.get_logger().info('  -> Unknown areas treated as FREE for exploration')
-
-        if self.use_live_slam:
-            self.get_logger().info('Using LIVE SLAM map from /map topic')
-            mode = 'OPTIMISTIC' if self.optimistic_planning else 'CONSERVATIVE'
-            self.get_logger().info(f'{mode} PLANNING enabled')
-
-    # ========================================================================
-    # MAP PROCESSING
-    # ========================================================================
 
     def _inflate_obstacles(self, grid, inflation_radius):
-        """
-        Inflate obstacles using morphological dilation.
-
-        Creates a safety buffer around all obstacles by expanding them.
-
-        Args:
-            grid: 2D numpy array (0=free, 1=occupied)
-            inflation_radius: Inflation radius in meters
-
-        Returns:
-            Inflated grid with same shape as input
-        """
+        """Inflate obstacles using morphological dilation."""
         radius_pixels = int(inflation_radius / self.resolution)
         kernel_size = 2 * radius_pixels + 1
         kernel = np.ones((kernel_size, kernel_size))
         return binary_dilation(grid, kernel).astype(int)
 
-    # ========================================================================
-    # ROS2 CALLBACKS
-    # ========================================================================
 
     def odom_callback(self, msg):
-        """
-        Update current robot pose from odometry.
-
-        Args:
-            msg: Odometry message
-        """
+        """Update current robot pose from odometry."""
         self.current_pose = {
             'x': msg.pose.pose.position.x,
             'y': msg.pose.pose.position.y,
             'theta': self.quaternion_to_yaw(msg.pose.pose.orientation)
         }
 
-    # ========================================================================
-    # LOCAL COSTMAP CALLBACKS (Nav2 Integration)
-    # ========================================================================
-
-    def local_costmap_callback(self, msg: OccupancyGrid):
-        """
-        Receive full local costmap from Nav2.
-
-        Processes the entire costmap to extract obstacles and integrate them
-        into the dynamic grid. This ensures costmap obstacles appear even
-        without incremental update messages.
-
-        Args:
-            msg: OccupancyGrid message from Nav2 local costmap
-        """
+    def obstacle_grid_callback(self, msg: OccupancyGrid):
+        """Merge shared LIDAR obstacle grid into grid_dynamic and trigger replan if blocked."""
         if self.grid_dynamic is None or self.resolution is None:
-            self.get_logger().warn('Costmap IGNORED: grid not initialized yet')
             return
 
-        self.local_costmap = np.array(msg.data, dtype=np.int8).reshape(
-            (msg.info.height, msg.info.width)
-        )
-        self.local_costmap_info = msg.info
+        if (msg.info.width != self.grid_dynamic.shape[1] or
+                msg.info.height != self.grid_dynamic.shape[0]):
+            return
 
-        # Process entire costmap to update obstacles.
-        # Iterate over SLAM grid cells within the costmap footprint (pull approach)
-        # so every 0.5m SLAM cell is covered — avoids gaps caused by the 0.6m→0.5m
-        # resolution difference when pushing costmap cells into the SLAM grid.
-        obstacles_found = 0
-        changed_cells = []
+        shared = np.array(msg.data, dtype=np.int8).reshape(
+            msg.info.height, msg.info.width)
 
-        # Determine which SLAM cells fall inside the costmap's world footprint
-        slam_x_min, slam_y_min = self.world_to_grid(
-            msg.info.origin.position.x,
-            msg.info.origin.position.y
-        )
-        slam_x_max, slam_y_max = self.world_to_grid(
-            msg.info.origin.position.x + msg.info.width * msg.info.resolution,
-            msg.info.origin.position.y + msg.info.height * msg.info.resolution
-        )
-        slam_x_min = max(0, slam_x_min)
-        slam_y_min = max(0, slam_y_min)
-        slam_x_max = min(self.grid_dynamic.shape[1] - 1, slam_x_max)
-        slam_y_max = min(self.grid_dynamic.shape[0] - 1, slam_y_max)
+        previous_dynamic = self.grid_dynamic.copy()
+        self.grid_dynamic = np.where(
+            (self.grid_base == 1) | (shared >= 50),
+            1, 0,
+        ).astype(np.int8)
 
-        for grid_y in range(slam_y_min, slam_y_max + 1):
-            for grid_x in range(slam_x_min, slam_x_max + 1):
-                # Convert SLAM cell centre to world, then to costmap cell index
-                world_x = self.origin[0] + grid_x * self.resolution
-                world_y = self.origin[1] + grid_y * self.resolution
-                local_x = int((world_x - msg.info.origin.position.x) / msg.info.resolution)
-                local_y = int((world_y - msg.info.origin.position.y) / msg.info.resolution)
+        diff = np.where(previous_dynamic != self.grid_dynamic)
+        changed_cells = list(zip(diff[1].tolist(), diff[0].tolist()))
 
-                if not (0 <= local_x < msg.info.width and 0 <= local_y < msg.info.height):
-                    continue
-
-                cost = self.local_costmap[local_y, local_x]
-
-                # Convert Nav2 cost (0-254) to binary obstacle (0 or 1)
-                is_obstacle = 1 if cost > PlannerConstants.LOCAL_COSTMAP_OBSTACLE_THRESHOLD else 0
-
-                if is_obstacle:
-                    obstacles_found += 1
-
-                # Update the local costmap layer (survives SLAM resets)
-                if self.grid_local_costmap is not None:
-                    old_value = self.grid_local_costmap[grid_y, grid_x]
-                    self.grid_local_costmap[grid_y, grid_x] = is_obstacle
-                    # Mark this cell as having costmap data (so it overrides SLAM)
-                    if self.grid_local_costmap_mask is not None:
-                        self.grid_local_costmap_mask[grid_y, grid_x] = 1
-
-                    # Track changes for D* Lite
-                    if old_value != is_obstacle:
-                        if self.grid_dynamic[grid_y, grid_x] != is_obstacle:
-                            self.grid_dynamic[grid_y, grid_x] = is_obstacle
-                            changed_cells.append((grid_x, grid_y))
-
-
-        # Update D* Lite planner and trigger replan if needed
-        if changed_cells and self.dstar_planner:
+        if self.dstar_planner is not None and changed_cells:
+            self.dstar_planner.grid = self.grid_dynamic.copy()
             self.dstar_planner.update_obstacles(changed_cells)
-            num_obstacles = sum(1 for x, y in changed_cells if self.grid_dynamic[y, x] == 1)
-            num_cleared = len(changed_cells) - num_obstacles
-            self.get_logger().info(
-                f'Applied to D* planner: {num_obstacles} obstacles, {num_cleared} cleared - COSTMAP IS TRUTH'
-            )
 
-            # Republish dynamic grid
-            self.publish_dynamic_grid()
-
-            if self.path:
+            if self.path and len(changed_cells) > 0:
                 current_time = self.get_clock().now()
-                time_since_last_replan = (current_time - self.last_replan_time).nanoseconds / 1e9
+                replan_cooldown = self.get_parameter('replan_cooldown').value
+                time_since = (current_time - self.last_replan_time).nanoseconds / 1e9
 
-                if time_since_last_replan > PlannerConstants.REPLAN_COOLDOWN:
-                    path_blocked = self._check_path_blocked_by_costmap_changes(changed_cells)
-                    if path_blocked:
-                        self.get_logger().warn(
-                            f'Costmap obstacles block path, triggering replan '
-                            f'({len(changed_cells)} cells changed)')
-                    else:
-                        self.get_logger().info(
-                            f'Dynamic grid changed ({len(changed_cells)} cells), '
-                            f'replanning for potentially better route')
-                    self.replanning_needed = True
-                    self.last_replan_time = current_time
-
-    def local_costmap_update_callback(self, msg: OccupancyGridUpdate):
-        """
-        Process incremental local costmap updates from Nav2.
-
-        Updates the dynamic grid with obstacle changes detected by Nav2's
-        costmap layers. This handles both obstacle detection AND clearing,
-        solving the problem where SLAM doesn't clear removed obstacles quickly.
-
-        Args:
-            msg: OccupancyGridUpdate message containing changed cells
-        """
-        if self.local_costmap is None or self.local_costmap_info is None:
-            self.get_logger().warn('Costmap update IGNORED: local_costmap or info not initialized')
-            return
-
-        if self.grid_dynamic is None or self.resolution is None:
-            self.get_logger().warn('Costmap update IGNORED: grid_dynamic or resolution not initialized')
-            return
-
-        self.get_logger().info(f'Costmap update received: {len(msg.data)} cells, position=({msg.x}, {msg.y}), size={msg.width}x{msg.height}')
-
-        changed_cells = []
-        obstacles_detected = 0
-
-        costmap_res = self.local_costmap_info.resolution  # 0.6 m
-
-        for i, cost in enumerate(msg.data):
-            # Calculate position in local costmap (0.6 m cells)
-            local_x = msg.x + (i % msg.width)
-            local_y = msg.y + (i // msg.width)
-
-            # Convert Nav2 cost (0-254) to binary obstacle (0 or 1)
-            is_obstacle = 1 if cost > PlannerConstants.LOCAL_COSTMAP_OBSTACLE_THRESHOLD else 0
-
-            if is_obstacle:
-                obstacles_detected += 1
-
-            # Compute the world-space footprint of this 0.6 m costmap cell
-            world_x0 = self.local_costmap_info.origin.position.x + local_x * costmap_res
-            world_y0 = self.local_costmap_info.origin.position.y + local_y * costmap_res
-            world_x1 = world_x0 + costmap_res
-            world_y1 = world_y0 + costmap_res
-
-            # Map footprint corners to SLAM grid (0.5 m) and clamp to bounds
-            gx0, gy0 = self.world_to_grid(world_x0, world_y0)
-            gx1, gy1 = self.world_to_grid(world_x1, world_y1)
-            gx0 = max(0, gx0)
-            gy0 = max(0, gy0)
-            gx1 = min(self.grid_dynamic.shape[1] - 1, gx1)
-            gy1 = min(self.grid_dynamic.shape[0] - 1, gy1)
-
-            # Update every 0.5 m SLAM cell that falls inside this costmap cell
-            for grid_y in range(gy0, gy1 + 1):
-                for grid_x in range(gx0, gx1 + 1):
-                    # Update the local costmap layer (survives SLAM resets)
-                    if self.grid_local_costmap is not None:
-                        self.grid_local_costmap[grid_y, grid_x] = is_obstacle
-                        if self.grid_local_costmap_mask is not None:
-                            self.grid_local_costmap_mask[grid_y, grid_x] = 1
-
-                    # Track changes for D* Lite incremental update
-                    if self.grid_dynamic[grid_y, grid_x] != is_obstacle:
-                        self.grid_dynamic[grid_y, grid_x] = is_obstacle
-                        changed_cells.append((grid_x, grid_y))
-
-        # Log summary
-        self.get_logger().info(
-            f'Costmap processing: {obstacles_detected} obstacles detected, '
-            f'{len(changed_cells)} cells changed in grid_dynamic'
-        )
-
-        # Update D* Lite planner with changed cells and trigger replan
-        if changed_cells and self.dstar_planner:
-            self.dstar_planner.update_obstacles(changed_cells)
-            num_obstacles = sum(1 for x, y in changed_cells if self.grid_dynamic[y, x] == 1)
-            num_cleared = len(changed_cells) - num_obstacles
-            self.get_logger().info(
-                f'Applied to D* planner: {num_obstacles} obstacles, {num_cleared} cleared - COSTMAP IS TRUTH'
-            )
-
-            # Republish dynamic grid so visualization reflects the changes
-            self.publish_dynamic_grid()
-
-            if self.path:
-                current_time = self.get_clock().now()
-                time_since_last_replan = (current_time - self.last_replan_time).nanoseconds / 1e9
-
-                if time_since_last_replan > PlannerConstants.REPLAN_COOLDOWN:
-                    # Check if changes directly block the path
-                    path_blocked = self._check_path_blocked_by_costmap_changes(changed_cells)
-                    if path_blocked:
-                        self.get_logger().warn(
-                            f'Local costmap detected obstacle in path, triggering replan '
-                            f'({len(changed_cells)} cells changed)')
-                    else:
-                        self.get_logger().info(
-                            f'Dynamic grid changed ({len(changed_cells)} cells), '
-                            f'replanning for potentially better route')
-                    self.replanning_needed = True
-                    self.last_replan_time = current_time
-
-    def _check_path_blocked_by_costmap_changes(self, changed_cells):
-        """
-        Check if any changed cells block the current path.
-
-        Args:
-            changed_cells: List of (grid_x, grid_y) tuples that changed
-
-        Returns:
-            True if any changed cell is an obstacle near the path
-        """
-        if not self.path or self.current_waypoint_idx >= len(self.path):
-            return False
-
-        changed_set = set(changed_cells)
-
-        # Check upcoming waypoints
-        for i in range(self.current_waypoint_idx, min(self.current_waypoint_idx + 5, len(self.path))):
-            waypoint = self.path[i]
-            wp_grid = self.world_to_grid(waypoint[0], waypoint[1])
-
-            # Check cells around waypoint
-            for dx in range(-PlannerConstants.PATH_CHECK_RADIUS, PlannerConstants.PATH_CHECK_RADIUS + 1):
-                for dy in range(-PlannerConstants.PATH_CHECK_RADIUS, PlannerConstants.PATH_CHECK_RADIUS + 1):
-                    check_cell = (wp_grid[0] + dx, wp_grid[1] + dy)
-                    if check_cell in changed_set:
-                        if self._in_bounds(check_cell[0], check_cell[1]):
-                            if self.grid_dynamic[check_cell[1], check_cell[0]] == 1:
-                                self.blocked_waypoint_idx = i
-                                return True
-        return False
-
-    def _in_bounds(self, grid_x, grid_y):
-        """Check if grid coordinates are within bounds."""
-        if self.grid_dynamic is None:
-            return False
-        return (0 <= grid_x < self.grid_dynamic.shape[1] and
-                0 <= grid_y < self.grid_dynamic.shape[0])
+                if time_since > replan_cooldown:
+                    # Check if any changed cell is an obstacle near the path
+                    changed_set = set(changed_cells)
+                    r = PlannerConstants.PATH_CHECK_RADIUS
+                    for i in range(self.current_waypoint_idx,
+                                   min(self.current_waypoint_idx + 5, len(self.path))):
+                        wp = self.path[i]
+                        wp_gx, wp_gy = self.world_to_grid(wp[0], wp[1])
+                        for dy in range(-r, r + 1):
+                            for dx in range(-r, r + 1):
+                                cell = (wp_gx + dx, wp_gy + dy)
+                                if cell in changed_set:
+                                    cx, cy = cell
+                                    if (0 <= cx < self.grid_dynamic.shape[1] and
+                                            0 <= cy < self.grid_dynamic.shape[0] and
+                                            self.grid_dynamic[cy, cx] == 1):
+                                        self.replanning_needed = True
+                                        self.blocked_waypoint_idx = i
+                                        self.last_replan_time = current_time
+                                        return
 
     def map_callback(self, msg: OccupancyGrid):
         """
@@ -903,19 +575,9 @@ class DStarNavigator(Node):
 
         Integrates SLAM-discovered obstacles into the planning grid and
         triggers replanning if they block the current path.
-
-        Initializes and maintains the entire grid from SLAM data,
-        treating unknown areas as free.
-
-        Args:
-            msg: OccupancyGrid message from SLAM
         """
-        if not self.use_live_slam:
-            return
-
         is_first_map = not self.map_received
 
-        # Extract SLAM map data
         width, height = msg.info.width, msg.info.height
         slam_resolution = msg.info.resolution
         slam_origin = [msg.info.origin.position.x, msg.info.origin.position.y]
@@ -924,19 +586,17 @@ class DStarNavigator(Node):
         unknown_mask = (occupancy_data == -1)
 
         # Convert to binary (0=free, 1=occupied)
-        # Unknown (-1) treated as FREE for optimistic exploration
         slam_grid = np.zeros((height, width), dtype=np.int8)
-        slam_grid[occupancy_data >= 50] = 1  # Occupied if >50% probability
+        slam_grid[occupancy_data >= 50] = 1
 
         # Initialize grids from SLAM on first message
         if self.grid_original is None:
             self._initialize_grids_from_slam(height, width, slam_resolution, slam_origin)
             self.get_logger().info(
                 f'Initialized grid from SLAM: {width}x{height}, '
-                f'resolution={slam_resolution}m, origin=({slam_origin[0]:.2f}, {slam_origin[1]:.2f})'
-            )
+                f'resolution={slam_resolution}m, '
+                f'origin=({slam_origin[0]:.2f}, {slam_origin[1]:.2f})')
 
-        # Skip if grids not initialized yet
         if self.grid_original is None:
             return
 
@@ -945,80 +605,49 @@ class DStarNavigator(Node):
         self.grid_slam = slam_grid.copy()
         self.grid_unknown = np.zeros_like(self.grid_original, dtype=np.int8)
 
-        # Use SLAM obstacles directly (mapped to our grid)
+        # Map SLAM obstacles (vectorized)
         current_slam_obstacles, newly_discovered = self._map_slam_to_grid(
             slam_grid, unknown_mask, slam_resolution, slam_origin,
-            height, width, previous_unknown
-        )
+            height, width, previous_unknown)
 
-        # Update grid_base to reflect current SLAM state (add AND remove)
+        # Update dynamic grid
         self._update_dynamic_grid_with_slam(current_slam_obstacles)
 
-        # Check if replanning needed - require significant new discoveries
-        min_new_obstacles = 5  # Require at least this many new obstacles to consider replanning
+        # Check if replanning needed
+        min_new_obstacles = 5
         if newly_discovered >= min_new_obstacles and self.optimistic_planning and self.path:
-            # Also check cooldown for SLAM-triggered replanning
             current_time = self.get_clock().now()
             time_since_last_replan = (current_time - self.last_replan_time).nanoseconds / 1e9
 
-            if time_since_last_replan > PlannerConstants.REPLAN_COOLDOWN:
+            if time_since_last_replan > self.get_parameter('replan_cooldown').value:
                 if self._check_path_blocked_by_obstacles(current_slam_obstacles):
-                    # Clear known obstacles - new SLAM discoveries
                     self.known_obstacles.clear()
                     self.get_logger().warn(f'Newly discovered SLAM obstacles block current path!')
-                    self.get_logger().warn(f'  Changed cells: {newly_discovered}')
-                    self.get_logger().warn('  Triggering D* Lite replanning...')
                     self.replanning_needed = True
                     self.last_replan_time = current_time
 
         self.map_received = True
 
         if is_first_map:
-            self.get_logger().info(f'SLAM map integrated: {current_slam_obstacles.sum()} obstacles detected')
+            self.get_logger().info(
+                f'SLAM map integrated: {current_slam_obstacles.sum()} obstacles detected')
 
-    # ========================================================================
-    # SLAM OBSTACLE DETECTION
-    # ========================================================================
 
     def _initialize_grids_from_slam(self, height, width, resolution, origin):
-        """
-        Initialize all grids from SLAM dimensions (SLAM-only mode).
-
-        Creates empty grids matching SLAM map size. All cells start as free,
-        allowing pathfinding to unknown areas for exploration.
-
-        Args:
-            height, width: SLAM map dimensions in cells
-            resolution: SLAM map resolution (meters per cell)
-            origin: SLAM map origin [x, y] in world coordinates
-        """
+        """Initialize all grids from SLAM dimensions."""
         self.resolution = resolution
         self.origin = origin
 
-        # Initialize all grids as free (zeros)
         self.grid_original = np.zeros((height, width), dtype=np.int8)
         self.grid = np.zeros((height, width), dtype=np.int8)
         self.grid_base = np.zeros((height, width), dtype=np.int8)
         self.grid_dynamic = np.zeros((height, width), dtype=np.int8)
         self.grid_unknown = np.zeros((height, width), dtype=np.int8)
-        self.grid_local_costmap = np.zeros((height, width), dtype=np.int8)
-        self.grid_local_costmap_mask = np.zeros((height, width), dtype=np.int8)  # Tracks which cells have costmap data
 
     def _map_slam_to_grid(self, slam_grid, unknown_mask, slam_resolution, slam_origin,
                           height, width, previous_unknown):
         """
-        Map SLAM obstacles directly to our grid.
-
-        Maps all SLAM obstacles to the planning grid. Unknown areas remain free
-        to allow exploration pathfinding.
-
-        Args:
-            slam_grid: SLAM occupancy grid (0=free, 1=occupied)
-            unknown_mask: Boolean mask of unknown cells
-            slam_resolution: SLAM map resolution
-            slam_origin: SLAM map origin [x, y]
-            height, width: SLAM map dimensions
-            previous_unknown: Previous unknown mask (for tracking discoveries)
+        Map SLAM obstacles to our grid (vectorized).
 
         Returns:
             Tuple (obstacles_grid, newly_discovered_count)
@@ -1026,106 +655,70 @@ class DStarNavigator(Node):
         obstacles_grid = np.zeros_like(self.grid_original, dtype=np.int8)
         newly_discovered_count = 0
 
-        for slam_y in range(height):
-            for slam_x in range(width):
-                # Convert SLAM coordinates to our grid coordinates
-                world_x = slam_x * slam_resolution + slam_origin[0]
-                world_y = slam_y * slam_resolution + slam_origin[1]
-                grid_x = int((world_x - self.origin[0]) / self.resolution)
-                grid_y = int((world_y - self.origin[1]) / self.resolution)
+        # Build coordinate arrays for vectorized mapping
+        slam_ys, slam_xs = np.mgrid[0:height, 0:width]
+        world_xs = slam_xs * slam_resolution + slam_origin[0]
+        world_ys = slam_ys * slam_resolution + slam_origin[1]
+        grid_xs = ((world_xs - self.origin[0]) / self.resolution).astype(int)
+        grid_ys = ((world_ys - self.origin[1]) / self.resolution).astype(int)
 
-                # Check bounds
-                if not (0 <= grid_x < self.grid_original.shape[1] and
-                        0 <= grid_y < self.grid_original.shape[0]):
-                    continue
+        # Bounds mask
+        in_bounds = ((grid_xs >= 0) & (grid_xs < self.grid_original.shape[1]) &
+                     (grid_ys >= 0) & (grid_ys < self.grid_original.shape[0]))
 
-                # Track unknown cells (for visualization, but treat as free for planning)
-                if unknown_mask[slam_y, slam_x]:
-                    self.grid_unknown[grid_y, grid_x] = 1
+        # Apply unknown mask
+        unknown_in_bounds = in_bounds & unknown_mask
+        gxs_unk = grid_xs[unknown_in_bounds]
+        gys_unk = grid_ys[unknown_in_bounds]
+        self.grid_unknown[gys_unk, gxs_unk] = 1
 
-                # Map SLAM obstacles directly
-                if slam_grid[slam_y, slam_x] == 1:
-                    obstacles_grid[grid_y, grid_x] = 1
+        # Apply obstacle mask
+        obstacle_in_bounds = in_bounds & (slam_grid == 1)
+        gxs_obs = grid_xs[obstacle_in_bounds]
+        gys_obs = grid_ys[obstacle_in_bounds]
+        obstacles_grid[gys_obs, gxs_obs] = 1
 
-                    # Check if newly discovered (was unknown before)
-                    if previous_unknown is not None and previous_unknown[grid_y, grid_x] == 1:
-                        newly_discovered_count += 1
+        # Count newly discovered
+        if previous_unknown is not None:
+            newly_discovered_count = int(np.sum(
+                previous_unknown[gys_obs, gxs_obs] == 1))
 
         return obstacles_grid, newly_discovered_count
 
     def _update_dynamic_grid_with_slam(self, current_slam_obstacles):
-        """
-        Update grid_base to reflect current SLAM obstacle state.
-
-        IMPORTANT: This SYNCS with SLAM state - both adding new obstacles
-        AND removing obstacles that SLAM no longer reports. This ensures the
-        grid reflects reality when obstacles move or disappear.
-
-        - Starts with empty grid (all free)
-        - Only SLAM obstacles are marked
-        - Unknown areas remain FREE for exploration pathfinding
-
-        Args:
-            current_slam_obstacles: Binary grid of ALL current SLAM obstacles
-        """
-        # Store previous state to detect changes
+        """Update grid_base to reflect current SLAM obstacle state."""
         previous_grid_base = self.grid_base.copy() if self.grid_base is not None else None
 
-        # Start with base grid (empty initially, allowing exploration)
         self.grid_base = self.grid.copy()
 
-        # Replace with current SLAM obstacles (inflated) - allows both adding AND removing
         if current_slam_obstacles.sum() > 0:
             total_inflation = self.robot_radius + self.safety_clearance
-            slam_obstacles_inflated = self._inflate_obstacles(current_slam_obstacles, total_inflation)
-
-            # Replace base with current SLAM state (not accumulate)
+            slam_obstacles_inflated = self._inflate_obstacles(
+                current_slam_obstacles, total_inflation)
             self.grid_base = slam_obstacles_inflated
 
-        # Update dynamic grid: Start with SLAM base, then COSTMAP OVERRIDES as truth
         self.grid_dynamic = self.grid_base.copy()
-        if self.grid_local_costmap is not None and self.grid_local_costmap_mask is not None:
-            # Where costmap has data (mask==1), use costmap value (overrides SLAM)
-            # Where no costmap data (mask==0), use SLAM value
-            # This makes costmap the "truth" over SLAM since it's real-time sensor data
-            self.grid_dynamic = np.where(self.grid_local_costmap_mask == 1,
-                                        self.grid_local_costmap,
-                                        self.grid_dynamic)
 
-        # Find changed cells (both additions AND removals)
+        # Find changed cells (vectorized)
         changed_cells = []
         if previous_grid_base is not None:
-            rows, cols = self.grid_base.shape
-            for y in range(rows):
-                for x in range(cols):
-                    if previous_grid_base[y, x] != self.grid_base[y, x]:
-                        changed_cells.append((x, y))
+            diff = np.where(previous_grid_base != self.grid_base)
+            changed_cells = list(zip(diff[1].tolist(), diff[0].tolist()))  # (x, y)
 
-        # Update D* Lite planner with all changes
         if self.dstar_planner is not None and changed_cells:
-            self.get_logger().info(f'Syncing {len(changed_cells)} SLAM changes to D* planner (adds & removes)')
+            self.get_logger().info(f'Syncing {len(changed_cells)} SLAM changes to D* planner')
             self.dstar_planner.grid = self.grid_dynamic.copy()
             self.dstar_planner.update_obstacles(changed_cells)
             self.planner_grid_snapshot = self.grid_base.copy()
 
-        # Publish updated dynamic grid for visualization
         self.publish_dynamic_grid()
 
     def _check_path_blocked_by_obstacles(self, obstacles_grid):
-        """
-        Check if obstacles block any waypoints in the current path.
-
-        Args:
-            obstacles_grid: Binary grid of obstacle positions
-
-        Returns:
-            True if path is blocked, False otherwise
-        """
+        """Check if obstacles block any waypoints in the current path."""
         if not self.path:
             return False
 
         for waypoint_idx, waypoint in enumerate(self.path):
-            # Skip waypoints we've already passed
             if waypoint_idx < self.current_waypoint_idx:
                 continue
 
@@ -1134,54 +727,36 @@ class DStarNavigator(Node):
             if not (0 <= gx < obstacles_grid.shape[1] and 0 <= gy < obstacles_grid.shape[0]):
                 continue
 
-            # Check waypoint and surrounding cells
-            for dy in range(-PlannerConstants.PATH_CHECK_RADIUS,
-                          PlannerConstants.PATH_CHECK_RADIUS + 1):
-                for dx in range(-PlannerConstants.PATH_CHECK_RADIUS,
-                              PlannerConstants.PATH_CHECK_RADIUS + 1):
+            r = PlannerConstants.PATH_CHECK_RADIUS
+            for dy in range(-r, r + 1):
+                for dx in range(-r, r + 1):
                     nx, ny = gx + dx, gy + dy
                     if (0 <= nx < obstacles_grid.shape[1] and
                         0 <= ny < obstacles_grid.shape[0] and
                         obstacles_grid[ny, nx] != 0):
-                        # Store blocked waypoint index for partial path preservation
                         self.blocked_waypoint_idx = waypoint_idx
                         return True
 
         return False
 
-    # ========================================================================
-    # PATH PLANNING
-    # ========================================================================
 
     def navigate_to_goal(self, start_x, start_y, goal_x, goal_y):
-        """
-        Navigate from start to goal position.
+        """Navigate from start to goal position."""
+        self.get_logger().info(
+            f'Planning path from ({start_x:.2f}, {start_y:.2f}) '
+            f'to ({goal_x:.2f}, {goal_y:.2f})')
 
-        This is the main entry point for navigation. Plans a path using D* Lite
-        and begins following it.
-
-        Args:
-            start_x, start_y: Start position in meters (world coordinates)
-            goal_x, goal_y: Goal position in meters (world coordinates)
-
-        Returns:
-            True if path found and navigation started, False otherwise
-        """
-        self.get_logger().info(f'Planning path from ({start_x:.2f}, {start_y:.2f}) to ({goal_x:.2f}, {goal_y:.2f})')
-
-        # Clear known obstacles for fresh navigation
         self.known_obstacles.clear()
+        self._goal_just_reached = False
 
         self.path = self.plan_path(start_x, start_y, goal_x, goal_y)
 
         if self.path:
             self.current_waypoint_idx = 0
-            # Initialize distance and time tracking
             self.start_time = self.get_clock().now()
             self.total_distance = 0.0
             self.last_position = (start_x, start_y)
             self.get_logger().info(f'Path found with {len(self.path)} waypoints')
-            self.get_logger().info('Started tracking distance and time')
             self.publish_path()
             return True
         else:
@@ -1189,91 +764,51 @@ class DStarNavigator(Node):
             return False
 
     def plan_path(self, start_x, start_y, goal_x, goal_y):
-        """
-        Plan path using D* Lite algorithm.
-
-        Converts world coordinates to grid, validates positions, runs D* Lite,
-        and converts result back to world coordinates.
-
-        Args:
-            start_x, start_y: Start in world coordinates
-            goal_x, goal_y: Goal in world coordinates
-
-        Returns:
-            List of waypoints [(x, y), ...] in world coordinates, or [] if no path
-        """
-        if self.grid is None or self.grid_original is None:
+        """Plan path using D* Lite algorithm."""
+        if self.grid_dynamic is None or self.grid_original is None:
             self.get_logger().error('No map available!')
             return []
 
-        # Convert to grid coordinates
         start_grid = self.world_to_grid(start_x, start_y)
         goal_grid = self.world_to_grid(goal_x, goal_y)
 
-        # Validate start position (must be in free space in original grid)
+        # Validate start in original grid (robot is already there)
         if not self._is_valid_in_original_grid(start_grid):
-            self.get_logger().error(f'Start position is invalid!')
+            self.get_logger().error('Start position is invalid!')
             return []
 
-        # Validate goal position (must be in free space in inflated grid)
-        # NOTE: This could be changed to allow to robot to get as close to the goal as possible
-        if not self._is_valid_in_inflated_grid(goal_grid):
-            self.get_logger().error(f'Goal position is invalid!')
+        # Validate goal in dynamic grid
+        if not self._is_valid_in_dynamic_grid(goal_grid):
+            self.get_logger().error('Goal position is invalid!')
             return []
 
-        # Run D* Lite planning
         path_grid = self.dstar_plan(start_grid, goal_grid)
 
         if not path_grid:
-            self.get_logger().error(f'Dstar algorithm path not found!')
+            self.get_logger().error('D* Lite algorithm found no path!')
             return []
 
-        # Convert to world coordinates
         path_world = [self.grid_to_world(gx, gy) for gx, gy in path_grid]
-
-        # Simplify for smoother motion
-        return self._simplify_path(path_world, max_points=PlannerConstants.MAX_WAYPOINTS)
+        max_wp = self.get_parameter('max_waypoints').value
+        return self._simplify_path(path_world, max_points=max_wp)
 
     def dstar_plan(self, start_grid, goal_grid):
-        """
-        Plan or replan using D* Lite.
-
-        Decides whether to do initial planning or incremental replanning
-        based on whether planner exists and goal changed.
-
-        Args:
-            start_grid: Start position (gx, gy)
-            goal_grid: Goal position (gx, gy)
-
-        Returns:
-            Path as list of grid positions, or [] if no path
-        """
-        # Initial planning if planner doesn't exist or goal changed
+        """Plan or replan using D* Lite."""
         if self.dstar_planner is None or self.goal_grid != goal_grid:
             return self._initial_dstar_plan(start_grid, goal_grid)
         else:
             return self._replan_dstar(start_grid, goal_grid)
 
     def _initial_dstar_plan(self, start_grid, goal_grid):
-        """
-        Create initial D* Lite plan.
-
-        Initializes new planner and computes first path.
-
-        Args:
-            start_grid: Start position
-            goal_grid: Goal position
-
-        Returns:
-            Path or [] if failed
-        """
+        """Create initial D* Lite plan."""
         self.get_logger().info('Initializing D* Lite planner...')
 
-        self.dstar_planner = DStarLite(self.grid_dynamic.copy(), start_grid, goal_grid)
+        self.dstar_planner = DStarLite(
+            self.grid_dynamic.copy(), start_grid, goal_grid,
+            logger=self.get_logger())
         self.goal_grid = goal_grid
-
-        # Snapshot base grid for change detection (persistent obstacles only)
-        self.planner_grid_snapshot = self.grid_base.copy() if self.grid_base is not None else self.grid.copy()
+        self.planner_grid_snapshot = (
+            self.grid_base.copy() if self.grid_base is not None else self.grid.copy())
 
         if not self.dstar_planner.compute_shortest_path():
             self.get_logger().error('D* Lite failed to find initial path')
@@ -1285,276 +820,140 @@ class DStarNavigator(Node):
         return path
 
     def _replan_dstar(self, start_grid, goal_grid):
-        """
-        Replan using D* Lite with updated obstacles.
-
-        This is the incremental replanning that makes D* Lite efficient.
-        Only processes vertices affected by obstacle changes.
-
-        Args:
-            start_grid: New start position
-            goal_grid: Goal position (unchanged)
-
-        Returns:
-            Updated path or [] if failed
-        """
+        """Replan using D* Lite with updated obstacles."""
         self.get_logger().info('Replanning with D* Lite...')
 
-        # Debug: Check if start position is occupied
         start_x, start_y = start_grid
         if (0 <= start_x < self.grid_dynamic.shape[1] and
             0 <= start_y < self.grid_dynamic.shape[0]):
-            is_occupied = self.grid_dynamic[start_y, start_x] != 0
-            self.get_logger().info(f'Start grid position: ({start_x}, {start_y}), occupied: {is_occupied}')
-
-            if is_occupied:
-                self.get_logger().warn('Start position is marked as occupied! Clearing robot area...')
-                # Clear area around robot before replanning
+            if self.grid_dynamic[start_y, start_x] != 0:
+                self.get_logger().warn('Start position is occupied, clearing robot area...')
                 self._clear_robot_area(start_x, start_y)
 
-        # Update start position (robot has moved)
         self.dstar_planner.update_start(start_grid)
 
-        # Find changed cells (compare base grids for persistent obstacles only)
         changed_cells = self._find_changed_cells()
 
         if changed_cells:
-            self.get_logger().info(f'Persistent obstacle changes detected: {len(changed_cells)} cells')
-
-            # Update planner's grid
+            self.get_logger().info(
+                f'Persistent obstacle changes detected: {len(changed_cells)} cells')
             self.dstar_planner.grid = self.grid_dynamic.copy()
-
-            # Incremental update - only processes affected vertices!
             self.dstar_planner.update_obstacles(changed_cells)
+            self.planner_grid_snapshot = (
+                self.grid_base.copy() if self.grid_base is not None else self.grid.copy())
 
-            # Update snapshot
-            self.planner_grid_snapshot = self.grid_base.copy() if self.grid_base is not None else self.grid.copy()
-
-        # Recompute shortest path (incrementally)
         if not self.dstar_planner.compute_shortest_path():
-            self.get_logger().error('D* Lite replanning failed - path is blocked')
+            self.get_logger().error('D* Lite replanning failed')
             return []
 
-        # Check if start is reachable
         if self.dstar_planner.g[start_grid] == float('inf'):
-            self.get_logger().warn('Start position unreachable after incremental replan - trying fresh reinitialization...')
-            self._debug_unreachable_start(start_grid, goal_grid)
-            # Fallback: reinitialize D* Lite completely
+            self.get_logger().warn('Start unreachable after replan, reinitializing...')
             return self._reinitialize_dstar(start_grid, goal_grid)
 
-        # Extract new path (with debug logging)
         path = self.dstar_planner.extract_path(debug=True)
         if not path:
-            self.get_logger().warn('D* Lite incremental extract failed - trying fresh reinitialization...')
-            # Fallback: reinitialize D* Lite completely
+            self.get_logger().warn('D* Lite extract failed, reinitializing...')
             return self._reinitialize_dstar(start_grid, goal_grid)
 
         self.get_logger().info(f'D* Lite replanning successful: {len(path)} waypoints')
         return path
 
     def _find_changed_cells(self):
-        """
-        Find cells that changed since last planning.
-
-        Compares grid_base snapshots to track only persistent (SLAM) obstacles,
-        not temporary lidar detections. This prevents the "massive grid changes"
-        bug where 4000+ cells were detected as changed.
-
-        Returns:
-            List of changed cell positions [(x, y), ...]
-        """
-        changed_cells = []
-
-        # Compare base grids (persistent SLAM obstacles only)
+        """Find cells that changed since last planning (vectorized)."""
         current_base = self.grid_base if self.grid_base is not None else self.grid
 
         if self.planner_grid_snapshot is None:
-            return changed_cells
+            return []
 
-        rows, cols = current_base.shape
-        for y in range(rows):
-            for x in range(cols):
-                if self.planner_grid_snapshot[y, x] != current_base[y, x]:
-                    changed_cells.append((x, y))
-
-        return changed_cells
+        diff = np.where(self.planner_grid_snapshot != current_base)
+        return list(zip(diff[1].tolist(), diff[0].tolist()))  # (x, y)
 
     def _reinitialize_dstar(self, start_grid, goal_grid):
-        """
-        Reinitialize D* Lite planner from scratch.
-
-        This is a fallback when incremental replanning fails due to
-        corrupted internal state. Creates a fresh planner with current grid.
-
-        Args:
-            start_grid: Start position
-            goal_grid: Goal position
-
-        Returns:
-            Path or [] if still fails
-        """
+        """Reinitialize D* Lite planner from scratch (fallback)."""
         self.get_logger().info('Reinitializing D* Lite planner from scratch...')
 
-        # Clear robot area in grid first
         start_x, start_y = start_grid
         self._clear_robot_area(start_x, start_y)
 
-        # Check if goal is occupied and find nearest free cell if so
         goal_x, goal_y = goal_grid
         if (0 <= goal_x < self.grid_dynamic.shape[1] and
             0 <= goal_y < self.grid_dynamic.shape[0] and
             self.grid_dynamic[goal_y, goal_x] != 0):
-            self.get_logger().warn(f'Goal ({goal_x}, {goal_y}) is occupied, finding nearest free cell...')
             new_goal = self._find_nearest_free_cell(goal_x, goal_y)
             if new_goal:
                 goal_grid = new_goal
-                self.goal_grid = new_goal  # Update stored goal
-                self.get_logger().info(f'Using alternative goal: {new_goal}')
+                self.goal_grid = new_goal
             else:
                 self.get_logger().error('Could not find free cell near goal')
                 return []
 
-        # Create fresh planner
-        self.dstar_planner = DStarLite(self.grid_dynamic.copy(), start_grid, goal_grid)
-        self.planner_grid_snapshot = self.grid_base.copy() if self.grid_base is not None else self.grid.copy()
+        self.dstar_planner = DStarLite(
+            self.grid_dynamic.copy(), start_grid, goal_grid,
+            logger=self.get_logger())
+        self.planner_grid_snapshot = (
+            self.grid_base.copy() if self.grid_base is not None else self.grid.copy())
 
-        # Compute path
         if not self.dstar_planner.compute_shortest_path():
             self.get_logger().error('Fresh D* Lite also failed to find path')
             return []
 
         if self.dstar_planner.g[start_grid] == float('inf'):
             self.get_logger().error('Start still unreachable after reinitialization')
-            self._debug_unreachable_start(start_grid, goal_grid)
             return []
 
         path = self.dstar_planner.extract_path(debug=True)
         if path:
             self.get_logger().info(f'Fresh D* Lite found path with {len(path)} waypoints')
-        else:
-            self.get_logger().error('Fresh D* Lite also failed to extract path')
-
         return path
 
     def _find_nearest_free_cell(self, gx, gy, max_radius=10):
-        """
-        Find the nearest free cell to the given position.
-
-        Searches in expanding circles until a free cell is found.
-
-        Args:
-            gx, gy: Center position in grid coordinates
-            max_radius: Maximum search radius in cells
-
-        Returns:
-            Tuple (x, y) of nearest free cell, or None if not found
-        """
+        """Find the nearest free cell to the given position."""
         for radius in range(1, max_radius + 1):
-            # Search in a square ring at this radius
             for dx in range(-radius, radius + 1):
                 for dy in range(-radius, radius + 1):
-                    # Only check cells on the ring perimeter
                     if abs(dx) != radius and abs(dy) != radius:
                         continue
-
                     nx, ny = gx + dx, gy + dy
                     if (0 <= nx < self.grid_dynamic.shape[1] and
                         0 <= ny < self.grid_dynamic.shape[0] and
                         self.grid_dynamic[ny, nx] == 0):
                         return (nx, ny)
-
         return None
 
-    def _debug_unreachable_start(self, start_grid, goal_grid):
-        """Debug helper to understand why start is unreachable."""
-        start_x, start_y = start_grid
-        goal_x, goal_y = goal_grid
-
-        self.get_logger().error(f'  Start: ({start_x}, {start_y}), Goal: ({goal_x}, {goal_y})')
-
-        # Check start neighborhood
-        obstacles_around_start = []
-        for dy in range(-3, 4):
-            for dx in range(-3, 4):
-                nx, ny = start_x + dx, start_y + dy
-                if (0 <= nx < self.grid_dynamic.shape[1] and
-                    0 <= ny < self.grid_dynamic.shape[0]):
-                    if self.grid_dynamic[ny, nx] != 0:
-                        obstacles_around_start.append((nx, ny))
-
-        self.get_logger().error(f'  Obstacles within 3 cells of start: {len(obstacles_around_start)}')
-        if obstacles_around_start and len(obstacles_around_start) <= 10:
-            self.get_logger().error(f'  Obstacle positions: {obstacles_around_start}')
-
-        # Check goal
-        if (0 <= goal_x < self.grid_dynamic.shape[1] and
-            0 <= goal_y < self.grid_dynamic.shape[0]):
-            goal_occupied = self.grid_dynamic[goal_y, goal_x] != 0
-            self.get_logger().error(f'  Goal occupied: {goal_occupied}')
-
-        # Check g-value at goal
-        goal_g = self.dstar_planner.g[goal_grid]
-        self.get_logger().error(f'  Goal g-value: {goal_g}')
-
     def _clear_robot_area(self, robot_gx, robot_gy):
-        """
-        Clear the area around the robot in all grids.
-
-        This fixes the issue where SLAM inflation or noise marks the robot's
-        current position as occupied, making replanning fail.
-
-        Args:
-            robot_gx, robot_gy: Robot position in grid coordinates
-        """
+        """Clear the area around the robot in all grids."""
         clearance = PlannerConstants.ROBOT_CLEARANCE_CELLS
         changed_cells = []
 
         for dy in range(-clearance, clearance + 1):
             for dx in range(-clearance, clearance + 1):
-                clear_x, clear_y = robot_gx + dx, robot_gy + dy
-
-                if (0 <= clear_x < self.grid_dynamic.shape[1] and
-                    0 <= clear_y < self.grid_dynamic.shape[0]):
-
-                    # Only clear if it was occupied (track for D* update)
-                    if self.grid_dynamic[clear_y, clear_x] != 0:
-                        changed_cells.append((clear_x, clear_y))
-
-                    # Clear in all grids
-                    self.grid_dynamic[clear_y, clear_x] = 0
+                cx, cy = robot_gx + dx, robot_gy + dy
+                if (0 <= cx < self.grid_dynamic.shape[1] and
+                    0 <= cy < self.grid_dynamic.shape[0]):
+                    if self.grid_dynamic[cy, cx] != 0:
+                        changed_cells.append((cx, cy))
+                    self.grid_dynamic[cy, cx] = 0
                     if self.grid_base is not None:
-                        self.grid_base[clear_y, clear_x] = 0
+                        self.grid_base[cy, cx] = 0
 
-        # Update D* planner's grid and notify of changes
         if self.dstar_planner is not None and changed_cells:
             self.dstar_planner.grid = self.grid_dynamic.copy()
             self.dstar_planner.update_obstacles(changed_cells)
             self.get_logger().info(f'Cleared {len(changed_cells)} cells around robot')
 
-    # ========================================================================
-    # ROBOT CONTROL
-    # ========================================================================
 
     def control_loop(self):
-        """
-        Main control loop - executes at 10 Hz.
-
-        State machine:
-        1. If replanning needed -> stop and replan
-        2. If goal reached -> stop and clear path
-        3. Otherwise -> follow current waypoint
-        """
+        """Main control loop -- executes at 10 Hz."""
         if not self.path or self.current_pose is None:
             return
-        
+
         # Update distance traveled
         if self.last_position is not None:
             current_x = self.current_pose['x']
             current_y = self.current_pose['y']
             dx = current_x - self.last_position[0]
             dy = current_y - self.last_position[1]
-            distance_increment = math.sqrt(dx**2 + dy**2)
-            self.total_distance += distance_increment
+            self.total_distance += math.sqrt(dx**2 + dy**2)
             self.last_position = (current_x, current_y)
 
         if self.replanning_needed:
@@ -1562,34 +961,32 @@ class DStarNavigator(Node):
             return
 
         if self.current_waypoint_idx >= len(self.path):
-            self.stop_robot()
-            # Calculate elapsed time
+            if self.standalone:
+                self.stop_robot()
             if self.start_time is not None:
                 elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
-                self.get_logger().info('Goal reached! 😎')
+                self.get_logger().info('Goal reached!')
                 self.get_logger().info(f'Total distance traveled: {self.total_distance:.2f} meters')
                 self.get_logger().info(f'Total time elapsed: {elapsed_time:.2f} seconds')
             else:
-                self.get_logger().info('Goal reached! 😎')
+                self.get_logger().info('Goal reached!')
+            self._planner_state = 'idle'
+            self._goal_just_reached = True
             self.path = []
             return
 
-        self._follow_waypoint()
+        if self.standalone:
+            self._follow_waypoint()
 
     def _handle_replanning(self):
-        """
-        Handle replanning request.
-
-        Stops robot, preserves valid waypoints up to the obstacle, and replans
-        from the last valid waypoint to the original goal.
-        """
+        """Handle replanning request."""
         self.get_logger().info('Stopping robot for replanning...')
-        self.stop_robot()
+        if self.standalone:
+            self.stop_robot()
 
         if self.goal_grid is not None:
             goal_x, goal_y = self.grid_to_world(self.goal_grid[0], self.goal_grid[1])
 
-            # Preserve valid waypoints up to the blocked segment
             preserved_waypoints = []
             replan_start_x = self.current_pose['x']
             replan_start_y = self.current_pose['y']
@@ -1597,82 +994,61 @@ class DStarNavigator(Node):
             if (self.blocked_waypoint_idx is not None and
                 self.blocked_waypoint_idx > self.current_waypoint_idx and
                 self.path):
-                # Preserve waypoints from current position up to (not including) the blocked one
                 preserved_waypoints = self.path[self.current_waypoint_idx:self.blocked_waypoint_idx]
-
                 if preserved_waypoints:
-                    # Replan from the last preserved waypoint
                     replan_start_x, replan_start_y = preserved_waypoints[-1]
-                    self.get_logger().info(
-                        f'Preserving {len(preserved_waypoints)} waypoints before obstacle at index {self.blocked_waypoint_idx}'
-                    )
 
-            # Plan new path from replan start point to goal
             new_path = self.plan_path(replan_start_x, replan_start_y, goal_x, goal_y)
 
             if new_path:
                 if preserved_waypoints:
-                    # Merge preserved waypoints with new path
-                    # Skip first point of new_path if it's the same as last preserved waypoint
                     if (new_path and len(preserved_waypoints) > 0 and
                         abs(new_path[0][0] - preserved_waypoints[-1][0]) < 0.05 and
                         abs(new_path[0][1] - preserved_waypoints[-1][1]) < 0.05):
                         new_path = new_path[1:]
                     self.path = preserved_waypoints + new_path
-                    # Keep current waypoint index since we preserved from there
                 else:
                     self.path = new_path
                     self.current_waypoint_idx = 0
 
-                self.get_logger().info(f'Replanning successful! Path: {len(self.path)} waypoints '
-                                      f'({len(preserved_waypoints)} preserved + {len(new_path)} new)')
+                self.get_logger().info(
+                    f'Replanning successful! Path: {len(self.path)} waypoints '
+                    f'({len(preserved_waypoints)} preserved + {len(new_path)} new)')
                 self.publish_path()
             else:
                 self.get_logger().error('Replanning failed! Stopping navigation.')
                 self.path = []
+                self._planner_state = 'idle'
 
-        # Reset blocked waypoint tracker
         self.blocked_waypoint_idx = None
         self.replanning_needed = False
 
     def _follow_waypoint(self):
-        """
-        Follow current waypoint using simple proportional control.
-
-        Control strategy:
-        1. If not facing waypoint -> rotate in place
-        2. If facing waypoint -> move forward with proportional angular correction
-        """
+        """Follow current waypoint using simple proportional control."""
         target = self.path[self.current_waypoint_idx]
         tx, ty = target
 
-        # Calculate errors
         dx = tx - self.current_pose['x']
         dy = ty - self.current_pose['y']
         distance = math.sqrt(dx**2 + dy**2)
         target_angle = math.atan2(dy, dx)
-        angle_diff = self.normalize_angle(target_angle - self.current_pose['theta'])
+        angle_diff = normalize_angle(target_angle - self.current_pose['theta'])
 
         cmd = TwistStamped()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.header.frame_id = 'base_link'
 
-        # Check if waypoint reached
         if distance < self.position_tolerance:
             self.current_waypoint_idx += 1
-            # Clear known obstacles when making progress
             self.known_obstacles.clear()
             self.get_logger().info(f'Waypoint {self.current_waypoint_idx}/{len(self.path)} reached')
             return
 
-        # Control logic
         if abs(angle_diff) > self.angle_tolerance:
-            # Rotate in place to face waypoint
             cmd.twist.angular.z = self.angular_speed if angle_diff > 0 else -self.angular_speed
         else:
-            # Move forward with proportional angular correction
             cmd.twist.linear.x = min(self.linear_speed, distance)
-            cmd.twist.angular.z = 0.3 * angle_diff  # Proportional correction
+            cmd.twist.angular.z = 0.3 * angle_diff
 
         self.cmd_vel_pub.publish(cmd)
 
@@ -1683,12 +1059,9 @@ class DStarNavigator(Node):
         cmd.header.frame_id = 'base_link'
         self.cmd_vel_pub.publish(cmd)
 
-    # ========================================================================
-    # UTILITY METHODS
-    # ========================================================================
 
     def publish_path(self):
-        """Publish the planned path as a nav_msgs/Path for RViz visualization."""
+        """Publish the planned path as a nav_msgs/Path."""
         path_msg = Path()
         path_msg.header.stamp = self.get_clock().now().to_msg()
         path_msg.header.frame_id = 'map'
@@ -1706,13 +1079,7 @@ class DStarNavigator(Node):
         self.path_pub.publish(path_msg)
 
     def publish_dynamic_grid(self):
-        """
-        Publish the dynamic grid for visualization.
-
-        The dynamic grid shows the current planning grid including:
-        - SLAM-discovered obstacles
-        - Lidar-detected obstacles (temporary)
-        """
+        """Publish the dynamic grid for visualization."""
         if self.grid_dynamic is None or self.resolution is None:
             return
 
@@ -1720,7 +1087,6 @@ class DStarNavigator(Node):
         grid_msg.header.stamp = self.get_clock().now().to_msg()
         grid_msg.header.frame_id = 'map'
 
-        # Set map metadata
         grid_msg.info.resolution = self.resolution
         grid_msg.info.width = self.grid_dynamic.shape[1]
         grid_msg.info.height = self.grid_dynamic.shape[0]
@@ -1728,209 +1094,78 @@ class DStarNavigator(Node):
         grid_msg.info.origin.position.y = self.origin[1]
         grid_msg.info.origin.position.z = 0.0
 
-        # Convert grid to occupancy data (0=free, 100=occupied)
         occupancy_data = (self.grid_dynamic * 100).astype(np.int8).flatten().tolist()
         grid_msg.data = occupancy_data
 
         self.dynamic_grid_pub.publish(grid_msg)
 
-    def _is_valid_in_inflated_grid(self, grid_pos):
-        """
-        Check if position is valid in inflated grid.
-
-        Args:
-            grid_pos: Position (gx, gy)
-
-        Returns:
-            True if in bounds and free, False otherwise
-        """
+    def _is_valid_in_dynamic_grid(self, grid_pos):
+        """Check if position is valid in the dynamic grid."""
         gx, gy = grid_pos
-        if gx < 0 or gx >= self.grid.shape[1] or gy < 0 or gy >= self.grid.shape[0]:
+        if self.grid_dynamic is None:
             return False
-        return self.grid[gy, gx] == 0
+        if gx < 0 or gx >= self.grid_dynamic.shape[1] or gy < 0 or gy >= self.grid_dynamic.shape[0]:
+            return False
+        return self.grid_dynamic[gy, gx] == 0
 
     def _is_valid_in_original_grid(self, grid_pos):
-        """
-        Check if position is valid in original (uninflated) grid.
-
-        Args:
-            grid_pos: Position (gx, gy)
-
-        Returns:
-            True if in bounds and free, False otherwise
-        """
+        """Check if position is valid in original (uninflated) grid."""
         gx, gy = grid_pos
-        if gx < 0 or gx >= self.grid_original.shape[1] or gy < 0 or gy >= self.grid_original.shape[0]:
+        if self.grid_original is None:
+            return False
+        if (gx < 0 or gx >= self.grid_original.shape[1] or
+                gy < 0 or gy >= self.grid_original.shape[0]):
             return False
         return self.grid_original[gy, gx] == 0
 
     def world_to_grid(self, x, y):
-        """
-        Convert world coordinates to grid indices.
-
-        Args:
-            x, y: World coordinates in meters
-
-        Returns:
-            Tuple (grid_x, grid_y)
-        """
+        """Convert world coordinates to grid indices."""
         grid_x = int((x - self.origin[0]) / self.resolution)
         grid_y = int((y - self.origin[1]) / self.resolution)
         return (grid_x, grid_y)
 
     def grid_to_world(self, grid_x, grid_y):
-        """
-        Convert grid indices to world coordinates.
-
-        Args:
-            grid_x, grid_y: Grid coordinates
-
-        Returns:
-            Tuple (x, y) in meters
-        """
+        """Convert grid indices to world coordinates."""
         x = grid_x * self.resolution + self.origin[0]
         y = grid_y * self.resolution + self.origin[1]
         return (x, y)
 
-    def _simplify_path(self, path, max_points=20):
-        """
-        Simplify path by keeping only key waypoints.
-
-        Reduces waypoint count for smoother motion.
-
-        Args:
-            path: List of waypoints
-            max_points: Maximum number of waypoints to keep
-
-        Returns:
-            Simplified path
-        """
+    def _simplify_path(self, path, max_points=10):
+        """Simplify path by keeping only key waypoints."""
         if len(path) <= max_points:
             return path
-
         step = len(path) // max_points
         simplified = [path[i] for i in range(0, len(path), step)]
-        simplified.append(path[-1])  # Always include goal
+        simplified.append(path[-1])
         return simplified
-
-    def get_current_position(self):
-        """
-        Get current robot position.
-
-        Returns:
-            Tuple (x, y) or None if no odometry yet
-        """
-        if self.current_pose is None:
-            self.get_logger().warn('No odometry data available yet')
-            return None
-        return (self.current_pose['x'], self.current_pose['y'])
 
     @staticmethod
     def quaternion_to_yaw(q):
-        """
-        Convert quaternion to yaw angle.
-
-        Args:
-            q: Quaternion with w, x, y, z components
-
-        Returns:
-            Yaw angle in radians
-        """
+        """Convert quaternion to yaw angle."""
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         return math.atan2(siny_cosp, cosy_cosp)
 
-    @staticmethod
-    def normalize_angle(angle):
-        """
-        Normalize angle to [-pi, pi].
 
-        Args:
-            angle: Angle in radians
+def normalize_angle(angle):
+    """Normalize angle to [-pi, pi] using modular arithmetic."""
+    return (angle + math.pi) % (2 * math.pi) - math.pi
 
-        Returns:
-            Normalized angle in [-pi, pi]
-        """
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
-
-
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
 
 def main(args=None):
-    """
-    Main entry point for D* Lite navigator.
-
-    Configuration:
-        - Set environment variables to override defaults:
-          ROBOT_RADIUS, SAFETY_CLEARANCE, OPTIMISTIC_PLANNING
-        - Or modify PlannerConstants class directly
-
-    Navigation:
-        - Send goal poses to the goal_pose topic (PoseStamped messages)
-        - Example: ros2 topic pub /don/goal_pose geometry_msgs/PoseStamped '{pose: {position: {x: 1.0, y: 2.0}}}'
-    """
-
-    # Load configuration from environment (with PlannerConstants as defaults)
-    robot_radius = float(os.getenv('ROBOT_RADIUS', str(PlannerConstants.ROBOT_RADIUS)))
-    safety_clearance = float(os.getenv('SAFETY_CLEARANCE', str(PlannerConstants.SAFETY_CLEARANCE)))
-    optimistic_planning = os.getenv('OPTIMISTIC_PLANNING', '1') == '1'
-
+    """Main entry point for D* Lite navigator."""
     rclpy.init(args=args)
-    navigator = DStarNavigator(
-        robot_radius=robot_radius,
-        safety_clearance=safety_clearance,
-        optimistic_planning=optimistic_planning
-    )
+    navigator = DStarNavigator()
 
-    # Print usage information
-    print("\n" + "="*60)
-    print("TurtleBot4 D* Lite Navigator with Dynamic Replanning")
-    print("="*60)
-    print(f"\nConfiguration:")
-    print(f"  Robot radius: {robot_radius}m")
-    print(f"  Safety clearance: {safety_clearance}m")
-    print(f"  Optimistic planning: {'ENABLED' if optimistic_planning else 'DISABLED'}")
-    print(f"\nTopics:")
-    print(f"  Goal pose input: {PlannerConstants.GOAL_POSE}")
-    print(f"  Odometry: {PlannerConstants.ODOMETRY}")
-    print(f"  Map: {PlannerConstants.OCCUPANCY_GRID}")
-    print(f"\nUsage:")
-    print(f"  ros2 topic pub {PlannerConstants.GOAL_POSE} geometry_msgs/PoseStamped '{{pose: {{position: {{x: 1.0, y: 2.0}}}}}}' --once")
-    print("="*60 + "\n")
-
-    # Wait for odometry
-    print("Waiting for odometry data...")
-    while navigator.current_pose is None and rclpy.ok():
-        rclpy.spin_once(navigator, timeout_sec=0.1)
-
-    if navigator.current_pose:
-        print(f"Odometry received. Current position: ({navigator.current_pose['x']:.2f}, {navigator.current_pose['y']:.2f})")
-
-    # Wait for SLAM map
-    if navigator.use_live_slam:
-        print("Listening for SLAM map updates...")
-        for _ in range(20):
-            rclpy.spin_once(navigator, timeout_sec=0.1)
-
-    print(f"\nReady! Waiting for goal poses on {PlannerConstants.GOAL_POSE}...")
-    
     try:
         rclpy.spin(navigator)
     except KeyboardInterrupt:
-        print("\nShutting down...")
-
-    # Cleanup
-    navigator.stop_robot()
-    navigator.destroy_node()
-    rclpy.shutdown()
+        pass
+    finally:
+        navigator.stop_robot()
+        navigator.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
     main()
-    
