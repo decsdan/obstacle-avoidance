@@ -3,16 +3,23 @@
 <package format="3">
   <name>dwa_package</name>
   <version>0.0.0</version>
-  <description>This is a package meant to run dynamic window approach for local path planning and obstacle avoidance comps</description>
+  <description>Dynamic Window Approach local planner for TurtleBot4 obstacle avoidance</description>
   <maintainer email="scheiderd@carleton.edu">daniel</maintainer>
-  <license>Creative Commons License (for school use)</license>
-  <depend>rclpy</depend>
-  <depend>geometry_msgs</depend>
-  <depend>nav_msgs</depend>
-  <depend>sensor_msgs</depend>
-  <depend>message_filters</depend>
+  <license></license>
 
-  <test_depend>ament_copyright</test_depend>
+  <depend>geometry_msgs</depend>
+  <depend>message_filters</depend>
+  <depend>nav_interfaces</depend>
+  <depend>nav_msgs</depend>
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>visualization_msgs</depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
