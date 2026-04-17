@@ -1,581 +1,472 @@
-# Obstacle Avoidance COMPS
+# Obstacle Avoidance
 
-ROS 2 workspace for TurtleBot4 obstacle avoidance and navigation.
+ROS 2 workspace for TurtleBot 4 obstacle avoidance. One launch file runs any combination of
+global planner (A\*, D\* Lite, JPS) and local planner (DWA) on top of a shared LIDAR
+occupancy grid, with RViz.
 
-> **Note:** This repository supports both ROS 2 Humble and Jazzy. Replace `humble` with `jazzy` in commands based on your distribution. Check with: `echo $ROS_DISTRO`
+Works on Humble and Jazzy. Check yours with `echo $ROS_DISTRO`.
+
+Authors and project history: [AUTHORS.md](AUTHORS.md).
 
 ---
 
-## Initial Setup
+## Contents
 
-### 1. Build the Workspace
+1. [Prerequisites](#prerequisites)
+2. [Quick Start](#quick-start)
+3. [Launch Options](#launch-options)
+4. [Structure](#structure)
+5. [Sending Goals](#sending-goals)
+6. [Package Reference and Parameters](#package-reference-and-parameters)
+7. [Troubleshooting](#troubleshooting)
+
+---
+
+## Prerequisites
+
+### 1. Build
 
 ```bash
-cd ~/obstacle-avoidance-comps/ros2_ws
+cd ~/obstacle-avoidance/ros2_ws
 colcon build
+source install/setup.bash
 ```
 
-### 2. Configure Your Environment
-
-Add these lines to your `~/.bashrc`:
+Interfaces must be built before the packages that use them, so incremental builds go:
 
 ```bash
-# ROS 2 Setup
-source /opt/ros/jazzy/setup.bash  # or 'humble'
-
-# This is for running the physical robot
-source /etc/turtlebot4_discovery/setup.bash
-ros2 daemon stop; ros2 daemon start
-```
-### 3. Manual Control on Physical Robot
-```bash
-# Note: ROBOT_NAME must match robot /cmd_vel:=/{ROBOT_NAME}/cmd_vel
-ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p stamped:=true -r /cmd_vel:=/don/cmd_vel
-
+colcon build --packages-select nav_interfaces
+source install/setup.bash
+colcon build --packages-select nav_server a_star d_star jps dwa_package obstacle_grid
+source install/setup.bash
 ```
 
-### 4. Running Slam on Physical Robot
+### 2. Install deps
 
-Open two terminals and follow the previous step (configure) in each.
-
-In terminal 1 run:
-
-```bash
-ros2 launch turtlebot4_navigation slam.launch.py namespace:=/don
-```
-### 5. Running Nav2 on Physical Robot
-
-In terminal 2 run:
-
-```bash
-ros2 launch turtlebot4_navigation nav2.launch.py namespace:=/don
-```
-
-### 6. Running Rviz on Physical Robot
-
-In terminal 3 run:
-
-```bash
-ros2 launch turtlebot4_viz view_navigation.launch.py namespace:=/don
-```
-
-then move the robot around to start. This will create a SLAM map that you can save 
-
----
-
-### 7. Saving Maps for Navigation
-
-To save a SLAM map for use with localization:
-
-```bash
-ros2 run nav2_map_server map_saver_cli -f "debugMaze"     --ros-args -p map_subscribe_transient_local:=true -r __ns:=/don -p save_map_timeout:=5000.0
-```
-
-This creates `map_name.yaml` and `map_name.pgm` files.
-
-Apply changes:
-```bash
-source ~/.bashrc
-```
-
----
-
-## Running with AMCL Localization
-
-This workflow uses a pre-saved map with AMCL localization, allowing you to run multiple navigation experiments without restarting terminals.
-
-### Prerequisites
-
-Install required packages:
 ```bash
 sudo apt install ros-${ROS_DISTRO}-nav2-map-server ros-${ROS_DISTRO}-nav2-amcl
 ```
 
-This workspace includes `amcl_params.yaml` which configures AMCL to auto-set an initial pose at (0,0,0) on startup. This is required because the `map` frame won't exist in RViz until AMCL initializes, and without it you can't see the map to place a 2D Pose Estimate. The auto-pose bootstraps the `map` frame so RViz works immediately — you then refine with 2D Pose Estimate.
+### 3. Shell setup
 
-### Experiment Workflow (Physical Robot)
+In `~/.bashrc`:
 
-**Step 0 — Undock the robot** before launching anything. AMCL requires lidar data to initialize, and the lidar does not run while docked.
-
-**Step 1 — Restart the ROS2 daemon** (once per session, any terminal):
 ```bash
+source /opt/ros/jazzy/setup.bash                 # or humble
+source /etc/turtlebot4_discovery/setup.bash      # physical robot
 ros2 daemon stop; ros2 daemon start
 ```
 
-**Terminal 1 - Localization (AMCL):**
+### 4. Save a map (first run only)
+
+Drive under SLAM, then save:
+
+```bash
+# Terminal 1 — SLAM
+ros2 launch turtlebot4_navigation slam.launch.py namespace:=/don
+
+# Terminal 2 — teleop
+ros2 run teleop_twist_keyboard teleop_twist_keyboard \
+    --ros-args -p stamped:=true -r /cmd_vel:=/don/cmd_vel
+
+# Terminal 3 — save
+ros2 run nav2_map_server map_saver_cli -f my_map \
+    --ros-args -p map_subscribe_transient_local:=true -r __ns:=/don \
+    -p save_map_timeout:=5000.0
+```
+
+You get `my_map.yaml` and `my_map.pgm`.
+
+---
+
+## Quick Start
+
+Two terminals. Undock first — the LIDAR is off while docked and AMCL needs it.
+
+**Terminal 1 — AMCL:**
+
 ```bash
 ros2 launch turtlebot4_navigation localization.launch.py \
     namespace:=/don \
-    map:=/path/to/your/map.yaml \
-    params_file:=/path/to/obstacle-avoidance-comps/ros2_ws/amcl_params.yaml
+    map:=/path/to/my_map.yaml \
+    params_file:=/path/to/obstacle-avoidance/ros2_ws/amcl_params.yaml
 ```
 
-Wait ~10 seconds. If AMCL prints `Setting pose`, the `map` frame is available — proceed to Terminal 2.
+Wait for `Setting pose`. The bundled `amcl_params.yaml` seeds a pose at (0,0,0) so the
+`map` frame exists immediately; refine it later with 2D Pose Estimate.
 
-If you see `failed to send response to /don/map_server/change_state (timeout)` and nothing else happens, the lifecycle manager has stalled. Leave Terminal 1 running and open a new terminal to fix it:
-
-```bash
-# Each command may hang a few seconds — Ctrl+C and continue
-ros2 lifecycle set /don/map_server activate
-ros2 lifecycle set /don/amcl configure
-ros2 lifecycle set /don/amcl activate
-```
-
-Then publish the initial pose to bootstrap the `map` frame:
+**Terminal 2 — planners, action server, RViz:**
 
 ```bash
-ros2 topic pub -r 1 /don/initialpose geometry_msgs/msg/PoseWithCovarianceStamped "{
-  header: {frame_id: 'map'},
-  pose: {
-    pose: {
-      position: {x: 0.0, y: 0.0, z: 0.0},
-      orientation: {w: 1.0}
-    }
-  }
-}"
-```
-
-Wait for AMCL to print `Setting pose` in Terminal 1, then Ctrl+C. Use `-r 1` (repeated), not `--once` — the single-shot publish often fires before AMCL discovers the publisher.
-
-**Terminal 2 - RViz Visualization:**
-```bash
-source /opt/ros/jazzy/setup.bash
-source /etc/turtlebot4_discovery/setup.bash
-
-ros2 launch turtlebot4_viz view_robot.launch.py namespace:=/don
-```
-
-**Terminal 3 - Navigation Node (A* or DWA):**
-```bash
-source /opt/ros/jazzy/setup.bash
-source /etc/turtlebot4_discovery/setup.bash
-cd ~/obstacle-avoidance-comps/ros2_ws
+cd ~/obstacle-avoidance/ros2_ws
 source install/setup.bash
 
-# For A* navigation (MAP_YAML is required):
-MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav --ros-args -p namespace:=/don
-
-# Or for DWA navigation:
-ros2 run dwa_package dwa_node --ros-args -p namespace:=/don
+# A* + DWA (default)
+ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml
 ```
 
-### Running Repeated Experiments
-
-Once all terminals are running, you can run multiple experiments without restarting:
-
-1. **Set Initial Pose (required after moving robot):**
-   - Ensure the 2D Pose Estimate topic is set to `/don/initialpose` (Panels → Tool Properties)
-   - In RViz, click the **"2D Pose Estimate"** button in the top toolbar
-   - Click and drag on the map where the robot actually is
-   - The arrow shows the robot's heading direction
-   - Watch the particle cloud (red arrows) converge around the robot
-
-2. **Send Goal:**
-   - Click the **"2D Goal Pose"** button in RViz toolbar
-   - Click and drag on the map where you want the robot to go
-   - The navigator will plan and execute the path
-
-3. **After Goal Reached:**
-   - Manually move/lift robot back to starting position
-   - Set initial pose again using "2D Pose Estimate"
-   - Send a new goal
-   - Repeat as needed!
-
-### RViz Setup for Navigation
-
-**Configure 2D Pose Estimate tool:**
-1. In RViz: Panels → Tool Properties
-2. Find "2D Pose Estimate" tool
-3. Set Topic to: `/{namespace}/initialpose` (e.g., `/don/initialpose`)
-
-**Configure 2D Goal Pose tool:**
-1. In RViz: Panels → Tool Properties
-2. Find "2D Goal Pose" tool
-3. Set Topic to: `/{namespace}/goal_pose` (e.g., `/don/goal_pose`)
-
-**Add visualization topics:**
-- `/don/map` (Map) - Occupancy grid from localization. If it shows "no map received", expand the display properties and set **Durability** to **Transient Local**
-- `/don/scan` (LaserScan) - LiDAR points
-- `/don/particlecloud` (PoseArray) - AMCL particle cloud
-
-**For DWA visualization, also add:**
-- `/don/debug_obstacles` (Marker) - Detected obstacles
-- `/don/dwa/trajectories` (Marker) - Candidate paths
-- `/don/dwa/best_trajectory` (Marker) - Selected path
+In RViz, click 2D Pose Estimate to refine the pose, then 2D Goal Pose to navigate.
 
 ---
 
-## Running Stacked A* + DWA
+## Launch Options
 
-This workflow runs A* as a global planner and DWA as a local controller — A* computes the global path and publishes it; DWA subscribes to that path and executes it while handling real-time obstacle avoidance. This mirrors the Nav2 planner/controller split.
-
-**Terminal 1 - Localization (AMCL):** *(same as above)*
 ```bash
-ros2 launch turtlebot4_navigation localization.launch.py \
-    namespace:=/don \
-    map:=/path/to/your/map.yaml \
-    params_file:=/path/to/obstacle-avoidance-comps/ros2_ws/amcl_params.yaml
+# A* + DWA stacked
+ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml
+
+# D* Lite + DWA
+ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml global_planner:=d_star
+
+# JPS + DWA
+ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml global_planner:=jps
+
+# A* standalone (A* drives)
+ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml local_planner:=none
+
+# D* standalone
+ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml \
+    global_planner:=d_star local_planner:=none
+
+# JPS standalone
+ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml \
+    global_planner:=jps local_planner:=none
+
+# DWA alone (no map, reactive only)
+ros2 launch nav_server navigation_launch.py global_planner:=none local_planner:=dwa
+
+# Different namespace
+ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml namespace:=/robot
+
+# No RViz
+ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml rviz:=false
+
+# No action server
+ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml server:=false
 ```
 
-**Terminal 2 - RViz:**
-```bash
-source /opt/ros/jazzy/setup.bash
-source /etc/turtlebot4_discovery/setup.bash
+### Launch arguments
 
-ros2 launch turtlebot4_viz view_robot.launch.py namespace:=/don
-```
-
-**Terminal 3 - A* (Global Planner, stacked):**
-```bash
-source /opt/ros/jazzy/setup.bash
-source /etc/turtlebot4_discovery/setup.bash
-cd ~/obstacle-avoidance-comps/ros2_ws
-source install/setup.bash
-
-MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav --ros-args -p namespace:=/don -p stacked:=true
-```
-
-**Terminal 4 - DWA (Local Controller, stacked):**
-```bash
-source /opt/ros/jazzy/setup.bash
-source /etc/turtlebot4_discovery/setup.bash
-cd ~/obstacle-avoidance-comps/ros2_ws
-source install/setup.bash
-
-ros2 run dwa_package dwa_node --ros-args -p namespace:=/don -p stacked:=true
-```
-
-`stacked:=true` on A* puts it in planner-only mode: it publishes the global path to `/{namespace}/a_star/plan` but does not drive the robot. `stacked:=true` on DWA tells it to subscribe to that path and control the robot, avoiding obstacles in real time.
-
-**Usage:**
-1. Set initial pose in RViz with **"2D Pose Estimate"**
-2. Send a goal with **"2D Goal Pose"** — A* receives the goal, plans the path, and publishes it
-3. DWA reads the path and controls the robot, avoiding obstacles in real time
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `map_yaml` | *(empty)* | Map YAML path. Required for A\*, D\*, JPS |
+| `namespace` | `/don` | Robot namespace; prefixed onto every topic |
+| `global_planner` | `a_star` | `a_star`, `d_star`, `jps`, or `none` |
+| `local_planner` | `dwa` | `dwa` or `none` |
+| `rviz` | `true` | Launch RViz |
+| `server` | `true` | Launch the action server |
+| `params_file` | `stacked_params.yaml` | Shared parameter YAML |
 
 ---
 
-## Running Gazebo Simulation
+## Structure
 
-### Basic Gazebo Launch
-
-```bash
-ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py
+```
+                     map_yaml ──────────────┐
+                                            ▼
+/{ns}/goal_pose  ─►  Global planner  ──►  /{ns}/{planner}/plan
+(RViz or CLI)        (A*, D*, JPS)                │
+                          ▲                       ▼
+                          │                   Local planner        ─►  /{ns}/cmd_vel
+                          │                   (DWA)
+                          │                       │
+                  /{ns}/obstacle_grid             │
+                          ▲                       │
+                          │                       │
+                      obstacle_grid  ◄── /{ns}/scan (LIDAR)
+                          ▲
+                          │
+                      /{ns}/map  (one-shot: dimensions + static walls)
 ```
 
-### With SLAM and Navigation
+`nav_server` subscribes to each planner's status topic and prints progress.
 
-```bash
-ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py slam:=true nav2:=true rviz:=true world:=maze
-```
+### Replanning
 
-### Using Saved Map in Simulation
+`obstacle_grid` rebuilds from every LIDAR scan, layered on top of the static map. Global
+planners poll it so the path stays current:
 
-```bash
-cd ~/obstacle-avoidance-comps/ros2_ws
-source install/setup.bash
-ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py \
-  slam:=false \
-  localization:=true \
-  nav2:=false \
-  rviz:=true \
-  world:=maze \
-  map:=$PWD/maze_slamed.yaml
-```
+| Planner | Replan |
+|---------|--------|
+| A\* | Timer, every `replan_interval` seconds (default 5 s) |
+| D\* Lite | Incremental, on obstacle grid change |
+| JPS | One-shot per goal |
 
-Then in a separate terminal, run your navigation node.
+DWA runs a 10 Hz dynamic-window search against the latest grid regardless.
+
+### Stacked mode
+
+When both `global_planner` and `local_planner` are set, the launch file passes
+`stacked:=true` to both:
+
+- The global planner publishes `nav_msgs/Path` on `/{ns}/{planner}/plan` and does not
+  drive.
+- DWA follows the path and drives `cmd_vel`, running its own state machine
+  (`IDLE → NAVIGATING → EMERGENCY_STOPPED → RECOVERING`).
+
+If only one is set, it runs standalone and drives directly.
+
+### RViz config
+
+Generated at launch time to match the selected planners:
+
+- Always: Grid, RobotModel, TF, LaserScan (`/{ns}/scan`), Map (`/{ns}/map`), 2D Goal Pose
+  (`/{ns}/goal_pose`), 2D Pose Estimate (`/{ns}/initialpose`)
+- A\*: `/{ns}/a_star/plan` (green)
+- D\*: `/{ns}/d_star/plan` (orange), `/{ns}/dynamic_grid` overlay
+- JPS: `/{ns}/jps/plan` (blue)
+- DWA: `/{ns}/debug_obstacles`, `/{ns}/dwa/trajectories`, `/{ns}/dwa/best_trajectory`
+
+TF is remapped `/tf` → `/{ns}/tf` automatically.
 
 ---
 
-## Running Custom Packages
+## Sending Goals
 
-### Demo Package
-Makes the robot move in a circle.
+### RViz
 
-```bash
-cd ~/obstacle-avoidance-comps/ros2_ws
-rosdep install -i --from-path src --rosdistro humble -y
-colcon build --packages-select demo_package
-source install/local_setup.bash
-ros2 run demo_package demo_node
-```
+1. 2D Pose Estimate on the robot's actual location (once, or after you move it).
+2. 2D Goal Pose on the target.
+3. The launch terminal prints progress:
+   ```
+   [INFO] RViz goal received: (1.50, 2.00, 0.79)
+   [INFO]   [NAVIGATING          ] to_goal: 1.23m  traveled: 0.45m  time: 3.2s  pos: (0.72, 0.88)
+   [INFO]
+   [INFO]   == REACHED ==
+   [INFO]   Distance traveled: 1.87 m
+   [INFO]   Total time:        12.34 s
+   [INFO]   Average speed:     0.152 m/s
+   ```
+4. A new goal at any time cancels the current one.
+5. Default timeout is 5 min.
 
-### Joy Test
-Prints the robot's position data in the world.
-
-```bash
-cd ~/obstacle-avoidance-comps/ros2_ws
-colcon build --symlink-install
-source install/local_setup.bash
-ros2 run joy_test input
-```
-
-### Sensor Data
-Displays GUI for robot's camera or lidar.
+### CLI
 
 ```bash
-cd ~/obstacle-avoidance-comps/ros2_ws
-colcon build --symlink-install
-source install/local_setup.bash
-
-# Camera view
-ros2 run sensor_data camera
-
-# Lidar view
-ros2 run sensor_data lidar
+ros2 run nav_server navigate -- --goal 1.5 2.0
+ros2 run nav_server navigate -- --goal 1.5 2.0 0.79   # heading in rad
+ros2 run nav_server navigate -- --cancel
 ```
 
-### A* Navigator
-Autonomous navigation using A* pathfinding algorithm with TF2/AMCL localization.
+### `Navigate` action
 
-Supports two modes:
-- **Standalone** (default): A* plans AND drives the robot via `cmd_vel`
-- **Planner-only**: A* publishes a `nav_msgs/Path` on `/{ns}/a_star/plan` for a local planner (e.g. DWA) to follow — mirroring the Nav2 planner/controller split
+Served at `/{ns}/navigate`. No Nav2 dependency:
 
-```bash
-cd ~/obstacle-avoidance-comps/ros2_ws
-colcon build --packages-select a_star
-source install/local_setup.bash
-
-# Run A* in standalone mode (plan + drive)
-MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav --ros-args -p namespace:=/don
-
-# Run A* in planner-only mode (for stacking with DWA)
-MAP_YAML=/path/to/your/map.yaml ros2 run a_star a_star_nav --ros-args -p namespace:=/don -p stacked:=true
-
-# With custom safety parameters (defaults: ROBOT_RADIUS=0.25, SAFETY_CLEARANCE=0.05)
-MAP_YAML=/path/to/your/map.yaml ROBOT_RADIUS=0.25 SAFETY_CLEARANCE=0.05 ros2 run a_star a_star_nav --ros-args -p namespace:=/don
-
-# Run interactive visualizer
-ros2 run a_star visualizer
+```
+# Goal
+string global_planner       # a_star, d_star, jps
+string local_planner        # dwa, none
+float64 goal_x
+float64 goal_y
+float64 goal_theta
+---
+# Result
+bool success
+float64 total_distance
+float64 total_time
+string final_state          # reached, cancelled, timeout, failed
+---
+# Feedback
+float64 distance_to_goal
+float64 distance_traveled
+float64 elapsed_time
+string nav_state            # planning, navigating, emergency_stopped, recovering
+float64 current_x
+float64 current_y
 ```
 
-**Features:**
-- Receives goals via RViz "2D Goal Pose" tool
-- Uses TF2 for map frame localization (works with AMCL)
-- Hybrid obstacle validation (tight spaces + safety margins)
-- Pure pursuit waypoint following (standalone mode)
-- Publishes `nav_msgs/Path` global plan (both modes)
-- Supports repeated experiments without restart
-
-### D* Lite Navigator
-Autonomous navigation using D* Lite with dynamic replanning and obstacle detection.
-
-```bash
-cd ~/obstacle-avoidance-comps/ros2_ws
-colcon build --packages-select d_star
-source install/local_setup.bash
-
-# Run D* Lite navigator (prompts for goal coordinates)
-ros2 run d_star d_star_nav
-
-# With custom safety parameters
-ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.15 ros2 run d_star d_star_nav
-
-# Run interactive visualizer with obstacle placement
-ros2 run d_star visualizer
-
-# Run live path visualizer (shows planned vs traveled path)
-ros2 run d_star live_visualizer
-```
-Note: 
-For nav2, make sure to set the Reliability Policy under the Local Costmap Topic to Best Effort. 
-For setting goals for d_star_nav, make sure to enable the tool properties, and update the topic (goal_pose) for 2d goal pose to {namespace}/d_star_goal_pose.
-To visualize the dynamic grid, make sure to add the topic after running the navigator under the topic dynamic_grid.
-
-**Features:**
-- Incremental pathfinding with dynamic replanning
-- SLAM integration for obstacle discovery
-- Lidar-based dynamic obstacle detection
-- Automatic replanning when obstacles detected
-- Real-time path visualization
+Preemption is a `CancelNav` service call on each planner.
 
 ---
-### Jump Point Search (JPS) Navigator
-Autonomous navigation using Jump Point Search algorithm with optimized pathfinding through uniform-cost grids.
 
+## Package Reference and Parameters
 
-```bash
-cd ~/obstacle-avoidance-comps/ros2_ws
-colcon build --packages-select jps
-source /opt/ros/jazzy/setup.bash
-source install/local_setup.bash
+Override any param with `-p name:=value` on `ros2 run`, or via `params_file:=` on the
+launch file.
 
-# Run JPS navigator (gazebo prompts for goal coordinates)
-ros2 run jps jps_nav
+### `nav_server`
 
-# With custom safety parameters
-ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.20 ros2 run jps jps_nav
-
-# Run interactive visualizer
-ros2 run jps jps_visualizer
-
-# Monitor robot position
-ros2 run jps odom
-```
-
-**Features:**
-- Interactive goal input via terminal
-- Jump Point Search optimization for uniform-cost grids
-- Hybrid obstacle validation (tight spaces + safety margins)
-
-
-### DWA Navigator
-
-Reactive local navigation using Dynamic Window Approach with TF2/AMCL localization.
-These instructions assume robot namespace `/don`. Replace with your robot's namespace if different.
-
-#### Quick Start (with Localization)
-
-**Terminal 1 - Localization:**
-```bash
-source /opt/ros/jazzy/setup.bash
-source /etc/turtlebot4_discovery/setup.bash
-ros2 daemon stop; ros2 daemon start
-
-ros2 launch turtlebot4_navigation localization.launch.py \
-    namespace:=/don \
-    map:=/path/to/your/map.yaml \
-    params_file:=/path/to/obstacle-avoidance-comps/ros2_ws/amcl_params.yaml
-```
-
-**Terminal 2 - RViz:**
-```bash
-source /opt/ros/jazzy/setup.bash
-source /etc/turtlebot4_discovery/setup.bash
-
-ros2 launch turtlebot4_viz view_robot.launch.py namespace:=/don
-```
-
-Then in RViz: File → Open Config → `~/obstacle-avoidance-comps/don_viz.rviz`
-
-#### RViz2 Configuration
-
-**Add 2D Goal Pose tool** (required for sending goals):
-1. Panels → Add New Tool → select "2D Goal Pose" → OK
-2. Use the new toolbar button to click+drag goals in the map
-
-**Add DWA visualization topics:**
-1. Add → By topic → select the following:
-   - `/don/scan` (LaserScan) - LiDAR points
-   - `/don/debug_obstacles` (Marker) - obstacle XY coordinates as red spheres
-   - `/don/dwa/trajectories` (Marker) - candidate paths (red→green by score)
-   - `/don/dwa/best_trajectory` (Marker) - selected path (cyan)
-
-**Save configuration:**
-1. File → Save Config As → `~/obstacle-avoidance-comps/don_viz.rviz`
-
-
-**Terminal 3 - DWA Node:**
-```bash
-source /opt/ros/jazzy/setup.bash
-source /etc/turtlebot4_discovery/setup.bash
-cd ~/obstacle-avoidance-comps/ros2_ws
-colcon build
-source install/setup.bash
-
-ros2 run dwa_package dwa_node --ros-args -p namespace:=/don
-```
-
-> **Note:** For stacked A* + DWA mode, see the [Stacked Algorithm section](#stacked-a--dwa-mode) above — both nodes need `--ros-args -p namespace:=/don -p stacked:=true`.
-
-Then in RViz:
-1. Set initial pose with "2D Pose Estimate"
-2. Send goals with "2D Goal Pose"
-
-#### DWA Parameters
-
-**Cost Weights** (normalized 0-1):
+Launch file, action server, CLI, RViz config generator.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `weights.goal` | 0.35 | Reward for progress toward goal |
-| `weights.heading` | 0.05 | Reward for pointing directly at goal — set to 0 in stacked mode (superseded by `weights.heading_path`) |
-| `weights.velocity` | 0.10 | Reward for higher speeds — kept low to avoid fighting deceleration near goal |
-| `weights.smoothness` | 0.05 | Reward for less angular velocity |
-| `weights.obstacle` | 0.40 | Incentivizes being further from objects — dominates near obstacles |
-| `weights.dist_path` | 0.10 | Soft guidance to stay near global path (stacked mode only) |
-| `weights.heading_path` | 0.05 | Penalizes misalignment with path tangent direction (stacked mode only) |
+| `namespace` | `/don` | Robot namespace |
+| `global_planner` | `a_star` | Which planner to monitor/cancel (set by launch) |
+| `local_planner` | `dwa` | Which local planner to monitor/cancel (set by launch) |
+| `navigation_timeout` | `300.0` | Max nav time in seconds; 0 disables |
 
-**Safety Distances** (meters):
+### `a_star`
+
+Periodic replanning with RDP simplification and cubic-spline smoothing.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `critical_radius` | 0.20 | Hard rejection boundary — trajectories whose closest point to any obstacle is within this radius are rejected outright |
-| `emergency_stop_distance` | 0.17 | Triggers immediate stop if robot center is within this distance of a LIDAR point |
-| `prediction_steps` | 25 | Trajectory simulation steps (× dt = sim time, 2.5s) — longer horizon improves obstacle anticipation |
-| `window_steps` | 5 | Dynamic window size (× dt = 0.5s) — constrains how aggressively v/w can change per cycle |
-| `v_samples` | 20 | Linear velocity samples across the dynamic window |
-| `lookahead` | 0.85 | Rolling carrot lookahead distance (m) in stacked mode — buffer before lookahead collapses to final goal |
-| `goal_tolerance` | 0.2 | Distance (m) at which goal is declared reached |
-| `max_path_deviation` | 1.0 | Distance from path (m) that scores 0 for dist_path — wider = more detour freedom |
+| `namespace` | `/don` | Robot namespace |
+| `stacked` | `false` | Planner-only mode |
+| `robot_radius` | `0.25` | Robot radius (m) |
+| `safety_clearance` | `0.05` | Extra inflation margin (m) |
+| `linear_speed` | `0.2` | Standalone forward speed (m/s) |
+| `angular_speed` | `0.5` | Standalone rotation speed (rad/s) |
+| `position_tolerance` | `0.1` | Waypoint reached threshold (m) |
+| `angle_tolerance` | `0.1` | Angular alignment threshold (rad) |
+| `max_path_waypoints` | `20` | Max waypoints after simplification (50 in stacked) |
+| `tight_space_radius` | `5` | Cells near start that skip inflation |
+| `max_search_nodes` | `100000` | A\* search cap |
+| `simplification_epsilon` | `0.1` | RDP tolerance (m) |
+| `replan_interval` | `5.0` | Replan period (s); 0 disables |
 
-**Example:** Run with custom weights:
+### `d_star`
+
+D\* Lite. Replans incrementally when the obstacle grid changes.
+
 ```bash
-ros2 run dwa_package dwa_node --ros-args \
-    -p weights.goal:=0.4 \
-    -p weights.obstacle:=0.5 \
-    -p max_velocity:=0.5
+ros2 run d_star d_star_nav --ros-args -p namespace:=/don
+ros2 run d_star live_visualizer --ros-args -p namespace:=/don   # planned vs traveled
 ```
 
----
+Publishes `/{ns}/d_star/plan` and `/{ns}/dynamic_grid`. Params: `namespace`, `stacked`,
+`robot_radius`, `safety_clearance`.
 
-## Project Structure
+### `jps`
 
+Jump Point Search. One-shot per goal, fastest on large uniform grids.
+
+```bash
+ros2 run jps jps_nav --ros-args -p namespace:=/don
 ```
-ros2_ws/
-├── src/
-│   ├── a_star/          # A* pathfinding implementation
-│   ├── d_star/          # D* pathfinding implementation
-│   ├── dwa_package/     # DWA local planner with TF2 localization
-│   ├── demo_package/    # Demo movement package
-│   ├── joy_test/        # Position data testing
-│   └── sensor_data/     # Camera and lidar visualization
-├── maze_slamed.pgm      # Saved maze map (image)
-└── maze_slamed.yaml     # Saved maze map (metadata)
-```
+
+Publishes `/{ns}/jps/plan`. Params: `namespace`, `stacked`, `robot_radius`,
+`safety_clearance`.
+
+### `dwa_package`
+
+Dynamic Window Approach. Needs `obstacle_grid`, which the launch file starts for you when
+DWA is selected.
+
+**Cost weights** (7 terms, normalized 0–1):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `weights.goal` | 0.35 | Progress toward goal |
+| `weights.heading` | 0.05 | Pointing at goal (skipped in stacked) |
+| `weights.velocity` | 0.10 | Prefer higher speed |
+| `weights.smoothness` | 0.05 | Prefer lower angular velocity |
+| `weights.obstacle` | 0.40 | Distance from obstacles |
+| `weights.dist_path` | 0.10 | Stay near global path (stacked only) |
+| `weights.heading_path` | 0.05 | Align with path tangent (stacked only; blends to 0.25 near goal) |
+
+**Velocity and sampling:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_velocity` | 0.4 | Forward cap (m/s) |
+| `min_velocity` | 0.0 | Forward min (m/s) |
+| `max_angular_velocity` | 1.8 | Rotation cap (rad/s) |
+| `min_angular_velocity` | -1.8 | Rotation min (rad/s) |
+| `max_linear_acceleration` | 0.5 | Linear accel (m/s²) |
+| `max_angular_acceleration` | 2.0 | Angular accel (rad/s²) |
+| `v_samples` | 20 | Linear samples |
+| `w_samples` | 20 | Angular samples |
+| `dt` | 0.1 | Sim step (s) |
+| `prediction_steps` | 25 | Trajectory lookahead (× dt) |
+| `window_steps` | 5 | Dynamic window size (× dt) |
+| `grid_size` | 161 | Local window side (cells) |
+| `grid_resolution` | 10.0 | Local window (cells/m) |
+
+**Safety and recovery:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `critical_radius` | 0.20 | Hard rejection distance (m) |
+| `emergency_stop_distance` | 0.17 | Immediate stop on LIDAR point (m) |
+| `max_lidar_range` | 8.0 | Ignore returns past this (m) |
+| `goal_tolerance` | 0.2 | Goal-reached threshold (m) |
+| `lookahead` | 0.85 | Stacked-mode carrot distance (m) |
+| `max_path_deviation` | 1.0 | Path distance that scores 0 for `dist_path` (m) |
+| `recovery.angular_velocity` | 0.5 | Rotate-in-place speed (rad/s) |
+| `recovery.backup_velocity` | -0.05 | Reverse speed (m/s) |
+| `recovery.rotate_timeout` | 3.0 | Rotate time before backup (s) |
+| `recovery.total_timeout` | 10.0 | Max recovery before abort (s) |
+
+### `obstacle_grid`
+
+Shared LIDAR occupancy grid in the map frame. Bresenham raycasting clears cells the
+moment a ray passes through; cells that haven't been reconfirmed in `obstacle_decay_seconds`
+fall back to free. Needs AMCL (for `map ← odom` TF).
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `obstacle_decay_seconds` | 20.0 | Fallback decay (s) |
+| `robot_radius` | 0.22 | Inflation radius (m) |
+| `safety_clearance` | 0.05 | Extra inflation (m) |
+| `publish_rate` | 10.0 | Hz |
+| `max_lidar_range` | 8.0 | m |
+| `lidar_downsample` | 2 | Every Nth beam |
+
+Publishes `/{ns}/obstacle_grid`. Subscribes `/{ns}/scan` continuously, `/{ns}/map` once
+for dimensions.
+
+### `nav_interfaces`
+
+CMake package with the action/msg/srv definitions:
+
+- `action/Navigate.action` — goal/result/feedback shown above
+- `msg/NavStatus.msg` — globals publish on `/{ns}/{planner}/status`, DWA on
+  `/{ns}/dwa/nav_status`
+- `srv/CancelNav.srv` — preemption, one per planner
 
 ---
 
 ## Troubleshooting
 
-### Lifecycle manager timeout (AMCL never activates)
-- **Symptom:** `failed to send response to /don/map_server/change_state (timeout)` and AMCL never prints `Configuring`
-- **Cause:** DDS service response timeout. Common on some machines with `rmw_fastrtps_cpp`
-- **Fix:** See lifecycle fix steps in [Experiment Workflow](#experiment-workflow-physical-robot)
+### AMCL lifecycle hangs
 
-### TF2 transform not available
-- With namespaced robots, TF is on `/don/tf` not `/tf`. Verify with: `ros2 topic hz /don/tf`
-- Use `view_robot.launch.py` which handles TF remapping automatically
-- To check TF chain manually: `ros2 run tf2_ros tf2_echo map base_link --ros-args -r /tf:=/don/tf -r /tf_static:=/don/tf_static`
-- Verify map→odom→base_link chain exists
+Symptom: `failed to send response to /don/map_server/change_state (timeout)`.
 
-### Map frame not available in RViz
-- The `map` frame is created by AMCL. It won't exist until AMCL initializes with a pose
-- Use `amcl_params.yaml` with `set_initial_pose: true` to auto-bootstrap the map frame on startup
-- If not using the params file, publish an initial pose: `ros2 topic pub -r 1 /don/initialpose ...` (use `-r 1` not `--once` — the single-shot publish often fires before AMCL discovers it)
+```bash
+# Second terminal. Each may hang for a few seconds — Ctrl+C and keep going.
+ros2 lifecycle set /don/map_server activate
+ros2 lifecycle set /don/amcl configure
+ros2 lifecycle set /don/amcl activate
 
-### Map shows "no map received" in RViz
-- Verify the map is publishing: `ros2 topic info /don/map` (should show 1 publisher)
-- In RViz, expand the Map display properties and set **Durability** to **Transient Local**
-- The map_server uses transient local QoS; RViz defaults to volatile which won't receive it
+# Seed a pose so the map frame appears
+ros2 topic pub -r 1 /don/initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
+    "{header: {frame_id: 'map'}, pose: {pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {w: 1.0}}}}"
+```
 
-### Robot not localizing properly
-- Set accurate initial pose using **2D Pose Estimate** in RViz
-- Ensure the 2D Pose Estimate topic is set to `/don/initialpose` (Panels → Tool Properties)
-- Ensure the map matches the actual environment
-- Check particle cloud convergence (should cluster around robot)
-- Try moving robot slightly to help AMCL converge
+Use `-r 1`, not `--once`. The one-shot publish often fires before AMCL discovers it.
 
-### Goals not being received
-- Check topic name matches: `ros2 topic echo /don/goal_pose`
-- Verify "2D Goal Pose" tool in RViz is configured to correct topic
-- Panels → Tool Properties → 2D Goal Pose → Topic: `/don/goal_pose`
+### Map shows "no map received"
+
+`map_server` uses transient-local QoS; RViz defaults to volatile. In the Map display's
+properties, set Durability to Transient Local.
+
+### TF missing on a namespaced robot
+
+TF is on `/don/tf`, not `/tf`. The launch file remaps automatically. Manual check:
+
+```bash
+ros2 run tf2_ros tf2_echo map base_link \
+    --ros-args -r /tf:=/don/tf -r /tf_static:=/don/tf_static
+```
 
 ### AMCL stuck on "Waiting for service map_server/get_state"
-- Check that `RMW_IMPLEMENTATION` is not set to an uninstalled DDS: `echo $RMW_IMPLEMENTATION`
-- If set to `rmw_cyclonedds_cpp` without CycloneDDS installed, fix with: `export RMW_IMPLEMENTATION=rmw_fastrtps_cpp`
-- Nodes may be crashing silently — check logs: `ls ~/.ros/log/` and inspect the latest launch.log
+
+```bash
+echo $RMW_IMPLEMENTATION
+# If rmw_cyclonedds_cpp but CycloneDDS isn't installed:
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+```
 
 ### Commands not found
-- Source the workspace: `source install/setup.bash`
-- Verify ROS 2 is sourced: `echo $ROS_DISTRO`
+
+```bash
+source install/setup.bash
+echo $ROS_DISTRO
+```
+
+### Robot doesn't move
+
+- Undock it. LIDAR is off while docked.
+- `ros2 topic echo /don/goal_pose` to confirm the goal arrived.
+- In RViz, Panels → Tool Properties → 2D Goal Pose → topic is `/don/goal_pose`.
