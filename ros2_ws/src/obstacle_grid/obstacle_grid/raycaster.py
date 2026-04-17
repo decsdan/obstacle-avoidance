@@ -52,7 +52,10 @@ def process_scan(
     """Raycast a full LIDAR scan into the grid.
 
     Marks cells along each ray as free and the endpoint as occupied.
-    Modifies grid and last_occupied in-place. Returns set of changed cells.
+    Modifies grid and last_occupied in-place.
+
+    Returns:
+        Set of (gx, gy) cells whose occupancy value changed.
     """
     height, width = grid.shape
     changed = set()
@@ -107,7 +110,11 @@ def apply_temporal_decay(
     current_time: float,
     decay_seconds: float,
 ):
-    """Clear occupied cells not re-confirmed within decay_seconds."""
+    """Clear occupied cells not re-confirmed within decay_seconds.
+
+    Returns:
+        Set of (gx, gy) cells that were cleared.
+    """
     stale_mask = (grid == 100) & ((current_time - last_occupied) > decay_seconds)
     cleared = set()
 

@@ -680,10 +680,15 @@ class AStarNavigator(Node):
         return list(zip(x_new.tolist(), y_new.tolist()))
 
     def print_path(self):
-        """Log the planned path waypoints."""
-        self.get_logger().info('Planned waypoints:')
-        for i, (x, y) in enumerate(self.path):
-            self.get_logger().info(f'  {i+1}. ({x:.2f}, {y:.2f})')
+        """Log first and last waypoint of the planned path as a sanity check."""
+        if not self.path:
+            return
+        start = self.path[0]
+        end = self.path[-1]
+        self.get_logger().info(
+            f'Path: ({start[0]:.2f}, {start[1]:.2f}) -> ({end[0]:.2f}, {end[1]:.2f}) '
+            f'| {len(self.path)} waypoints'
+        )
 
     def control_loop(self):
         """Waypoint-following control loop, called at 10 Hz."""
@@ -785,7 +790,9 @@ def main(args=None):
     ROBOT_RADIUS and SAFETY_CLEARANCE fall back to NavigatorConstants.
     """
     robot_radius = float(os.getenv('ROBOT_RADIUS', str(NavigatorConstants.ROBOT_RADIUS)))
-    safety_clearance = float(os.getenv('SAFETY_CLEARANCE', str(NavigatorConstants.SAFETY_CLEARANCE)))
+    safety_clearance = float(
+        os.getenv('SAFETY_CLEARANCE', str(NavigatorConstants.SAFETY_CLEARANCE))
+    )
     map_yaml = os.getenv('MAP_YAML')
     map_pgm = os.getenv('MAP_PGM')
 

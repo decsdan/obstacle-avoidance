@@ -11,8 +11,8 @@ import sys
 import numpy as np
 import yaml
 from matplotlib.animation import FuncAnimation
-from PIL import Image
 import matplotlib.pyplot as plt
+from PIL import Image
 
 
 class VisualizerConstants:
@@ -376,8 +376,10 @@ class AStarVisualizer:
             VisualizerConstants.MIN_ANIMATION_INTERVAL,
             VisualizerConstants.BASE_ANIMATION_TIME // len(self.explored_nodes)
         )
-        FuncAnimation(self.fig, animate, frames=frames, interval=interval,
-                      blit=False, repeat=False)
+        self._anim = FuncAnimation(
+            self.fig, animate, frames=frames, interval=interval,
+            blit=False, repeat=False,
+        )
         plt.draw()
 
     def run(self, yaml_file, pgm_file):
