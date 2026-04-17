@@ -1,444 +1,307 @@
 #!/usr/bin/env python3
+"""JPS global path planner for ROS2 with hybrid obstacle checking.
 
-"""
-JPS Navigator for ROS2 TurtleBot4
-
-This ROS2 node provides autonomous navigation using the Jump Point Search (JPS) pathfinding algorithm.
-Features hybrid obstacle checking to handle tight spaces while maintaining safety.
-
-Features:
-    - Jump Point Search with 8-connected grid movement
-    - Hybrid obstacle validation (tight spaces + safety margins)
-    - Pure pursuit-style waypoint following
-    - Interactive goal selection via terminal input
-    - Environment variable configuration for robot parameters
-
-Publishes to:
-    - /mikey/cmd_vel (TwistStamped): Velocity commands for robot control
-
-Subscribes to:
-    - /mikey/odom (Odometry): Robot position in map frame
-
-Usage:
-    ros2 run jps jps_nav
-
-    With custom parameters:
-    ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.20 ros2 run jps jps_nav
-
-Architecture:
-    - Hybrid obstacle checking near start position for escaping tight spaces
-    - Standard inflated grid checking for safety in open areas
-    - Simple proportional controller for robot movement
-    - Path simplification to reduce waypoint count
+Supports standalone mode (plans and drives via cmd_vel) and stacked mode
+(publishes nav_msgs/Path for a downstream local planner). Requires a
+pre-built static map loaded via the MAP_YAML env var.
 """
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
-from nav_msgs.msg import Odometry
-import numpy as np
-import yaml
-from PIL import Image
 import heapq
 import math
 import os
+import sys
 
+import numpy as np
+import yaml
+from PIL import Image
+from scipy.interpolate import CubicSpline
+from scipy.ndimage import binary_dilation
 
-# ============================================================================
-# CONSTANTS
-# ============================================================================
+import rclpy
+from geometry_msgs.msg import PoseStamped, TwistStamped
+from nav_interfaces.msg import NavStatus
+from nav_interfaces.srv import CancelNav
+from nav_msgs.msg import Odometry, Path
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from tf2_ros import Buffer, TransformListener
+
 
 class NavigatorConstants:
-    """Configuration constants for the JPS navigator"""
+    """Default configuration constants for the JPS navigator."""
 
-    # Robot Physical Parameters (meters)
-    ROBOT_RADIUS = 0.22          # TurtleBot4 radius
-    SAFETY_CLEARANCE = 0.00      # Additional safety margin
+    ROBOT_RADIUS = 0.22
+    SAFETY_CLEARANCE = 0.05
 
-    # Control Parameters
-    LINEAR_SPEED = 0.2           # Forward speed (m/s)
-    ANGULAR_SPEED = 0.5          # Rotation speed (rad/s)
-    POSITION_TOLERANCE = 0.1     # Waypoint reached threshold (meters)
-    ANGLE_TOLERANCE = 0.1        # Angular alignment threshold (radians)
+    LINEAR_SPEED = 0.2
+    ANGULAR_SPEED = 0.5
+    POSITION_TOLERANCE = 0.1
+    ANGLE_TOLERANCE = 0.1
+    CONTROL_TIMER_PERIOD = 0.1
 
-    # Control Loop
-    CONTROL_TIMER_PERIOD = 0.1   # Control loop frequency (seconds)
+    MAX_PATH_WAYPOINTS = 20
+    TIGHT_SPACE_RADIUS = 3
+    SIMPLIFICATION_EPSILON = 0.1
+    MAX_JUMP_DEPTH = 500
 
-    # Path Planning
-    MAX_PATH_WAYPOINTS = 20      # Maximum waypoints after simplification
-    TIGHT_SPACE_RADIUS = 3       # Grid cells to use original grid near start
+    DEFAULT_NAMESPACE = '/don'
 
-    # Publishing/Subscribing Paths - CRITICAL: MUST MATCH YOUR ROBOT
-    CMD_VEL = '/leo/cmd_vel'   # Change 'mikey' to your robot name if different
-    ODOMETRY = '/leo/odom'     # Change 'mikey' to your robot name if different
-
-    # Pgm and yaml paths - MUST match A* paths
-    SLAM_MAP_YAML = '~/obstacle-avoidance-comps/ros2_ws/complex_add_test.yaml'
-    SLAM_MAP_PGM = '~/obstacle-avoidance-comps/ros2_ws/complex_add_test.pgm'
-
-
-# ============================================================================
-# MAIN NAVIGATOR CLASS
-# ============================================================================
 
 class JPSNavigator(Node):
-    """
-    ROS2 node for JPS path planning and navigation.
+    """ROS2 node for Jump Point Search path planning and waypoint following."""
 
-    Implements autonomous navigation using Jump Point Search with hybrid
-    obstacle checking to handle tight spaces while maintaining safety.
-    """
+    def __init__(self):
+        _ns = NavigatorConstants.DEFAULT_NAMESPACE
+        for i, arg in enumerate(sys.argv):
+            if arg.startswith('namespace:='):
+                _ns = arg.split(':=', 1)[1]
+            elif arg == '-p' and i + 1 < len(sys.argv) and sys.argv[i+1].startswith('namespace:='):
+                _ns = sys.argv[i+1].split(':=', 1)[1]
 
-    def __init__(self, robot_radius=None, safety_clearance=None):
-        """
-        Initialize the JPS navigator.
+        _user_args = sys.argv[1:]
+        _tf_remaps = ['-r', f'/tf:={_ns}/tf', '-r', f'/tf_static:={_ns}/tf_static']
+        if '--ros-args' in _user_args:
+            _combined = _user_args + _tf_remaps
+        else:
+            _combined = _user_args + ['--ros-args'] + _tf_remaps
 
-        Args:
-            robot_radius: Robot radius in meters (default from constants or env)
-            safety_clearance: Safety margin in meters (default from constants or env)
-        """
-        super().__init__('jps_navigator')
+        super().__init__('jps_navigator', cli_args=_combined, use_global_arguments=False)
 
-        # ====================================================================
-        # INITIALIZATION - Robot Parameters
-        # ====================================================================
+        self.declare_parameter('namespace', NavigatorConstants.DEFAULT_NAMESPACE)
+        self.ns = self.get_parameter('namespace').value
 
-        # Use provided values, environment variables, or defaults
-        self.robot_radius = robot_radius if robot_radius is not None else \
-                           float(os.getenv('ROBOT_RADIUS', str(NavigatorConstants.ROBOT_RADIUS)))
-        self.safety_clearance = safety_clearance if safety_clearance is not None else \
-                               float(os.getenv('SAFETY_CLEARANCE', str(NavigatorConstants.SAFETY_CLEARANCE)))
-
-        # ====================================================================
-        # INITIALIZATION - ROS2 Publishers and Subscribers
-        # ====================================================================
-
-        # Command velocity publisher - USING CONSTANTS
-        self.cmd_vel_pub = self.create_publisher(
-            TwistStamped, 
-            NavigatorConstants.CMD_VEL,  # Using constant
-            10
+        default_radius = float(os.getenv('ROBOT_RADIUS', str(NavigatorConstants.ROBOT_RADIUS)))
+        default_clearance = float(
+            os.getenv('SAFETY_CLEARANCE', str(NavigatorConstants.SAFETY_CLEARANCE))
         )
 
-        # Odometry subscriber - USING CONSTANTS
+        self.declare_parameter('robot_radius', default_radius)
+        self.declare_parameter('safety_clearance', default_clearance)
+        self.robot_radius = self.get_parameter('robot_radius').value
+        self.safety_clearance = self.get_parameter('safety_clearance').value
+
+        self.declare_parameter('linear_speed', NavigatorConstants.LINEAR_SPEED)
+        self.declare_parameter('angular_speed', NavigatorConstants.ANGULAR_SPEED)
+        self.declare_parameter('position_tolerance', NavigatorConstants.POSITION_TOLERANCE)
+        self.declare_parameter('angle_tolerance', NavigatorConstants.ANGLE_TOLERANCE)
+        self.declare_parameter('max_path_waypoints', NavigatorConstants.MAX_PATH_WAYPOINTS)
+        self.declare_parameter('tight_space_radius', NavigatorConstants.TIGHT_SPACE_RADIUS)
+        self.declare_parameter('simplification_epsilon', NavigatorConstants.SIMPLIFICATION_EPSILON)
+
+        self.linear_speed = self.get_parameter('linear_speed').value
+        self.angular_speed = self.get_parameter('angular_speed').value
+        self.position_tolerance = self.get_parameter('position_tolerance').value
+        self.angle_tolerance = self.get_parameter('angle_tolerance').value
+        self.tight_space_radius = self.get_parameter('tight_space_radius').value
+        self.simplification_epsilon = self.get_parameter('simplification_epsilon').value
+
+        self.declare_parameter('stacked', False)
+        self.standalone = not self.get_parameter('stacked').value
+
+        self.plan_pub = self.create_publisher(Path, f'{self.ns}/jps/plan', 10)
+        self.cmd_vel_pub = self.create_publisher(TwistStamped, f'{self.ns}/cmd_vel', 10)
+
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=10
+            depth=10,
         )
         self.odom_sub = self.create_subscription(
             Odometry,
-            NavigatorConstants.ODOMETRY,  # Using constant
+            f'{self.ns}/odom',
             self.odom_callback,
-            qos_profile
+            qos_profile,
+        )
+        self.goal_sub = self.create_subscription(
+            PoseStamped,
+            f'{self.ns}/goal_pose',
+            self.goal_callback,
+            10,
         )
 
-        # ====================================================================
-        # INITIALIZATION - Map Data
-        # ====================================================================
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        self.grid = None                # Inflated grid for safety
-        self.grid_original = None       # Original grid before inflation
-        self.resolution = None          # Meters per grid cell
-        self.origin = None              # Map origin [x, y, theta]
+        self._planner_state = 'idle'
+        self._goal_just_reached = False
+        self._active_goal = None
 
-        # ====================================================================
-        # INITIALIZATION - Navigation State
-        # ====================================================================
+        self.nav_status_pub = self.create_publisher(NavStatus, f'{self.ns}/jps/status', 10)
+        self.cancel_srv = self.create_service(
+            CancelNav,
+            f'{self.ns}/jps/cancel',
+            self._handle_cancel,
+        )
+        self._status_timer = self.create_timer(0.5, self._publish_nav_status)
 
-        self.current_pose = None        # Current robot pose {x, y, theta}
-        self.path = []                  # Planned path as list of (x, y) in world coords
-        self.current_waypoint_idx = 0   # Index of current target waypoint
+        self.grid = None
+        self.grid_original = None
+        self.resolution = None
+        self.origin = None
 
-        # ====================================================================
-        # INITIALIZATION - Control Parameters
-        # ====================================================================
-
-        self.linear_speed = NavigatorConstants.LINEAR_SPEED
-        self.angular_speed = NavigatorConstants.ANGULAR_SPEED
-        self.position_tolerance = NavigatorConstants.POSITION_TOLERANCE
-        self.angle_tolerance = NavigatorConstants.ANGLE_TOLERANCE
-
-        # ====================================================================
-        # INITIALIZATION - Distance and Time Tracking
-        # ====================================================================
+        self.current_pose = None
+        self.path = []
+        self.current_waypoint_idx = 0
 
         self.start_time = None
-        self.total_distance = 0.0  # Total distance traveled in meters
-        self.last_position = None  # Last position for distance calculation
-
-
-        # ====================================================================
-        # INITIALIZATION - Control Loop Timer
-        # ====================================================================
+        self.total_distance = 0.0
+        self.last_position = None
 
         self.control_timer = self.create_timer(
             NavigatorConstants.CONTROL_TIMER_PERIOD,
-            self.control_loop
+            self.control_loop,
         )
+        self._path_republish_timer = self.create_timer(1.0, self._republish_path)
 
-        # ====================================================================
-        # INITIALIZATION - Load Map
-        # ====================================================================
+        map_yaml = os.getenv('MAP_YAML')
+        map_pgm = os.getenv('MAP_PGM')
 
-        # Use constants for map paths (same as A*)
-        yaml_file = os.path.expanduser(NavigatorConstants.SLAM_MAP_YAML)
-        pgm_file = os.path.expanduser(NavigatorConstants.SLAM_MAP_PGM)
+        if map_yaml is None:
+            self.get_logger().error('No map provided. Set MAP_YAML env var.')
+            raise SystemExit('Map YAML path required. Set MAP_YAML env var.')
 
-        self.load_map(yaml_file, pgm_file)
+        map_yaml = os.path.expanduser(map_yaml)
+        if map_pgm is None:
+            map_pgm = map_yaml.rsplit('.', 1)[0] + '.pgm'
+        else:
+            map_pgm = os.path.expanduser(map_pgm)
 
-        # ====================================================================
-        # INITIALIZATION - Logging
-        # ====================================================================
+        self.load_map(map_yaml, map_pgm)
 
-        self.get_logger().info('JPS Navigator initialized')
-        self.get_logger().info(f'Robot radius: {self.robot_radius}m, Safety clearance: {self.safety_clearance}m')
-        self.get_logger().info(f'Total obstacle inflation: {self.robot_radius + self.safety_clearance}m')
-        self.get_logger().info(f'Commanding on: {NavigatorConstants.CMD_VEL}')
-        self.get_logger().info(f'Listening on: {NavigatorConstants.ODOMETRY}')
-        self.get_logger().info('Usage: navigator.navigate_to_goal(start_x, start_y, goal_x, goal_y)')
-
-    # ========================================================================
-    # MAP LOADING AND PROCESSING
-    # ========================================================================
+        mode_str = 'standalone' if self.standalone else 'stacked'
+        self.get_logger().info(
+            f'jps_navigator initialized | ns={self.ns} mode={mode_str} '
+            f'radius={self.robot_radius}m clearance={self.safety_clearance}m')
 
     def load_map(self, yaml_file, pgm_file):
-        """
-        Load map from YAML and PGM files.
+        """Load static map from YAML and PGM, then inflate obstacles.
 
-        Loads the static map, applies coordinate transforms to match Gazebo,
-        and inflates obstacles by robot radius + safety clearance.
-
-        Args:
-            yaml_file: Path to map metadata YAML file
-            pgm_file: Path to map image PGM file
+        Changes:
+            self.grid, self.grid_original, self.resolution, self.origin
         """
         try:
-            # Load map metadata
             with open(yaml_file, 'r') as f:
                 map_data = yaml.safe_load(f)
 
             self.resolution = map_data['resolution']
             self.origin = map_data['origin']
 
-            # Load map image
             img = Image.open(pgm_file)
             occupancy_grid = np.array(img)
 
-            # Convert to binary: 0=free, 1=occupied
-            # PGM: 255=free, <250=occupied/unknown
             self.grid = np.zeros_like(occupancy_grid)
-            self.grid[occupancy_grid < 250] = 1  # Occupied/unknown
-            self.grid[occupancy_grid >= 250] = 0  # Free space
-
-            # Flip map vertically to match Gazebo coordinate system
+            self.grid[occupancy_grid < 250] = 1
+            self.grid[occupancy_grid >= 250] = 0
             self.grid = np.flipud(self.grid)
-
-            # Store original grid before inflation
             self.grid_original = self.grid.copy()
 
-            # Inflate obstacles for robot safety
             total_inflation = self.robot_radius + self.safety_clearance
             self.inflate_obstacles(total_inflation)
 
-            # Log map information
-            self.get_logger().info(f'Map loaded: {self.grid.shape}, resolution: {self.resolution}')
-            self.get_logger().info(f'Map origin: {self.origin}')
             self.get_logger().info(
-                f'Obstacles inflated by {total_inflation}m ({int(total_inflation/self.resolution)} pixels)'
-            )
-
-            # Log map bounds
-            map_width = self.grid.shape[1] * self.resolution
-            map_height = self.grid.shape[0] * self.resolution
-            self.get_logger().info(
-                f'Map bounds: X=[{self.origin[0]:.2f}, {self.origin[0]+map_width:.2f}], '
-                f'Y=[{self.origin[1]:.2f}, {self.origin[1]+map_height:.2f}]'
-            )
+                f'Map loaded: {self.grid.shape} res={self.resolution}m '
+                f'inflation={total_inflation:.2f}m')
         except Exception as e:
             self.get_logger().error(f'Failed to load map: {e}')
 
     def inflate_obstacles(self, inflation_radius):
-        """
-        Inflate obstacles by specified radius using morphological dilation.
-
-        Creates a safety buffer around all obstacles equal to robot_radius +
-        safety_clearance. This ensures the robot's center can safely follow
-        paths without collision.
-
-        Args:
-            inflation_radius: Inflation distance in meters
-        """
-        from scipy.ndimage import binary_dilation
-
-        # Convert radius to pixels
+        """Inflate obstacles by inflation_radius using morphological dilation."""
         radius_pixels = int(inflation_radius / self.resolution)
         kernel_size = 2 * radius_pixels + 1
         kernel = np.ones((kernel_size, kernel_size))
-
-        # Apply dilation to original grid
         self.grid = binary_dilation(self.grid_original, kernel).astype(int)
 
-    # ========================================================================
-    # ODOMETRY CALLBACK
-    # ========================================================================
-
     def odom_callback(self, msg):
-        """
-        Update current robot pose from odometry.
-
-        Extracts position and orientation from odometry message and
-        updates internal state for navigation control.
-
-        Args:
-            msg: Odometry message from odometry topic
-        """
+        """Update current pose from odometry."""
         self.current_pose = {
             'x': msg.pose.pose.position.x,
             'y': msg.pose.pose.position.y,
-            'theta': self.quaternion_to_yaw(msg.pose.pose.orientation)
+            'theta': self.quaternion_to_yaw(msg.pose.pose.orientation),
         }
 
-    # ========================================================================
-    # NAVIGATION INTERFACE
-    # ========================================================================
+    def goal_callback(self, msg):
+        """Handle goal pose from RViz 2D Goal Pose tool and start navigation."""
+        goal_x = msg.pose.position.x
+        goal_y = msg.pose.position.y
+        self.get_logger().info(f'Goal received: ({goal_x:.2f}, {goal_y:.2f})')
+
+        if self.current_pose is None:
+            self.get_logger().warn('No odometry data yet, cannot navigate')
+            return
+
+        self._goal_just_reached = False
+        self._active_goal = (goal_x, goal_y)
+        self._planner_state = 'planning'
+
+        start_x = self.current_pose['x']
+        start_y = self.current_pose['y']
+
+        if self.navigate_to_goal(start_x, start_y, goal_x, goal_y):
+            self._planner_state = 'navigating'
+        else:
+            self._planner_state = 'idle'
+            self._active_goal = None
 
     def navigate_to_goal(self, start_x, start_y, goal_x, goal_y):
-        """
-        Plan path and start navigation from start to goal.
-
-        Main entry point for navigation. Plans a path using JPS and
-        starts the waypoint following control loop.
-
-        Args:
-            start_x: Start X coordinate in world frame (meters)
-            start_y: Start Y coordinate in world frame (meters)
-            goal_x: Goal X coordinate in world frame (meters)
-            goal_y: Goal Y coordinate in world frame (meters)
+        """Plan path from start to goal and begin navigation.
 
         Returns:
-            bool: True if path found and navigation started, False otherwise
+            True if a path was found and navigation started, False otherwise.
+
+        Changes:
+            self.path, self.start_time, self.total_distance, self.last_position,
+            self.current_waypoint_idx, self._goal_just_reached
         """
         self.get_logger().info(
-            f'Planning path from ({start_x:.2f}, {start_y:.2f}) to ({goal_x:.2f}, {goal_y:.2f})'
-        )
+            f'Planning from ({start_x:.2f}, {start_y:.2f}) to ({goal_x:.2f}, {goal_y:.2f})')
 
-        # Plan path using JPS
+        self._goal_just_reached = False
         self.path = self.plan_path(start_x, start_y, goal_x, goal_y)
 
         if self.path:
             self.current_waypoint_idx = 0
-            # Initialize distance and time tracking
             self.start_time = self.get_clock().now()
             self.total_distance = 0.0
             self.last_position = (start_x, start_y)
-            self.get_logger().info(f'✓ Path found with {len(self.path)} waypoints')
-            self.get_logger().info('Started tracking distance and time')
-            self.print_path()
+            self.get_logger().info(f'Path found with {len(self.path)} waypoints')
+            self._publish_path()
             return True
         else:
-            self.get_logger().error('✗ No path found! Check if start/goal are valid and reachable')
+            self.get_logger().error('No path found! Check if start/goal are valid and reachable')
             return False
 
-    # ========================================================================
-    # PATH PLANNING
-    # ========================================================================
-
     def plan_path(self, start_x, start_y, goal_x, goal_y):
-        """
-        Plan path from start to goal using JPS.
-
-        Converts world coordinates to grid coordinates, validates positions,
-        runs JPS pathfinding, and converts result back to world coordinates.
-
-        Args:
-            start_x: Start X in world frame (meters)
-            start_y: Start Y in world frame (meters)
-            goal_x: Goal X in world frame (meters)
-            goal_y: Goal Y in world frame (meters)
+        """Validate positions, run JPS, and return a simplified world-coordinate path.
 
         Returns:
-            list: Path as list of (x, y) tuples in world coordinates, or empty if no path
+            List of (x, y) tuples in world coordinates, or [] if no path found.
         """
-        # Convert to grid coordinates
         start_grid = self.world_to_grid(start_x, start_y)
         goal_grid = self.world_to_grid(goal_x, goal_y)
 
-        self.get_logger().info(f'Grid coordinates: Start {start_grid}, Goal {goal_grid}')
-
-        # Verify conversion is reversible (debug)
-        start_world_check = self.grid_to_world(start_grid[0], start_grid[1])
-        goal_world_check = self.grid_to_world(goal_grid[0], goal_grid[1])
-        self.get_logger().info(
-            f'World coords check: Start ({start_world_check[0]:.2f}, {start_world_check[1]:.2f}), '
-            f'Goal ({goal_world_check[0]:.2f}, {goal_world_check[1]:.2f})'
-        )
-
-        # Validate start position in original grid (robot is already there)
         if not self.is_valid_in_original_grid(start_grid):
             self.get_logger().error(
-                f'Start position ({start_x:.2f}, {start_y:.2f}) is invalid or in actual obstacle!'
-            )
+                f'Start position ({start_x:.2f}, {start_y:.2f}) is in an obstacle.')
             return []
 
-        # Validate goal position in inflated grid (for safety)
         if not self.is_valid(goal_grid):
             self.get_logger().error(
-                f'Goal position ({goal_x:.2f}, {goal_y:.2f}) is invalid or too close to obstacles!'
-            )
+                f'Goal position ({goal_x:.2f}, {goal_y:.2f}) is invalid or too close to obstacles.')
             return []
 
-        # Check connectivity from start (debug)
-        neighbors_valid = sum(
-            1 for dx, dy in [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]
-            if self.is_valid((start_grid[0] + dx, start_grid[1] + dy))
-        )
-        self.get_logger().info(f'Start has {neighbors_valid}/8 valid neighbors in inflated grid')
-
-        if neighbors_valid == 0:
-            self.get_logger().warn('Start position is surrounded by inflated obstacles!')
-            self.get_logger().warn(
-                f'Consider reducing safety_clearance (current: {self.safety_clearance}m) '
-                f'or robot_radius (current: {self.robot_radius}m)'
-            )
-            self.get_logger().warn(f'Current total inflation: {self.robot_radius + self.safety_clearance}m')
-
-        # Run JPS pathfinding
-        self.get_logger().info('Running Jump Point Search...')
         path_grid = self.jps(start_grid, goal_grid)
-
         if not path_grid:
             return []
 
-        # Convert to world coordinates and simplify
         path_world = [self.grid_to_world(gx, gy) for gx, gy in path_grid]
-        simplified_path = self.simplify_path(path_world)
-
-        return simplified_path
+        simplified = self._rdp_simplify(path_world, self.simplification_epsilon)
+        return self._smooth_path(simplified)
 
     def jps(self, start, goal):
-        """
-        Jump Point Search algorithm with hybrid obstacle checking.
-
-        Uses original grid near start position (tight spaces) and inflated
-        grid far from start (safety). This allows the robot to escape from
-        tight spaces while maintaining safety margins in open areas.
-
-        Args:
-            start: Start position as (grid_x, grid_y)
-            goal: Goal position as (grid_x, grid_y)
-
-        Returns:
-            list: Path as list of (grid_x, grid_y) tuples, or empty list if no path
-        """
-        # Heuristic: Euclidean distance
+        """Jump Point Search with hybrid obstacle checking near the start cell."""
         def heuristic(a, b):
             return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
 
-        rows, cols = self.grid.shape
-
-        # Initialize JPS data structures
         open_set = []
         heapq.heappush(open_set, (0, start))
         came_from = {}
@@ -446,362 +309,316 @@ class JPSNavigator(Node):
         f_score = {start: heuristic(start, goal)}
         nodes_explored = 0
 
-        # JPS main loop
         while open_set:
             _, current = heapq.heappop(open_set)
             nodes_explored += 1
 
-            # Check if reached goal
             if current == goal:
-                # Reconstruct path
                 path = []
                 while current in came_from:
                     path.append(current)
                     current = came_from[current]
                 path.append(start)
                 self.get_logger().info(f'JPS explored {nodes_explored} nodes')
-                return path[::-1]  # Reverse to get start->goal order
+                return path[::-1]
 
-            # Get successors using jump point search
             for successor in self.get_successors(current, start, goal):
-                # Calculate distance between current and successor
                 dx = successor[0] - current[0]
                 dy = successor[1] - current[1]
                 distance = math.sqrt(dx*dx + dy*dy)
-                
                 tentative_g = g_score[current] + distance
 
-                # Update if better path found
                 if successor not in g_score or tentative_g < g_score[successor]:
                     came_from[successor] = current
                     g_score[successor] = tentative_g
                     f_score[successor] = tentative_g + heuristic(successor, goal)
                     heapq.heappush(open_set, (f_score[successor], successor))
 
-        # No path found
         self.get_logger().error(f'JPS failed after exploring {nodes_explored} nodes')
         return []
 
     def get_successors(self, node, start, goal):
-        """
-        Get jump point successors for a given node.
-
-        Args:
-            node: Current node (grid_x, grid_y)
-            start: Start position (for hybrid validation)
-            goal: Goal position
-
-        Returns:
-            list: List of jump point successors
-        """
+        """Return jump point successors in the 8-connected neighborhood."""
         successors = []
-        rows, cols = self.grid.shape
-        
-        # Check all 8 directions
-        for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0), 
-                      (1, 1), (1, -1), (-1, 1), (-1, -1)]:
-            
-            # Try to jump in this direction
-            jump_point = self.jump(node, (dx, dy), start, goal)
-            
+        for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0),
+                       (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+            jump_point = self.jump(node, (dx, dy), start, goal, depth=0)
             if jump_point is not None:
                 successors.append(jump_point)
-                
         return successors
 
-    def jump(self, node, direction, start, goal):
-        """
-        Jump recursively in a direction until finding a jump point.
+    def jump(self, node, direction, start, goal, depth=0):
+        """Jump recursively in direction until finding a jump point or dead end.
 
-        Args:
-            node: Current node (grid_x, grid_y)
-            direction: Direction (dx, dy) to jump
-            start: Start position (for hybrid validation)
-            goal: Goal position
-
-        Returns:
-            tuple: Jump point coordinates or None if blocked
+        Depth-limited to prevent RecursionError on large maps.
         """
+        if depth > NavigatorConstants.MAX_JUMP_DEPTH:
+            return None
+
         dx, dy = direction
         next_node = (node[0] + dx, node[1] + dy)
-        
-        # Check if next node is valid
+
         if not self.is_valid_with_hybrid(next_node, start):
             return None
-            
-        # If we reached the goal, it's a jump point
+
         if next_node == goal:
             return next_node
-            
-        # Check for forced neighbors (diagonal case)
+
         if dx != 0 and dy != 0:
-            # Check for horizontal forced neighbor
-            if (self.is_valid_with_hybrid((next_node[0] - dx, next_node[1]), start) and 
-                not self.is_valid_with_hybrid((next_node[0] - dx, next_node[1] + dy), start)):
+            if (self.is_valid_with_hybrid((next_node[0] - dx, next_node[1]), start) and
+                    not self.is_valid_with_hybrid((next_node[0] - dx, next_node[1] + dy), start)):
                 return next_node
-                
-            # Check for vertical forced neighbor
-            if (self.is_valid_with_hybrid((next_node[0], next_node[1] - dy), start) and 
-                not self.is_valid_with_hybrid((next_node[0] + dx, next_node[1] - dy), start)):
+
+            if (self.is_valid_with_hybrid((next_node[0], next_node[1] - dy), start) and
+                    not self.is_valid_with_hybrid((next_node[0] + dx, next_node[1] - dy), start)):
                 return next_node
-                
-            # Recursive jump in diagonal direction
-            if self.jump(next_node, direction, start, goal) is not None:
+
+            if self.jump(next_node, (dx, 0), start, goal, depth + 1) is not None:
                 return next_node
-                
-            # Recursive jump in horizontal direction
-            if self.jump(next_node, (dx, 0), start, goal) is not None:
+            if self.jump(next_node, (0, dy), start, goal, depth + 1) is not None:
                 return next_node
-                
-            # Recursive jump in vertical direction
-            if self.jump(next_node, (0, dy), start, goal) is not None:
-                return next_node
-                
-        else:  # Horizontal or vertical movement
-            if dx != 0:  # Horizontal
-                # Check for forced neighbors above/below
-                if (self.is_valid_with_hybrid((next_node[0], next_node[1] + 1), start) and 
-                    not self.is_valid_with_hybrid((next_node[0] + dx, next_node[1] + 1), start)):
+
+        else:
+            if dx != 0:
+                if (self.is_valid_with_hybrid((next_node[0], next_node[1] + 1), start) and
+                        not self.is_valid_with_hybrid(
+                            (next_node[0] + dx, next_node[1] + 1), start)):
                     return next_node
-                    
-                if (self.is_valid_with_hybrid((next_node[0], next_node[1] - 1), start) and 
-                    not self.is_valid_with_hybrid((next_node[0] + dx, next_node[1] - 1), start)):
+                if (self.is_valid_with_hybrid((next_node[0], next_node[1] - 1), start) and
+                        not self.is_valid_with_hybrid(
+                            (next_node[0] + dx, next_node[1] - 1), start)):
                     return next_node
-                    
-            else:  # Vertical
-                # Check for forced neighbors left/right
-                if (self.is_valid_with_hybrid((next_node[0] + 1, next_node[1]), start) and 
-                    not self.is_valid_with_hybrid((next_node[0] + 1, next_node[1] + dy), start)):
+            else:
+                if (self.is_valid_with_hybrid((next_node[0] + 1, next_node[1]), start) and
+                        not self.is_valid_with_hybrid(
+                            (next_node[0] + 1, next_node[1] + dy), start)):
                     return next_node
-                    
-                if (self.is_valid_with_hybrid((next_node[0] - 1, next_node[1]), start) and 
-                    not self.is_valid_with_hybrid((next_node[0] - 1, next_node[1] + dy), start)):
+                if (self.is_valid_with_hybrid((next_node[0] - 1, next_node[1]), start) and
+                        not self.is_valid_with_hybrid(
+                            (next_node[0] - 1, next_node[1] + dy), start)):
                     return next_node
-            
-            # Continue jumping in same direction
-            return self.jump(next_node, direction, start, goal)
-            
-        return None
+
+        return self.jump(next_node, direction, start, goal, depth + 1)
 
     def is_valid_with_hybrid(self, grid_pos, start):
-        """
-        Check if grid position is valid using hybrid validation.
-
-        Uses original grid near start (tight spaces) and inflated
-        grid far from start (safety).
-
-        Args:
-            grid_pos: Tuple (grid_x, grid_y) to check
-            start: Start position for distance calculation
-
-        Returns:
-            bool: True if position is valid and free, False otherwise
-        """
+        """Return True if grid_pos is free, using original grid near the start cell."""
         gx, gy = grid_pos
         rows, cols = self.grid.shape
 
-        # Check bounds
         if gx < 0 or gx >= cols or gy < 0 or gy >= rows:
             return False
 
-        # Calculate distance from start
         distance_from_start = abs(gx - start[0]) + abs(gy - start[1])
-
-        # HYBRID VALIDATION
-        if distance_from_start <= NavigatorConstants.TIGHT_SPACE_RADIUS:
-            # Close to start - use original grid to escape tight spaces
+        if distance_from_start <= self.tight_space_radius:
             return self.grid_original[gy, gx] == 0
-        else:
-            # Far from start - use inflated grid for safety
-            return self.grid[gy, gx] == 0
-
-    # ========================================================================
-    # GRID VALIDATION
-    # ========================================================================
+        return self.grid[gy, gx] == 0
 
     def is_valid(self, grid_pos):
-        """
-        Check if grid position is valid and free in inflated grid.
-
-        Args:
-            grid_pos: Tuple (grid_x, grid_y) to check
-
-        Returns:
-            bool: True if position is valid and free, False otherwise
-        """
+        """Return True if grid_pos is in-bounds and free in the inflated grid."""
         gx, gy = grid_pos
         rows, cols = self.grid.shape
-
-        # Check bounds
         if gx < 0 or gx >= cols or gy < 0 or gy >= rows:
             return False
-
-        # Check if free (0 = free, 1 = occupied)
-        return self.grid[gy, gx] == 0  # Note: grid is [row, col] = [y, x]
+        return self.grid[gy, gx] == 0
 
     def is_valid_in_original_grid(self, grid_pos):
-        """
-        Check if grid position is valid and free in original grid (before inflation).
-
-        Used for checking positions near the start to allow escape from tight spaces.
-
-        Args:
-            grid_pos: Tuple (grid_x, grid_y) to check
-
-        Returns:
-            bool: True if position is valid and free, False otherwise
-        """
+        """Return True if grid_pos is in-bounds and free in the original (uninflated) grid."""
         gx, gy = grid_pos
         rows, cols = self.grid_original.shape
-
-        # Check bounds
         if gx < 0 or gx >= cols or gy < 0 or gy >= rows:
             return False
-
-        # Check if free (0 = free, 1 = occupied)
-        return self.grid_original[gy, gx] == 0  # Note: grid is [row, col] = [y, x]
-
-    # ========================================================================
-    # COORDINATE CONVERSION
-    # ========================================================================
+        return self.grid_original[gy, gx] == 0
 
     def world_to_grid(self, x, y):
-        """
-        Convert world coordinates (meters) to grid indices (cells).
-
-        Args:
-            x: X coordinate in world frame (meters)
-            y: Y coordinate in world frame (meters)
-
-        Returns:
-            tuple: (grid_x, grid_y) in grid cell coordinates
-        """
+        """Convert world coordinates in meters to grid cell indices."""
         grid_x = int((x - self.origin[0]) / self.resolution)
         grid_y = int((y - self.origin[1]) / self.resolution)
         return (grid_x, grid_y)
 
     def grid_to_world(self, grid_x, grid_y):
-        """
-        Convert grid indices (cells) to world coordinates (meters).
-
-        Args:
-            grid_x: X index in grid coordinates
-            grid_y: Y index in grid coordinates
-
-        Returns:
-            tuple: (x, y) in world frame (meters)
-        """
+        """Convert grid cell indices to world coordinates in meters."""
         x = grid_x * self.resolution + self.origin[0]
         y = grid_y * self.resolution + self.origin[1]
         return (x, y)
 
-    # ========================================================================
-    # PATH MANAGEMENT
-    # ========================================================================
+    def _rdp_simplify(self, path, epsilon):
+        """Ramer-Douglas-Peucker line simplification."""
+        if len(path) <= 2:
+            return list(path)
 
-    def simplify_path(self, path, max_points=None):
-        """
-        Simplify path by keeping only key waypoints.
+        start = np.array(path[0])
+        end = np.array(path[-1])
+        line_vec = end - start
+        line_len = np.linalg.norm(line_vec)
 
-        Reduces the number of waypoints to improve navigation smoothness
-        while maintaining the overall path shape.
+        if line_len < 1e-10:
+            return [path[0], path[-1]]
 
-        Args:
-            path: List of (x, y) tuples in world coordinates
-            max_points: Maximum waypoints to keep (default from constants)
+        line_unit = line_vec / line_len
+        max_dist = 0.0
+        max_idx = 0
+        for i in range(1, len(path) - 1):
+            pt = np.array(path[i])
+            proj = np.clip(np.dot(pt - start, line_unit), 0, line_len)
+            closest = start + proj * line_unit
+            dist = np.linalg.norm(pt - closest)
+            if dist > max_dist:
+                max_dist = dist
+                max_idx = i
 
-        Returns:
-            list: Simplified path as list of (x, y) tuples
-        """
-        if max_points is None:
-            max_points = NavigatorConstants.MAX_PATH_WAYPOINTS
+        if max_dist > epsilon:
+            left = self._rdp_simplify(path[:max_idx + 1], epsilon)
+            right = self._rdp_simplify(path[max_idx:], epsilon)
+            return left[:-1] + right
+        return [path[0], path[-1]]
 
-        if len(path) <= max_points:
+    def _smooth_path(self, path):
+        """Smooth waypoints with cubic spline interpolation, resampled at ~0.1 m."""
+        if len(path) < 3:
             return path
 
-        # Downsample to max_points waypoints
-        step = len(path) // max_points
-        simplified = [path[i] for i in range(0, len(path), step)]
-        simplified.append(path[-1])  # Always include goal
-        return simplified
+        xs = [p[0] for p in path]
+        ys = [p[1] for p in path]
 
-    def print_path(self):
-        """Print the planned path waypoints to logger."""
-        self.get_logger().info('Planned waypoints:')
-        for i, (x, y) in enumerate(self.path):
-            self.get_logger().info(f'  {i+1}. ({x:.2f}, {y:.2f})')
+        dists = [0.0]
+        for i in range(1, len(xs)):
+            d = math.sqrt((xs[i] - xs[i-1])**2 + (ys[i] - ys[i-1])**2)
+            dists.append(dists[-1] + d)
 
-    # ========================================================================
-    # ROBOT CONTROL
-    # ========================================================================
+        total_len = dists[-1]
+        if total_len < 1e-6:
+            return path
+
+        t = np.array(dists)
+        cs_x = CubicSpline(t, xs)
+        cs_y = CubicSpline(t, ys)
+
+        n_samples = max(int(total_len / 0.1), len(path))
+        t_new = np.linspace(0, total_len, n_samples)
+        return list(zip(cs_x(t_new).tolist(), cs_y(t_new).tolist()))
+
+    def _publish_path(self):
+        """Publish the planned path as a nav_msgs/Path."""
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = 'map'
+
+        for x, y in self.path:
+            pose = PoseStamped()
+            pose.header = path_msg.header
+            pose.pose.position.x = float(x)
+            pose.pose.position.y = float(y)
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+
+        self.plan_pub.publish(path_msg)
+
+    def _republish_path(self):
+        """Republish current path at 1 Hz for late-joining subscribers."""
+        if self.path:
+            self._publish_path()
+
+    def _handle_cancel(self, request, response):
+        """CancelNav service handler -- stop planning and driving."""
+        self.get_logger().info('Cancel requested via service')
+        self._active_goal = None
+        self.path = []
+        self.current_waypoint_idx = 0
+        self._planner_state = 'idle'
+
+        empty_path = Path()
+        empty_path.header.stamp = self.get_clock().now().to_msg()
+        empty_path.header.frame_id = 'map'
+        self.plan_pub.publish(empty_path)
+
+        if self.standalone:
+            self.stop_robot()
+
+        response.confirmed = True
+        return response
+
+    def _publish_nav_status(self):
+        """Publish NavStatus at 2 Hz for the navigation server to consume."""
+        msg = NavStatus()
+        msg.nav_state = self._planner_state
+        msg.has_active_goal = self._active_goal is not None
+        msg.distance_traveled = self.total_distance
+
+        if self.start_time is not None:
+            msg.elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+        else:
+            msg.elapsed_time = 0.0
+
+        if self.current_pose is not None:
+            msg.current_x = self.current_pose['x']
+            msg.current_y = self.current_pose['y']
+            if self._active_goal is not None:
+                dx = self._active_goal[0] - self.current_pose['x']
+                dy = self._active_goal[1] - self.current_pose['y']
+                msg.distance_to_goal = math.sqrt(dx**2 + dy**2)
+            else:
+                msg.distance_to_goal = -1.0
+        else:
+            msg.current_x = 0.0
+            msg.current_y = 0.0
+            msg.distance_to_goal = -1.0
+
+        msg.goal_reached = self._goal_just_reached
+        self.nav_status_pub.publish(msg)
 
     def control_loop(self):
-        """
-        Main control loop for waypoint following.
-
-        Called periodically by ROS2 timer. Implements simple proportional
-        control to follow waypoints: rotate towards target, then drive forward.
-        """
-        # Check if navigation active
+        """Waypoint-following control loop, called at 10 Hz."""
         if not self.path or self.current_pose is None:
             return
 
-        # Update distance traveled
         if self.last_position is not None:
             current_x = self.current_pose['x']
             current_y = self.current_pose['y']
             dx = current_x - self.last_position[0]
             dy = current_y - self.last_position[1]
-            distance_increment = math.sqrt(dx**2 + dy**2)
-            self.total_distance += distance_increment
+            self.total_distance += math.sqrt(dx**2 + dy**2)
             self.last_position = (current_x, current_y)
 
-        # Check if goal reached
         if self.current_waypoint_idx >= len(self.path):
-            self.stop_robot()
-            # Calculate elapsed time
+            if self.standalone:
+                self.stop_robot()
             if self.start_time is not None:
-                elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
-                self.get_logger().info('🎯 Goal reached!')
-                self.get_logger().info(f'Total distance traveled: {self.total_distance:.2f} meters')
-                self.get_logger().info(f'Total time elapsed: {elapsed_time:.2f} seconds')
+                elapsed = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+                self.get_logger().info(
+                    f'Goal reached | dist={self.total_distance:.2f}m time={elapsed:.2f}s')
             else:
-                self.get_logger().info('🎯 Goal reached!')
+                self.get_logger().info('Goal reached')
+            self._planner_state = 'idle'
+            self._goal_just_reached = True
             self.path = []
             return
 
-        # Get current target waypoint
+        if self.standalone:
+            self._follow_waypoint()
+
+    def _follow_waypoint(self):
+        """Drive toward the current waypoint with proportional control."""
         target = self.path[self.current_waypoint_idx]
         tx, ty = target
 
-        # Calculate distance and angle to target
         dx = tx - self.current_pose['x']
         dy = ty - self.current_pose['y']
         distance = math.sqrt(dx**2 + dy**2)
         target_angle = math.atan2(dy, dx)
-        angle_diff = self.normalize_angle(target_angle - self.current_pose['theta'])
+        angle_diff = normalize_angle(target_angle - self.current_pose['theta'])
 
-        # Create velocity command
         cmd = TwistStamped()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.header.frame_id = 'base_link'
 
-        # Check if waypoint reached
         if distance < self.position_tolerance:
             self.current_waypoint_idx += 1
-            self.get_logger().info(
-                f'Waypoint {self.current_waypoint_idx}/{len(self.path)} reached'
-            )
             return
 
-        # Simple proportional control:
-        # 1. Rotate towards target if not aligned
         if abs(angle_diff) > self.angle_tolerance:
             cmd.twist.angular.z = self.angular_speed if angle_diff > 0 else -self.angular_speed
         else:
-            # 2. Drive forward once aligned
             cmd.twist.linear.x = min(self.linear_speed, distance)
-            # Small angular correction while moving
             cmd.twist.angular.z = 0.3 * angle_diff
 
         self.cmd_vel_pub.publish(cmd)
@@ -813,137 +630,30 @@ class JPSNavigator(Node):
         cmd.header.frame_id = 'base_link'
         self.cmd_vel_pub.publish(cmd)
 
-    def get_current_position(self):
-        """
-        Get the current robot position from odometry.
-
-        Returns:
-            tuple: (x, y) position in world frame, or None if no odometry data
-        """
-        if self.current_pose is None:
-            self.get_logger().warn('No odometry data available yet')
-            return None
-        return (self.current_pose['x'], self.current_pose['y'])
-
-    # ========================================================================
-    # UTILITY METHODS
-    # ========================================================================
-
     @staticmethod
     def quaternion_to_yaw(q):
-        """
-        Convert quaternion to yaw angle.
-
-        Args:
-            q: Quaternion with w, x, y, z components
-
-        Returns:
-            float: Yaw angle in radians
-        """
+        """Extract yaw angle from a quaternion."""
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         return math.atan2(siny_cosp, cosy_cosp)
 
-    @staticmethod
-    def normalize_angle(angle):
-        """
-        Normalize angle to [-pi, pi] range.
 
-        Args:
-            angle: Angle in radians
+def normalize_angle(angle):
+    """Normalize angle to [-pi, pi] range."""
+    return (angle + math.pi) % (2 * math.pi) - math.pi
 
-        Returns:
-            float: Normalized angle in [-pi, pi]
-        """
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
-
-
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
 
 def main(args=None):
-    """
-    Main entry point for the JPS navigator.
-
-    Initializes ROS2, creates the navigator node, waits for odometry data,
-    prompts for goal input, and executes navigation.
-
-    Configuration via environment variables:
-        ROBOT_RADIUS: Robot radius in meters (default 0.22)
-        SAFETY_CLEARANCE: Safety margin in meters (default 0.15)
-    """
-    # Get parameters from environment or use defaults
-    robot_radius = float(os.getenv('ROBOT_RADIUS', str(NavigatorConstants.ROBOT_RADIUS)))
-    safety_clearance = float(os.getenv('SAFETY_CLEARANCE', str(NavigatorConstants.SAFETY_CLEARANCE)))
-
-    # Initialize ROS2
     rclpy.init(args=args)
-    navigator = JPSNavigator(robot_radius=robot_radius, safety_clearance=safety_clearance)
-
-    # Print usage information
-    print("\n" + "="*60)
-    print("TurtleBot4 JPS Navigator")
-    print("="*60)
-    print(f"\nRobot Configuration:")
-    print(f"  Robot radius: {robot_radius}m (set via ROBOT_RADIUS env var)")
-    print(f"  Safety clearance: {safety_clearance}m (set via SAFETY_CLEARANCE env var)")
-    print(f"  Total inflation: {robot_radius + safety_clearance}m")
-    print(f"  Commanding on: {NavigatorConstants.CMD_VEL}")
-    print(f"  Listening on: {NavigatorConstants.ODOMETRY}")
-    print("\nUsage Examples:")
-    print("  1. Get current position:")
-    print("     pos = navigator.get_current_position()")
-    print("\n  2. Navigate to goal:")
-    print("     navigator.navigate_to_goal(0.0, 0.0, 3.0, 2.0)")
-    print("\n  3. Use current position:")
-    print("     pos = navigator.get_current_position()")
-    print("     if pos:")
-    print("         navigator.navigate_to_goal(pos[0], pos[1], 3.0, 2.0)")
-    print("\nTo customize clearance:")
-    print("  ROBOT_RADIUS=0.22 SAFETY_CLEARANCE=0.20 ros2 run jps jps_nav")
-    print("="*60 + "\n")
-
-    # Wait for odometry data
-    print("Waiting for odometry data...")
-    while navigator.current_pose is None and rclpy.ok():
-        rclpy.spin_once(navigator, timeout_sec=0.1)
-
-    if navigator.current_pose:
-        print(f"Current position: ({navigator.current_pose['x']:.2f}, {navigator.current_pose['y']:.2f})")
-
-        # Get goal from user input
-        try:
-            goal_x = float(input("Enter goal X coordinate (meters): "))
-            goal_y = float(input("Enter goal Y coordinate (meters): "))
-        except (ValueError, EOFError, KeyboardInterrupt):
-            print("\nInvalid input or interrupted. Exiting...")
-            navigator.destroy_node()
-            rclpy.shutdown()
-            return
-
-        # Use current position as start
-        start_x = navigator.current_pose['x']
-        start_y = navigator.current_pose['y']
-
-        # Plan and execute navigation
-        if navigator.navigate_to_goal(start_x, start_y, goal_x, goal_y):
-            print("\nNavigation started! Press Ctrl+C to stop.\n")
-            try:
-                rclpy.spin(navigator)
-            except KeyboardInterrupt:
-                print("\nStopping navigation...")
-        else:
-            print("\nNavigation failed!")
-
-    # Cleanup
-    navigator.stop_robot()
-    navigator.destroy_node()
-    rclpy.shutdown()
+    navigator = JPSNavigator()
+    try:
+        rclpy.spin(navigator)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        navigator.stop_robot()
+        navigator.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

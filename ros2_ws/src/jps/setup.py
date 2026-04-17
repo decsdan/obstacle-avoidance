@@ -16,7 +16,7 @@ setup(
     maintainer='emekar',
     maintainer_email='emekar@todo.todo',
     description='Jump Point Search pathfinding algorithm for TurtleBot4 navigation',
-    license='Apache License 2.0',
+    license='',
     extras_require={
         'test': [
             'pytest',
@@ -25,8 +25,6 @@ setup(
     entry_points={
         'console_scripts': [
             'jps_nav = jps.jps_nav:main',
-            'odom = jps.odom_subscriber:main',
-            'jps_visualizer = jps.jps_visualizer:main',
         ],
     },
 )

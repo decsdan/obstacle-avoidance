@@ -5,14 +5,20 @@
   <version>0.0.0</version>
   <description>Jump Point Search pathfinding algorithm for TurtleBot4 navigation</description>
   <maintainer email="emekar@todo.todo">emekar</maintainer>
-  <license>Apache License 2.0</license>
+  <license></license>
 
-  <depend>rclpy</depend>
   <depend>geometry_msgs</depend>
+  <depend>nav_interfaces</depend>
   <depend>nav_msgs</depend>
+  <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
+  <depend>tf2_ros</depend>
 
-  <test_depend>ament_copyright</test_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
