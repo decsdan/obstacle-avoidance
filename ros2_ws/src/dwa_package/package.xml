@@ -2,13 +2,12 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>dwa_package</name>
-  <version>0.0.0</version>
-  <description>Dynamic Window Approach local planner for TurtleBot4 obstacle avoidance</description>
+  <version>2.0.0</version>
+  <description>Dynamic Window Approach local planner. The navigation server sends it a reference path via FollowPath and it drives the robot along it.</description>
   <maintainer email="scheiderd@carleton.edu">daniel</maintainer>
   <license></license>
 
   <depend>geometry_msgs</depend>
-  <depend>message_filters</depend>
   <depend>nav_interfaces</depend>
   <depend>nav_msgs</depend>
   <depend>rclpy</depend>

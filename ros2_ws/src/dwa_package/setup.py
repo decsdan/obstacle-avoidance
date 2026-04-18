@@ -6,7 +6,7 @@ package_name = 'dwa_package'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='2.0.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -18,7 +18,7 @@ setup(
     zip_safe=True,
     maintainer='daniel',
     maintainer_email='scheiderd@carleton.edu',
-    description='Dynamic Window Approach local planner for TurtleBot4 obstacle avoidance',
+    description='Dynamic Window Approach local planner. The navigation server sends it a reference path via FollowPath and it drives the robot along it.',
     license='',
     extras_require={
         'test': [
