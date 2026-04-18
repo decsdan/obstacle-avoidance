@@ -35,7 +35,11 @@ from rclpy.action import (
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy,
+)
 from rclpy.time import Time
+from std_msgs.msg import Bool
 from tf2_ros import Buffer, TransformListener
 
 
@@ -68,16 +72,20 @@ class NavKnowledge:
     distance_to_goal: float = -1.0
     distance_traveled: float = 0.0
     cross_track_error: float = 0.0
-    local_state: str = 'idle'
+    local_state: str = ''  # mirrors FollowPath feedback: running|path_blocked|stuck
     waypoint_index: int = -1
 
-    # Orchestrator state machine
-    nav_state: str = 'idle'  # planning | following | replanning | recovering | idle
+    # Orchestrator state machine; values restricted to the Navigate feedback
+    # enum (planning | following | replanning | recovering).
+    nav_state: str = 'planning'
     replan_count: int = 0
     replan_reason: str = ''
 
     # Terminal outcome from the FollowPath action, set by its result callback
     follow_terminal: Optional[str] = None
+
+    # Safety mux latched flag; any transition to True forces an abort
+    safety_latched: bool = False
 
     # Timing
     start_time: Optional[Time] = None
@@ -103,8 +111,8 @@ class NavigationServer(Node):
         self.declare_parameter('feedback_hz', 10.0)
         self.declare_parameter('replan_on_path_blocked', True)
         self.declare_parameter('replan_deviation_threshold', 0.5)
-        # Periodic replanning is OFF by default: PRD §4.5 requires replan
-        # decisions to be deterministic functions of grid/path, not timers.
+        # Periodic replanning is OFF by default; replan decisions must be
+        # deterministic functions of grid/path, not wall-clock timers.
         self.declare_parameter('replan_period_sec', 0.0)
 
         p = self.get_parameter
@@ -142,7 +150,22 @@ class NavigationServer(Node):
         self._plan_clients = {}
         self._follow_clients = {}
         self._grid_client = self.create_client(
-            GetGridSnapshot, f'{self.ns}/obstacle_grid/get_snapshot',
+            GetGridSnapshot, f'{self.ns}/get_grid_snapshot',
+            callback_group=self._cbg)
+
+        # ------------------------------------------------------------------
+        # Safety mux latch subscription -- observe-only; the mux owns the
+        # cmd_vel override path directly and does not depend on this node.
+        # ------------------------------------------------------------------
+        latched_qos = QoSProfile(
+            depth=1,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._safety_sub = self.create_subscription(
+            Bool, f'{self.ns}/safety/latched',
+            self._monitor_safety_latched, latched_qos,
             callback_group=self._cbg)
 
         # ------------------------------------------------------------------
@@ -276,6 +299,11 @@ class NavigationServer(Node):
                 goal_handle.abort()
                 return self._finalize_result('timeout', success=False)
 
+            if self.K.safety_latched:
+                await self._execute_cancel_follow()
+                goal_handle.abort()
+                return self._finalize_result('failed', success=False)
+
             # Monitor: refresh pose from TF when FollowPath isn't feeding us
             if self.K.nav_state != 'following':
                 self._monitor_pose_from_tf()
@@ -335,6 +363,14 @@ class NavigationServer(Node):
         self.K.current_pose.orientation = t.transform.rotation
         self.K.pose_valid = True
         self.K.distance_to_goal = self._distance_to_goal()
+
+    def _monitor_safety_latched(self, msg: Bool):
+        """Latched-QoS subscription for the safety mux override signal."""
+        was_latched = self.K.safety_latched
+        self.K.safety_latched = bool(msg.data)
+        if self.K.safety_latched and not was_latched:
+            self.get_logger().warn(
+                '[monitor] safety mux latched -- aborting active Navigate goal')
 
     def _monitor_follow_feedback(self, feedback_msg):
         fb = feedback_msg.feedback
@@ -538,7 +574,6 @@ class NavigationServer(Node):
         r.total_time = (self._elapsed(self.K.start_time)
                         if self.K.start_time else 0.0)
         r.replan_count = self.K.replan_count
-        self.K.nav_state = 'idle'
         self.get_logger().info(
             f'[result] outcome={outcome} '
             f'distance={r.total_distance:.2f} '
