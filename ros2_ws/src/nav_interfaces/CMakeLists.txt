@@ -16,8 +16,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/FollowPath.action"
   "action/Navigate.action"
   "action/RunBatch.action"
-  "msg/NavStatus.msg"
-  "srv/CancelNav.srv"
   "srv/GetGridSnapshot.srv"
   "srv/PlanPath.srv"
   DEPENDENCIES builtin_interfaces geometry_msgs nav_msgs std_msgs
