@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # Originally authored by the 2025 Carleton Senior Capstone Project
 # (see AUTHORS.md). Substantially rewritten by Daniel Scheider, 2026.
-"""A* global path planner exposed as a ``PlanPath`` service.
+"""A* global path planner.
 
-The planner is a pure call/response worker: the navigation server hands it
-an inflated ``OccupancyGrid`` plus start/goal poses, and the planner returns
-a ``nav_msgs/Path`` in the map frame. It holds no goal state, runs no
-replan loop, and does not drive the robot.
+Planner only, the navigation server calls this node with a grid and a
+start/goal, and it hands back a path. It doesn't listen for goals or drive
+the robot on its own.
 """
 
 import heapq
