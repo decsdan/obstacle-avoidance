@@ -4,7 +4,7 @@ package_name = 'jps'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='2.0.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -13,9 +13,9 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='emekar',
-    maintainer_email='emekar@todo.todo',
-    description='Jump Point Search pathfinding algorithm for TurtleBot4 navigation',
+    maintainer='daniel',
+    maintainer_email='scheiderd@carleton.edu',
+    description='Jump Point Search global path planner called by the navigation server.',
     license='',
     extras_require={
         'test': [

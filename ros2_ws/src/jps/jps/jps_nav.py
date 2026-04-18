@@ -1,466 +1,303 @@
 #!/usr/bin/env python3
 # Originally authored by the 2025 Carleton Senior Capstone Project
 # (see AUTHORS.md). Substantially rewritten by Daniel Scheider, 2026.
-"""JPS global path planner for ROS2 with hybrid obstacle checking.
+"""Jump Point Search global path planner.
 
-Supports standalone mode (plans and drives via cmd_vel) and stacked mode
-(publishes nav_msgs/Path for a downstream local planner). Requires a
-pre-built static map loaded via the MAP_YAML env var.
+Planner only, the navigation server calls this node with a grid and a
+start/goal, and it hands back a path. The JPS search, RDP simplification,
+and spline smoothing are kept; all the goal-subscription, TF, replan, and
+cmd_vel wiring is gone.
 """
 
 import heapq
 import math
-import os
-import sys
+import time
 
 import numpy as np
-import yaml
-from PIL import Image
 from scipy.interpolate import CubicSpline
-from scipy.ndimage import binary_dilation
 
 import rclpy
-from geometry_msgs.msg import PoseStamped, TwistStamped
-from nav_interfaces.msg import NavStatus
-from nav_interfaces.srv import CancelNav
-from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import PoseStamped
+from nav_interfaces.srv import PlanPath
+from nav_msgs.msg import Path
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from tf2_ros import Buffer, TransformListener
 
 
 class NavigatorConstants:
-    """Default configuration constants for the JPS navigator."""
+    """Default configuration constants for the JPS planner."""
 
-    ROBOT_RADIUS = 0.22
-    SAFETY_CLEARANCE = 0.05
-
-    LINEAR_SPEED = 0.2
-    ANGULAR_SPEED = 0.5
-    POSITION_TOLERANCE = 0.1
-    ANGLE_TOLERANCE = 0.1
-    CONTROL_TIMER_PERIOD = 0.1
-
-    MAX_PATH_WAYPOINTS = 20
-    TIGHT_SPACE_RADIUS = 3
+    MAX_PATH_WAYPOINTS = 50
+    TIGHT_SPACE_RADIUS = 5
     SIMPLIFICATION_EPSILON = 0.1
     MAX_JUMP_DEPTH = 500
+    MAX_SEARCH_NODES = 100_000
 
     DEFAULT_NAMESPACE = '/don'
 
 
-class JPSNavigator(Node):
-    """ROS2 node for Jump Point Search path planning and waypoint following."""
+class JPSPlanner(Node):
+    """JPS PlanPath service server."""
 
     def __init__(self):
-        _ns = NavigatorConstants.DEFAULT_NAMESPACE
-        for i, arg in enumerate(sys.argv):
-            if arg.startswith('namespace:='):
-                _ns = arg.split(':=', 1)[1]
-            elif arg == '-p' and i + 1 < len(sys.argv) and sys.argv[i+1].startswith('namespace:='):
-                _ns = sys.argv[i+1].split(':=', 1)[1]
-
-        _user_args = sys.argv[1:]
-        _tf_remaps = ['-r', f'/tf:={_ns}/tf', '-r', f'/tf_static:={_ns}/tf_static']
-        if '--ros-args' in _user_args:
-            _combined = _user_args + _tf_remaps
-        else:
-            _combined = _user_args + ['--ros-args'] + _tf_remaps
-
-        super().__init__('jps_navigator', cli_args=_combined, use_global_arguments=False)
+        super().__init__('jps_planner')
 
         self.declare_parameter('namespace', NavigatorConstants.DEFAULT_NAMESPACE)
         self.ns = self.get_parameter('namespace').value
 
-        default_radius = float(os.getenv('ROBOT_RADIUS', str(NavigatorConstants.ROBOT_RADIUS)))
-        default_clearance = float(
-            os.getenv('SAFETY_CLEARANCE', str(NavigatorConstants.SAFETY_CLEARANCE))
-        )
+        self.declare_parameter(
+            'max_path_waypoints', NavigatorConstants.MAX_PATH_WAYPOINTS)
+        self.declare_parameter(
+            'tight_space_radius', NavigatorConstants.TIGHT_SPACE_RADIUS)
+        self.declare_parameter(
+            'simplification_epsilon', NavigatorConstants.SIMPLIFICATION_EPSILON)
+        self.declare_parameter(
+            'max_jump_depth', NavigatorConstants.MAX_JUMP_DEPTH)
+        self.declare_parameter(
+            'max_search_nodes', NavigatorConstants.MAX_SEARCH_NODES)
 
-        self.declare_parameter('robot_radius', default_radius)
-        self.declare_parameter('safety_clearance', default_clearance)
-        self.robot_radius = self.get_parameter('robot_radius').value
-        self.safety_clearance = self.get_parameter('safety_clearance').value
-
-        self.declare_parameter('linear_speed', NavigatorConstants.LINEAR_SPEED)
-        self.declare_parameter('angular_speed', NavigatorConstants.ANGULAR_SPEED)
-        self.declare_parameter('position_tolerance', NavigatorConstants.POSITION_TOLERANCE)
-        self.declare_parameter('angle_tolerance', NavigatorConstants.ANGLE_TOLERANCE)
-        self.declare_parameter('max_path_waypoints', NavigatorConstants.MAX_PATH_WAYPOINTS)
-        self.declare_parameter('tight_space_radius', NavigatorConstants.TIGHT_SPACE_RADIUS)
-        self.declare_parameter('simplification_epsilon', NavigatorConstants.SIMPLIFICATION_EPSILON)
-
-        self.linear_speed = self.get_parameter('linear_speed').value
-        self.angular_speed = self.get_parameter('angular_speed').value
-        self.position_tolerance = self.get_parameter('position_tolerance').value
-        self.angle_tolerance = self.get_parameter('angle_tolerance').value
+        self.max_path_waypoints = self.get_parameter('max_path_waypoints').value
         self.tight_space_radius = self.get_parameter('tight_space_radius').value
-        self.simplification_epsilon = self.get_parameter('simplification_epsilon').value
+        self.simplification_epsilon = self.get_parameter(
+            'simplification_epsilon').value
+        self.max_jump_depth = self.get_parameter('max_jump_depth').value
+        self.max_search_nodes = self.get_parameter('max_search_nodes').value
 
-        self.declare_parameter('stacked', False)
-        self.standalone = not self.get_parameter('stacked').value
+        # Per-request state; set at the top of _handle_plan_path.
+        self._grid = None
+        self._start = None
+        self._deadline = None
 
-        self.plan_pub = self.create_publisher(Path, f'{self.ns}/jps/plan', 10)
-        self.cmd_vel_pub = self.create_publisher(TwistStamped, f'{self.ns}/cmd_vel', 10)
+        self._srv = self.create_service(
+            PlanPath, f'{self.ns}/jps/plan_path', self._handle_plan_path)
 
-        qos_profile = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-        )
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            f'{self.ns}/odom',
-            self.odom_callback,
-            qos_profile,
-        )
-        self.goal_sub = self.create_subscription(
-            PoseStamped,
-            f'{self.ns}/goal_pose',
-            self.goal_callback,
-            10,
-        )
-
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        self._planner_state = 'idle'
-        self._goal_just_reached = False
-        self._active_goal = None
-
-        self.nav_status_pub = self.create_publisher(NavStatus, f'{self.ns}/jps/status', 10)
-        self.cancel_srv = self.create_service(
-            CancelNav,
-            f'{self.ns}/jps/cancel',
-            self._handle_cancel,
-        )
-        self._status_timer = self.create_timer(0.5, self._publish_nav_status)
-
-        self.grid = None
-        self.grid_original = None
-        self.resolution = None
-        self.origin = None
-
-        self.current_pose = None
-        self.path = []
-        self.current_waypoint_idx = 0
-
-        self.start_time = None
-        self.total_distance = 0.0
-        self.last_position = None
-
-        self.control_timer = self.create_timer(
-            NavigatorConstants.CONTROL_TIMER_PERIOD,
-            self.control_loop,
-        )
-        self._path_republish_timer = self.create_timer(1.0, self._republish_path)
-
-        map_yaml = os.getenv('MAP_YAML')
-        map_pgm = os.getenv('MAP_PGM')
-
-        if map_yaml is None:
-            self.get_logger().error('No map provided. Set MAP_YAML env var.')
-            raise SystemExit('Map YAML path required. Set MAP_YAML env var.')
-
-        map_yaml = os.path.expanduser(map_yaml)
-        if map_pgm is None:
-            map_pgm = map_yaml.rsplit('.', 1)[0] + '.pgm'
-        else:
-            map_pgm = os.path.expanduser(map_pgm)
-
-        self.load_map(map_yaml, map_pgm)
-
-        mode_str = 'standalone' if self.standalone else 'stacked'
         self.get_logger().info(
-            f'jps_navigator initialized | ns={self.ns} mode={mode_str} '
-            f'radius={self.robot_radius}m clearance={self.safety_clearance}m')
+            f'jps planner ready on {self.ns}/jps/plan_path')
 
-    def load_map(self, yaml_file, pgm_file):
-        """Load static map from YAML and PGM, then inflate obstacles.
+    # ------------------------------------------------------------------
+    # Service entry point
+    # ------------------------------------------------------------------
 
-        Changes:
-            self.grid, self.grid_original, self.resolution, self.origin
-        """
-        try:
-            with open(yaml_file, 'r') as f:
-                map_data = yaml.safe_load(f)
+    def _handle_plan_path(self, request, response):
+        t0 = time.monotonic()
 
-            self.resolution = map_data['resolution']
-            self.origin = map_data['origin']
+        grid_msg = request.grid_snapshot
+        if grid_msg.info.width == 0 or grid_msg.info.height == 0:
+            return self._fail(response, 'BAD_INPUT', t0, 'Empty grid_snapshot')
 
-            img = Image.open(pgm_file)
-            occupancy_grid = np.array(img)
+        self._grid = self._grid_from_msg(grid_msg)
+        resolution = grid_msg.info.resolution
+        origin = (grid_msg.info.origin.position.x,
+                  grid_msg.info.origin.position.y)
 
-            self.grid = np.zeros_like(occupancy_grid)
-            self.grid[occupancy_grid < 250] = 1
-            self.grid[occupancy_grid >= 250] = 0
-            self.grid = np.flipud(self.grid)
-            self.grid_original = self.grid.copy()
+        start_cell = self._world_to_grid(
+            request.start.pose.position.x,
+            request.start.pose.position.y,
+            resolution, origin)
+        goal_cell = self._world_to_grid(
+            request.goal.pose.position.x,
+            request.goal.pose.position.y,
+            resolution, origin)
 
-            total_inflation = self.robot_radius + self.safety_clearance
-            self.inflate_obstacles(total_inflation)
+        rows, cols = self._grid.shape
+        if not (0 <= start_cell[0] < cols and 0 <= start_cell[1] < rows):
+            return self._fail(response, 'BAD_INPUT', t0,
+                              f'Start {start_cell} out of grid bounds')
+        if not (0 <= goal_cell[0] < cols and 0 <= goal_cell[1] < rows):
+            return self._fail(response, 'BAD_INPUT', t0,
+                              f'Goal {goal_cell} out of grid bounds')
+        if self._grid[goal_cell[1], goal_cell[0]] != 0:
+            return self._fail(response, 'BAD_INPUT', t0,
+                              'Goal cell is in an obstacle')
 
-            self.get_logger().info(
-                f'Map loaded: {self.grid.shape} res={self.resolution}m '
-                f'inflation={total_inflation:.2f}m')
-        except Exception as e:
-            self.get_logger().error(f'Failed to load map: {e}')
+        self._start = start_cell
+        budget = int(request.budget) if request.budget > 0 else self.max_search_nodes
+        self._deadline = t0 + (request.timeout if request.timeout > 0 else 1e9)
 
-    def inflate_obstacles(self, inflation_radius):
-        """Inflate obstacles by inflation_radius using morphological dilation."""
-        radius_pixels = int(inflation_radius / self.resolution)
-        kernel_size = 2 * radius_pixels + 1
-        kernel = np.ones((kernel_size, kernel_size))
-        self.grid = binary_dilation(self.grid_original, kernel).astype(int)
+        path_cells, nodes_expanded, reason = self._jps(start_cell, goal_cell, budget)
+        compute_time = time.monotonic() - t0
 
-    def odom_callback(self, msg):
-        """Update current pose from odometry."""
-        self.current_pose = {
-            'x': msg.pose.pose.position.x,
-            'y': msg.pose.pose.position.y,
-            'theta': self.quaternion_to_yaw(msg.pose.pose.orientation),
-        }
+        if not path_cells:
+            response.success = False
+            response.failure_reason = reason or 'NO_PATH'
+            response.compute_time = compute_time
+            response.nodes_expanded = nodes_expanded
+            response.cached = False
+            response.path = Path()
+            response.path.header.frame_id = grid_msg.header.frame_id or 'map'
+            response.path.header.stamp = self.get_clock().now().to_msg()
+            self.get_logger().warn(
+                f'PlanPath {response.failure_reason} '
+                f'(expanded {nodes_expanded}, {compute_time*1000:.1f} ms)')
+            return response
 
-    def goal_callback(self, msg):
-        """Handle goal pose from RViz 2D Goal Pose tool and start navigation."""
-        goal_x = msg.pose.position.x
-        goal_y = msg.pose.position.y
-        self.get_logger().info(f'Goal received: ({goal_x:.2f}, {goal_y:.2f})')
+        path_world = [
+            self._grid_to_world(gx, gy, resolution, origin)
+            for gx, gy in path_cells
+        ]
+        waypoints = self._simplify_path(path_world, self.max_path_waypoints)
 
-        if self.current_pose is None:
-            self.get_logger().warn('No odometry data yet, cannot navigate')
-            return
+        response.path = self._path_msg(waypoints, grid_msg.header.frame_id or 'map')
+        response.success = True
+        response.failure_reason = ''
+        response.compute_time = compute_time
+        response.nodes_expanded = nodes_expanded
+        response.cached = False
 
-        self._goal_just_reached = False
-        self._active_goal = (goal_x, goal_y)
-        self._planner_state = 'planning'
-
-        start_x = self.current_pose['x']
-        start_y = self.current_pose['y']
-
-        if self.navigate_to_goal(start_x, start_y, goal_x, goal_y):
-            self._planner_state = 'navigating'
-        else:
-            self._planner_state = 'idle'
-            self._active_goal = None
-
-    def navigate_to_goal(self, start_x, start_y, goal_x, goal_y):
-        """Plan path from start to goal and begin navigation.
-
-        Returns:
-            True if a path was found and navigation started, False otherwise.
-
-        Changes:
-            self.path, self.start_time, self.total_distance, self.last_position,
-            self.current_waypoint_idx, self._goal_just_reached
-        """
         self.get_logger().info(
-            f'Planning from ({start_x:.2f}, {start_y:.2f}) to ({goal_x:.2f}, {goal_y:.2f})')
+            f'PlanPath OK: {len(waypoints)} pts, '
+            f'expanded {nodes_expanded}, {compute_time*1000:.1f} ms')
+        return response
 
-        self._goal_just_reached = False
-        self.path = self.plan_path(start_x, start_y, goal_x, goal_y)
+    # ------------------------------------------------------------------
+    # JPS core
+    # ------------------------------------------------------------------
 
-        if self.path:
-            self.current_waypoint_idx = 0
-            self.start_time = self.get_clock().now()
-            self.total_distance = 0.0
-            self.last_position = (start_x, start_y)
-            self.get_logger().info(f'Path found with {len(self.path)} waypoints')
-            self._publish_path()
-            return True
-        else:
-            self.get_logger().error('No path found! Check if start/goal are valid and reachable')
-            return False
-
-    def plan_path(self, start_x, start_y, goal_x, goal_y):
-        """Validate positions, run JPS, and return a simplified world-coordinate path.
-
-        Returns:
-            List of (x, y) tuples in world coordinates, or [] if no path found.
-        """
-        start_grid = self.world_to_grid(start_x, start_y)
-        goal_grid = self.world_to_grid(goal_x, goal_y)
-
-        if not self.is_valid_in_original_grid(start_grid):
-            self.get_logger().error(
-                f'Start position ({start_x:.2f}, {start_y:.2f}) is in an obstacle.')
-            return []
-
-        if not self.is_valid(goal_grid):
-            self.get_logger().error(
-                f'Goal position ({goal_x:.2f}, {goal_y:.2f}) is invalid or too close to obstacles.')
-            return []
-
-        path_grid = self.jps(start_grid, goal_grid)
-        if not path_grid:
-            return []
-
-        path_world = [self.grid_to_world(gx, gy) for gx, gy in path_grid]
-        simplified = self._rdp_simplify(path_world, self.simplification_epsilon)
-        return self._smooth_path(simplified)
-
-    def jps(self, start, goal):
-        """Jump Point Search with hybrid obstacle checking near the start cell."""
+    def _jps(self, start, goal, budget):
         def heuristic(a, b):
-            return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+            return math.hypot(a[0] - b[0], a[1] - b[1])
 
         open_set = []
-        heapq.heappush(open_set, (0, start))
+        heapq.heappush(open_set, (heuristic(start, goal), start))
         came_from = {}
-        g_score = {start: 0}
-        f_score = {start: heuristic(start, goal)}
-        nodes_explored = 0
+        g_score = {start: 0.0}
+        expanded = 0
 
         while open_set:
             _, current = heapq.heappop(open_set)
-            nodes_explored += 1
+            expanded += 1
+
+            if expanded >= budget:
+                return [], expanded, 'TIMEOUT'
+            if time.monotonic() > self._deadline:
+                return [], expanded, 'TIMEOUT'
 
             if current == goal:
-                path = []
+                path = [current]
                 while current in came_from:
-                    path.append(current)
                     current = came_from[current]
-                path.append(start)
-                self.get_logger().info(f'JPS explored {nodes_explored} nodes')
-                return path[::-1]
+                    path.append(current)
+                return path[::-1], expanded, ''
 
-            for successor in self.get_successors(current, start, goal):
+            for successor in self._get_successors(current, goal):
                 dx = successor[0] - current[0]
                 dy = successor[1] - current[1]
-                distance = math.sqrt(dx*dx + dy*dy)
+                distance = math.hypot(dx, dy)
                 tentative_g = g_score[current] + distance
 
                 if successor not in g_score or tentative_g < g_score[successor]:
                     came_from[successor] = current
                     g_score[successor] = tentative_g
-                    f_score[successor] = tentative_g + heuristic(successor, goal)
-                    heapq.heappush(open_set, (f_score[successor], successor))
+                    f = tentative_g + heuristic(successor, goal)
+                    heapq.heappush(open_set, (f, successor))
 
-        self.get_logger().error(f'JPS failed after exploring {nodes_explored} nodes')
-        return []
+        return [], expanded, 'NO_PATH'
 
-    def get_successors(self, node, start, goal):
-        """Return jump point successors in the 8-connected neighborhood."""
+    def _get_successors(self, node, goal):
         successors = []
         for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0),
                        (1, 1), (1, -1), (-1, 1), (-1, -1)]:
-            jump_point = self.jump(node, (dx, dy), start, goal, depth=0)
+            jump_point = self._jump(node, (dx, dy), goal, depth=0)
             if jump_point is not None:
                 successors.append(jump_point)
         return successors
 
-    def jump(self, node, direction, start, goal, depth=0):
-        """Jump recursively in direction until finding a jump point or dead end.
-
-        Depth-limited to prevent RecursionError on large maps.
-        """
-        if depth > NavigatorConstants.MAX_JUMP_DEPTH:
+    def _jump(self, node, direction, goal, depth):
+        """Jump recursively until a jump point is found or the ray leaves the grid."""
+        if depth > self.max_jump_depth:
             return None
 
         dx, dy = direction
-        next_node = (node[0] + dx, node[1] + dy)
+        nxt = (node[0] + dx, node[1] + dy)
 
-        if not self.is_valid_with_hybrid(next_node, start):
+        if not self._is_free(nxt):
             return None
 
-        if next_node == goal:
-            return next_node
+        if nxt == goal:
+            return nxt
 
         if dx != 0 and dy != 0:
-            if (self.is_valid_with_hybrid((next_node[0] - dx, next_node[1]), start) and
-                    not self.is_valid_with_hybrid((next_node[0] - dx, next_node[1] + dy), start)):
-                return next_node
+            # Diagonal: forced neighbours on blocked cardinals
+            if (self._is_free((nxt[0] - dx, nxt[1])) and
+                    not self._is_free((nxt[0] - dx, nxt[1] + dy))):
+                return nxt
+            if (self._is_free((nxt[0], nxt[1] - dy)) and
+                    not self._is_free((nxt[0] + dx, nxt[1] - dy))):
+                return nxt
 
-            if (self.is_valid_with_hybrid((next_node[0], next_node[1] - dy), start) and
-                    not self.is_valid_with_hybrid((next_node[0] + dx, next_node[1] - dy), start)):
-                return next_node
-
-            if self.jump(next_node, (dx, 0), start, goal, depth + 1) is not None:
-                return next_node
-            if self.jump(next_node, (0, dy), start, goal, depth + 1) is not None:
-                return next_node
-
+            if self._jump(nxt, (dx, 0), goal, depth + 1) is not None:
+                return nxt
+            if self._jump(nxt, (0, dy), goal, depth + 1) is not None:
+                return nxt
         else:
             if dx != 0:
-                if (self.is_valid_with_hybrid((next_node[0], next_node[1] + 1), start) and
-                        not self.is_valid_with_hybrid(
-                            (next_node[0] + dx, next_node[1] + 1), start)):
-                    return next_node
-                if (self.is_valid_with_hybrid((next_node[0], next_node[1] - 1), start) and
-                        not self.is_valid_with_hybrid(
-                            (next_node[0] + dx, next_node[1] - 1), start)):
-                    return next_node
+                if (self._is_free((nxt[0], nxt[1] + 1)) and
+                        not self._is_free((nxt[0] + dx, nxt[1] + 1))):
+                    return nxt
+                if (self._is_free((nxt[0], nxt[1] - 1)) and
+                        not self._is_free((nxt[0] + dx, nxt[1] - 1))):
+                    return nxt
             else:
-                if (self.is_valid_with_hybrid((next_node[0] + 1, next_node[1]), start) and
-                        not self.is_valid_with_hybrid(
-                            (next_node[0] + 1, next_node[1] + dy), start)):
-                    return next_node
-                if (self.is_valid_with_hybrid((next_node[0] - 1, next_node[1]), start) and
-                        not self.is_valid_with_hybrid(
-                            (next_node[0] - 1, next_node[1] + dy), start)):
-                    return next_node
+                if (self._is_free((nxt[0] + 1, nxt[1])) and
+                        not self._is_free((nxt[0] + 1, nxt[1] + dy))):
+                    return nxt
+                if (self._is_free((nxt[0] - 1, nxt[1])) and
+                        not self._is_free((nxt[0] - 1, nxt[1] + dy))):
+                    return nxt
 
-        return self.jump(next_node, direction, start, goal, depth + 1)
+        return self._jump(nxt, direction, goal, depth + 1)
 
-    def is_valid_with_hybrid(self, grid_pos, start):
-        """Return True if grid_pos is free, using original grid near the start cell."""
-        gx, gy = grid_pos
-        rows, cols = self.grid.shape
+    def _is_free(self, cell):
+        """True if ``cell`` is in bounds and free.
 
+        Cells within ``tight_space_radius`` of the start are treated as
+        free regardless of inflation so the robot can escape its own halo.
+        """
+        gx, gy = cell
+        rows, cols = self._grid.shape
         if gx < 0 or gx >= cols or gy < 0 or gy >= rows:
             return False
-
-        distance_from_start = abs(gx - start[0]) + abs(gy - start[1])
+        distance_from_start = abs(gx - self._start[0]) + abs(gy - self._start[1])
         if distance_from_start <= self.tight_space_radius:
-            return self.grid_original[gy, gx] == 0
-        return self.grid[gy, gx] == 0
+            return True
+        return self._grid[gy, gx] == 0
 
-    def is_valid(self, grid_pos):
-        """Return True if grid_pos is in-bounds and free in the inflated grid."""
-        gx, gy = grid_pos
-        rows, cols = self.grid.shape
-        if gx < 0 or gx >= cols or gy < 0 or gy >= rows:
-            return False
-        return self.grid[gy, gx] == 0
+    # ------------------------------------------------------------------
+    # Post-processing
+    # ------------------------------------------------------------------
 
-    def is_valid_in_original_grid(self, grid_pos):
-        """Return True if grid_pos is in-bounds and free in the original (uninflated) grid."""
-        gx, gy = grid_pos
-        rows, cols = self.grid_original.shape
-        if gx < 0 or gx >= cols or gy < 0 or gy >= rows:
-            return False
-        return self.grid_original[gy, gx] == 0
-
-    def world_to_grid(self, x, y):
-        """Convert world coordinates in meters to grid cell indices."""
-        grid_x = int((x - self.origin[0]) / self.resolution)
-        grid_y = int((y - self.origin[1]) / self.resolution)
-        return (grid_x, grid_y)
-
-    def grid_to_world(self, grid_x, grid_y):
-        """Convert grid cell indices to world coordinates in meters."""
-        x = grid_x * self.resolution + self.origin[0]
-        y = grid_y * self.resolution + self.origin[1]
-        return (x, y)
-
-    def _rdp_simplify(self, path, epsilon):
-        """Ramer-Douglas-Peucker line simplification."""
+    def _simplify_path(self, path, max_points):
         if len(path) <= 2:
-            return list(path)
+            return path
 
-        start = np.array(path[0])
-        end = np.array(path[-1])
+        rdp_path = self._rdp(path, self.simplification_epsilon)
+        if len(rdp_path) >= 4:
+            smoothed = self._smooth(rdp_path, max_points)
+        else:
+            smoothed = list(rdp_path)
+
+        smoothed[0] = path[0]
+        smoothed[-1] = path[-1]
+        return smoothed
+
+    @staticmethod
+    def _rdp(points, epsilon):
+        if len(points) <= 2:
+            return list(points)
+
+        start = np.array(points[0])
+        end = np.array(points[-1])
         line_vec = end - start
         line_len = np.linalg.norm(line_vec)
 
         if line_len < 1e-10:
-            return [path[0], path[-1]]
+            return [points[0], points[-1]]
 
         line_unit = line_vec / line_len
         max_dist = 0.0
         max_idx = 0
-        for i in range(1, len(path) - 1):
-            pt = np.array(path[i])
+
+        for i in range(1, len(points) - 1):
+            pt = np.array(points[i])
             proj = np.clip(np.dot(pt - start, line_unit), 0, line_len)
             closest = start + proj * line_unit
             dist = np.linalg.norm(pt - closest)
@@ -469,192 +306,94 @@ class JPSNavigator(Node):
                 max_idx = i
 
         if max_dist > epsilon:
-            left = self._rdp_simplify(path[:max_idx + 1], epsilon)
-            right = self._rdp_simplify(path[max_idx:], epsilon)
+            left = JPSPlanner._rdp(points[:max_idx + 1], epsilon)
+            right = JPSPlanner._rdp(points[max_idx:], epsilon)
             return left[:-1] + right
-        return [path[0], path[-1]]
-
-    def _smooth_path(self, path):
-        """Smooth waypoints with cubic spline interpolation, resampled at ~0.1 m."""
-        if len(path) < 3:
-            return path
-
-        xs = [p[0] for p in path]
-        ys = [p[1] for p in path]
-
-        dists = [0.0]
-        for i in range(1, len(xs)):
-            d = math.sqrt((xs[i] - xs[i-1])**2 + (ys[i] - ys[i-1])**2)
-            dists.append(dists[-1] + d)
-
-        total_len = dists[-1]
-        if total_len < 1e-6:
-            return path
-
-        t = np.array(dists)
-        cs_x = CubicSpline(t, xs)
-        cs_y = CubicSpline(t, ys)
-
-        n_samples = max(int(total_len / 0.1), len(path))
-        t_new = np.linspace(0, total_len, n_samples)
-        return list(zip(cs_x(t_new).tolist(), cs_y(t_new).tolist()))
-
-    def _publish_path(self):
-        """Publish the planned path as a nav_msgs/Path."""
-        path_msg = Path()
-        path_msg.header.stamp = self.get_clock().now().to_msg()
-        path_msg.header.frame_id = 'map'
-
-        for x, y in self.path:
-            pose = PoseStamped()
-            pose.header = path_msg.header
-            pose.pose.position.x = float(x)
-            pose.pose.position.y = float(y)
-            pose.pose.orientation.w = 1.0
-            path_msg.poses.append(pose)
-
-        self.plan_pub.publish(path_msg)
-
-    def _republish_path(self):
-        """Republish current path at 1 Hz for late-joining subscribers."""
-        if self.path:
-            self._publish_path()
-
-    def _handle_cancel(self, request, response):
-        """CancelNav service handler -- stop planning and driving."""
-        self.get_logger().info('Cancel requested via service')
-        self._active_goal = None
-        self.path = []
-        self.current_waypoint_idx = 0
-        self._planner_state = 'idle'
-
-        empty_path = Path()
-        empty_path.header.stamp = self.get_clock().now().to_msg()
-        empty_path.header.frame_id = 'map'
-        self.plan_pub.publish(empty_path)
-
-        if self.standalone:
-            self.stop_robot()
-
-        response.confirmed = True
-        return response
-
-    def _publish_nav_status(self):
-        """Publish NavStatus at 2 Hz for the navigation server to consume."""
-        msg = NavStatus()
-        msg.nav_state = self._planner_state
-        msg.has_active_goal = self._active_goal is not None
-        msg.distance_traveled = self.total_distance
-
-        if self.start_time is not None:
-            msg.elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
-        else:
-            msg.elapsed_time = 0.0
-
-        if self.current_pose is not None:
-            msg.current_x = self.current_pose['x']
-            msg.current_y = self.current_pose['y']
-            if self._active_goal is not None:
-                dx = self._active_goal[0] - self.current_pose['x']
-                dy = self._active_goal[1] - self.current_pose['y']
-                msg.distance_to_goal = math.sqrt(dx**2 + dy**2)
-            else:
-                msg.distance_to_goal = -1.0
-        else:
-            msg.current_x = 0.0
-            msg.current_y = 0.0
-            msg.distance_to_goal = -1.0
-
-        msg.goal_reached = self._goal_just_reached
-        self.nav_status_pub.publish(msg)
-
-    def control_loop(self):
-        """Waypoint-following control loop, called at 10 Hz."""
-        if not self.path or self.current_pose is None:
-            return
-
-        if self.last_position is not None:
-            current_x = self.current_pose['x']
-            current_y = self.current_pose['y']
-            dx = current_x - self.last_position[0]
-            dy = current_y - self.last_position[1]
-            self.total_distance += math.sqrt(dx**2 + dy**2)
-            self.last_position = (current_x, current_y)
-
-        if self.current_waypoint_idx >= len(self.path):
-            if self.standalone:
-                self.stop_robot()
-            if self.start_time is not None:
-                elapsed = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
-                self.get_logger().info(
-                    f'Goal reached | dist={self.total_distance:.2f}m time={elapsed:.2f}s')
-            else:
-                self.get_logger().info('Goal reached')
-            self._planner_state = 'idle'
-            self._goal_just_reached = True
-            self.path = []
-            return
-
-        if self.standalone:
-            self._follow_waypoint()
-
-    def _follow_waypoint(self):
-        """Drive toward the current waypoint with proportional control."""
-        target = self.path[self.current_waypoint_idx]
-        tx, ty = target
-
-        dx = tx - self.current_pose['x']
-        dy = ty - self.current_pose['y']
-        distance = math.sqrt(dx**2 + dy**2)
-        target_angle = math.atan2(dy, dx)
-        angle_diff = normalize_angle(target_angle - self.current_pose['theta'])
-
-        cmd = TwistStamped()
-        cmd.header.stamp = self.get_clock().now().to_msg()
-        cmd.header.frame_id = 'base_link'
-
-        if distance < self.position_tolerance:
-            self.current_waypoint_idx += 1
-            return
-
-        if abs(angle_diff) > self.angle_tolerance:
-            cmd.twist.angular.z = self.angular_speed if angle_diff > 0 else -self.angular_speed
-        else:
-            cmd.twist.linear.x = min(self.linear_speed, distance)
-            cmd.twist.angular.z = 0.3 * angle_diff
-
-        self.cmd_vel_pub.publish(cmd)
-
-    def stop_robot(self):
-        """Stop the robot by publishing zero velocities."""
-        cmd = TwistStamped()
-        cmd.header.stamp = self.get_clock().now().to_msg()
-        cmd.header.frame_id = 'base_link'
-        self.cmd_vel_pub.publish(cmd)
+        return [points[0], points[-1]]
 
     @staticmethod
-    def quaternion_to_yaw(q):
-        """Extract yaw angle from a quaternion."""
-        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        return math.atan2(siny_cosp, cosy_cosp)
+    def _smooth(waypoints, max_points):
+        pts = np.array(waypoints)
+        diffs = np.diff(pts, axis=0)
+        chord_lengths = np.sqrt(np.sum(diffs ** 2, axis=1))
+        t = np.concatenate([[0], np.cumsum(chord_lengths)])
+        total_length = t[-1]
 
+        if total_length < 1e-10:
+            return list(waypoints)
 
-def normalize_angle(angle):
-    """Normalize angle to [-pi, pi] range."""
-    return (angle + math.pi) % (2 * math.pi) - math.pi
+        cs_x = CubicSpline(t, pts[:, 0])
+        cs_y = CubicSpline(t, pts[:, 1])
+
+        n_out = min(max_points, max(len(waypoints), 10))
+        t_new = np.linspace(0, total_length, n_out)
+        return list(zip(cs_x(t_new).tolist(), cs_y(t_new).tolist()))
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _grid_from_msg(grid_msg):
+        width = grid_msg.info.width
+        height = grid_msg.info.height
+        data = np.array(grid_msg.data, dtype=np.int16).reshape((height, width))
+        grid = np.zeros_like(data, dtype=np.uint8)
+        grid[(data >= 50) | (data < 0)] = 1
+        return grid
+
+    @staticmethod
+    def _world_to_grid(x, y, resolution, origin):
+        return (int((x - origin[0]) / resolution),
+                int((y - origin[1]) / resolution))
+
+    @staticmethod
+    def _grid_to_world(gx, gy, resolution, origin):
+        return ((gx + 0.5) * resolution + origin[0],
+                (gy + 0.5) * resolution + origin[1])
+
+    def _path_msg(self, waypoints, frame_id):
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = frame_id
+
+        yaw = 0.0
+        for i, (wx, wy) in enumerate(waypoints):
+            pose = PoseStamped()
+            pose.header = path_msg.header
+            pose.pose.position.x = float(wx)
+            pose.pose.position.y = float(wy)
+            pose.pose.position.z = 0.0
+            if i + 1 < len(waypoints):
+                nx, ny = waypoints[i + 1]
+                yaw = math.atan2(ny - wy, nx - wx)
+            pose.pose.orientation.z = math.sin(yaw / 2.0)
+            pose.pose.orientation.w = math.cos(yaw / 2.0)
+            path_msg.poses.append(pose)
+        return path_msg
+
+    def _fail(self, response, reason, t_start, log_msg):
+        response.success = False
+        response.failure_reason = reason
+        response.compute_time = time.monotonic() - t_start
+        response.nodes_expanded = 0
+        response.cached = False
+        response.path = Path()
+        response.path.header.frame_id = 'map'
+        response.path.header.stamp = self.get_clock().now().to_msg()
+        self.get_logger().warn(f'PlanPath {reason}: {log_msg}')
+        return response
 
 
 def main(args=None):
     rclpy.init(args=args)
-    navigator = JPSNavigator()
+    node = JPSPlanner()
     try:
-        rclpy.spin(navigator)
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        navigator.stop_robot()
-        navigator.destroy_node()
+        node.destroy_node()
         rclpy.shutdown()
 
 
