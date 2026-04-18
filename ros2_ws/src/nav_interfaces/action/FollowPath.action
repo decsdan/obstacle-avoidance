@@ -1,0 +1,16 @@
+# Goal
+nav_msgs/Path reference_path            # May be empty for end-to-end policies
+string mode                             # "stacked" | "standalone"
+---
+# Result
+string terminal_outcome                 # "reached" | "path_blocked" | "cancelled" | "failed"
+float64 total_distance                  # Meters traveled during this action
+float64 total_time                      # Seconds elapsed
+---
+# Feedback
+geometry_msgs/Pose current_pose         # Map frame
+geometry_msgs/Twist current_velocity    # Body frame
+float64 distance_to_goal                # Meters to path endpoint
+float64 cross_track_error               # Meters from nearest path point; 0 for path-free planners
+string local_state                      # "running" | "path_blocked" | "stuck"
+int32 waypoint_index                    # Current tracking index; -1 when no path

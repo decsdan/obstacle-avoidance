@@ -1,0 +1,6 @@
+# Request (empty)
+---
+# Response
+nav_msgs/OccupancyGrid raw              # Log-odds clipped to int8
+nav_msgs/OccupancyGrid inflated         # Distance-transformed costmap
+builtin_interfaces/Time stamp           # Snapshot time in the clock domain of the caller
