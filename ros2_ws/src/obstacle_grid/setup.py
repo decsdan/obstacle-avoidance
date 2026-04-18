@@ -6,7 +6,7 @@ package_name = 'obstacle_grid'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='2.0.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -16,9 +16,9 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='devin',
-    maintainer_email='devin@todo.todo',
-    description='Shared LIDAR-based obstacle grid with raycasting and temporal decay',
+    maintainer='daniel',
+    maintainer_email='scheiderd@carleton.edu',
+    description='Shared LIDAR obstacle grid. Publishes raw and inflated OccupancyGrids and serves matched pairs through GetGridSnapshot for planners.',
     license='',
     extras_require={
         'test': ['pytest'],

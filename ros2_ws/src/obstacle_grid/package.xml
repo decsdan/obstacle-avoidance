@@ -2,14 +2,15 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>obstacle_grid</name>
-  <version>0.0.0</version>
-  <description>Shared LIDAR-based obstacle grid with raycasting and temporal decay for real-time obstacle detection and clearing</description>
-  <maintainer email="devin@todo.todo">devin</maintainer>
+  <version>2.0.0</version>
+  <description>Shared LIDAR obstacle grid. Publishes raw and inflated OccupancyGrids and serves matched pairs through GetGridSnapshot for planners.</description>
+  <maintainer email="scheiderd@carleton.edu">daniel</maintainer>
   <license></license>
 
+  <depend>nav_interfaces</depend>
+  <depend>nav_msgs</depend>
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
-  <depend>nav_msgs</depend>
   <depend>tf2_ros</depend>
 
   <exec_depend>python3-numpy</exec_depend>

@@ -2,7 +2,10 @@
 """Shared LIDAR obstacle grid node.
 
 Converts LaserScan data to a map-frame OccupancyGrid using Bresenham
-raycasting with temporal decay and EDT inflation.
+raycasting with temporal decay and EDT inflation. The latest raw and
+inflated grids are both published on topics for visualization and DWA,
+and also served through the ``GetGridSnapshot`` service so the
+navigation server can pull a consistent pair at plan time.
 """
 
 import math
@@ -19,6 +22,7 @@ from rclpy.qos import (
     ReliabilityPolicy,
     qos_profile_sensor_data,
 )
+from nav_interfaces.srv import GetGridSnapshot
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from tf2_ros import Buffer, TransformListener
@@ -116,6 +120,22 @@ class ObstacleGridNode(Node):
             OccupancyGrid,
             f'{self.ns}/obstacle_grid',
             10,
+        )
+        self.raw_grid_pub = self.create_publisher(
+            OccupancyGrid,
+            f'{self.ns}/obstacle_grid_raw',
+            10,
+        )
+
+        # Cached latest snapshot for the service. Populated by the update
+        # loop once the grid is initialized and a scan has been ingested.
+        self._latest_raw_msg = None
+        self._latest_inflated_msg = None
+
+        self.snapshot_srv = self.create_service(
+            GetGridSnapshot,
+            f'{self.ns}/get_grid_snapshot',
+            self._handle_get_snapshot,
         )
 
         self.update_timer = self.create_timer(1.0 / self.publish_rate, self._update_cycle)
@@ -219,12 +239,21 @@ class ObstacleGridNode(Node):
         )
 
         inflated = inflate_grid(self.grid, self.inflation_cells)
-        self._publish_grid(inflated)
 
-    def _publish_grid(self, grid_data: np.ndarray):
-        """Publish the inflated grid as OccupancyGrid."""
+        stamp = self.get_clock().now().to_msg()
+        raw_msg = self._build_grid_msg(self.grid, stamp)
+        inflated_msg = self._build_grid_msg(inflated, stamp)
+
+        self._latest_raw_msg = raw_msg
+        self._latest_inflated_msg = inflated_msg
+
+        self.raw_grid_pub.publish(raw_msg)
+        self.grid_pub.publish(inflated_msg)
+
+    def _build_grid_msg(self, grid_data: np.ndarray, stamp) -> OccupancyGrid:
+        """Package a grid array as an ``OccupancyGrid`` in the map frame."""
         msg = OccupancyGrid()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.stamp = stamp
         msg.header.frame_id = 'map'
 
         msg.info.resolution = self.resolution
@@ -235,7 +264,27 @@ class ObstacleGridNode(Node):
         msg.info.origin.position.z = 0.0
 
         msg.data = grid_data.flatten().tolist()
-        self.grid_pub.publish(msg)
+        return msg
+
+    def _handle_get_snapshot(self, _request, response):
+        """Return the latest raw/inflated pair, or empty grids if none yet."""
+        if self._latest_raw_msg is None or self._latest_inflated_msg is None:
+            stamp = self.get_clock().now().to_msg()
+            response.raw = OccupancyGrid()
+            response.raw.header.stamp = stamp
+            response.raw.header.frame_id = 'map'
+            response.inflated = OccupancyGrid()
+            response.inflated.header.stamp = stamp
+            response.inflated.header.frame_id = 'map'
+            response.stamp = stamp
+            self.get_logger().warn(
+                'GetGridSnapshot called before first scan, returning empty grids')
+            return response
+
+        response.raw = self._latest_raw_msg
+        response.inflated = self._latest_inflated_msg
+        response.stamp = self._latest_inflated_msg.header.stamp
+        return response
 
 
 def main(args=None):
