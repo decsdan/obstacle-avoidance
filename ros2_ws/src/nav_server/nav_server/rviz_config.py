@@ -222,23 +222,11 @@ def _dwa_displays(ns):
     ]
 
 
-def _astar_displays(ns):
-    return [
-        _path(ns, 'a_star/plan', 'A* Global Path', '25; 255; 0'),
-    ]
-
-
-def _dstar_displays(ns):
-    return [
-        _path(ns, 'd_star/plan', 'D* Path', '255; 165; 0'),
-        _occupancy_grid(ns, 'dynamic_grid', 'D* Dynamic Grid'),
-    ]
-
-
-def _jps_displays(ns):
-    return [
-        _path(ns, 'jps/plan', 'JPS Path', '0; 200; 255'),
-    ]
+_PLANNER_COLORS = {
+    'a_star': '25; 255; 0',
+    'd_star': '255; 165; 0',
+    'jps': '0; 200; 255',
+}
 
 
 def generate_rviz_config(ns, global_planner, local_planner):
@@ -251,13 +239,14 @@ def generate_rviz_config(ns, global_planner, local_planner):
         _map(ns),
     ]
 
-    planner_map = {
-        'a_star': _astar_displays,
-        'd_star': _dstar_displays,
-        'jps': _jps_displays,
-    }
-    if global_planner in planner_map:
-        displays.extend(planner_map[global_planner](ns))
+    # Single active-path display, driven by nav_server. Path color tracks
+    # the selected global planner so the RViz look matches the old per-
+    # planner topics without subscribing to things that no longer exist.
+    if global_planner in _PLANNER_COLORS:
+        displays.append(_path(
+            ns, 'nav_server/active_path',
+            f'Active Path ({global_planner})',
+            _PLANNER_COLORS[global_planner]))
 
     if local_planner == 'dwa' or global_planner == 'd_star':
         displays.append(

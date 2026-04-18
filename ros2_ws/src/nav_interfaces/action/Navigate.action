@@ -1,13 +1,13 @@
 # Goal
 geometry_msgs/PoseStamped goal
-string global_planner                   # "a_star" | "d_star" | "jps" | "rrt_star" | "fm2"
-string local_planner                    # "dwa" | "mppi" | "rl_policy"
+string global_planner                   # "a_star" | "d_star" | "jps"
+string local_planner                    # "dwa"
 float64 global_budget                   # PlanPath budget; 0 = planner default
 string scenario_id                      # Optional; correlates the run with a scenario record
 ---
 # Result
 bool success
-string terminal_outcome                 # "reached" | "collision" | "timeout" | "stuck" | "cancelled" | "failed"
+string terminal_outcome                 # "reached" | "path_blocked" | "timeout" | "cancelled" | "failed"
 float64 total_distance
 float64 total_time
 uint32 replan_count

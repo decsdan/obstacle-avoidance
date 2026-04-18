@@ -1,8 +1,8 @@
 # Obstacle Avoidance
 
-ROS 2 workspace for TurtleBot 4 obstacle avoidance. One launch file runs any combination of
-global planner (A\*, D\* Lite, JPS) and local planner (DWA) on top of a shared LIDAR
-occupancy grid, with RViz.
+ROS 2 workspace for TurtleBot 4 obstacle avoidance. One launch file brings up a global
+planner (A\*, D\* Lite, JPS), a local planner (DWA), a shared LIDAR obstacle grid, and
+the navigation action server that ties them together, with RViz.
 
 Works on Humble and Jazzy. Check yours with `echo $ROS_DISTRO`.
 
@@ -15,7 +15,7 @@ Authors and project history: [AUTHORS.md](AUTHORS.md).
 1. [Prerequisites](#prerequisites)
 2. [Quick Start](#quick-start)
 3. [Launch Options](#launch-options)
-4. [Structure](#structure)
+4. [Architecture](#architecture)
 5. [Sending Goals](#sending-goals)
 6. [Package Reference and Parameters](#package-reference-and-parameters)
 7. [Troubleshooting](#troubleshooting)
@@ -112,7 +112,7 @@ In RViz, click 2D Pose Estimate to refine the pose, then 2D Goal Pose to navigat
 ## Launch Options
 
 ```bash
-# A* + DWA stacked
+# A* + DWA (default)
 ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml
 
 # D* Lite + DWA
@@ -121,18 +121,7 @@ ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml globa
 # JPS + DWA
 ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml global_planner:=jps
 
-# A* standalone (A* drives)
-ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml local_planner:=none
-
-# D* standalone
-ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml \
-    global_planner:=d_star local_planner:=none
-
-# JPS standalone
-ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml \
-    global_planner:=jps local_planner:=none
-
-# DWA alone (no map, reactive only)
+# DWA alone (no global plan, reactive only)
 ros2 launch nav_server navigation_launch.py global_planner:=none local_planner:=dwa
 
 # Different namespace
@@ -141,7 +130,7 @@ ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml names
 # No RViz
 ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml rviz:=false
 
-# No action server
+# No action server (launch just the planners/grid)
 ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml server:=false
 ```
 
@@ -154,70 +143,76 @@ ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/my_map.yaml serve
 | `global_planner` | `a_star` | `a_star`, `d_star`, `jps`, or `none` |
 | `local_planner` | `dwa` | `dwa` or `none` |
 | `rviz` | `true` | Launch RViz |
-| `server` | `true` | Launch the action server |
-| `params_file` | `stacked_params.yaml` | Shared parameter YAML |
+| `server` | `true` | Launch the navigation action server |
+
+Each planner ships its own params YAML in its package's `config/` directory; the launch
+file loads the one that matches the selected planner.
 
 ---
 
-## Structure
+## Architecture
+
+The stack is a strict call/response orchestrator. `nav_server` owns the `Navigate`
+action and drives three contracts:
 
 ```
-                     map_yaml ──────────────┐
-                                            ▼
-/{ns}/goal_pose  ─►  Global planner  ──►  /{ns}/{planner}/plan
-(RViz or CLI)        (A*, D*, JPS)                │
-                          ▲                       ▼
-                          │                   Local planner        ─►  /{ns}/cmd_vel
-                          │                   (DWA)
-                          │                       │
-                  /{ns}/obstacle_grid             │
-                          ▲                       │
-                          │                       │
-                      obstacle_grid  ◄── /{ns}/scan (LIDAR)
-                          ▲
-                          │
-                      /{ns}/map  (one-shot: dimensions + static walls)
+                     Navigate goal (RViz / CLI)
+                              │
+                              ▼
+                         nav_server
+                   ┌──────────┼─────────────┐
+                   │          │             │
+                   ▼          ▼             ▼
+        GetGridSnapshot   PlanPath     FollowPath (action)
+         (obstacle_grid)  (a_star |     (dwa)
+                           d_star |        │
+                           jps)            ▼
+                                      /{ns}/cmd_vel
 ```
 
-`nav_server` subscribes to each planner's status topic and prints progress.
+No planner drives the robot directly. No planner runs its own replan timer. The action
+server makes all scheduling decisions: when to request a new path, when to cancel the
+current follow, when to abort on a safety latch.
 
-### Replanning
+### Contracts
 
-`obstacle_grid` rebuilds from every LIDAR scan, layered on top of the static map. Global
-planners poll it so the path stays current:
+- **`GetGridSnapshot` service** (`{ns}/get_grid_snapshot`): returns a matched `(raw,
+  inflated, stamp)` triple so planners see a consistent grid without racing topic
+  subscriptions.
+- **`PlanPath` service** (`{ns}/{planner}/plan_path`): takes a grid snapshot plus
+  start/goal, returns a path plus diagnostics (`nodes_expanded`, `cached`,
+  `failure_reason`).
+- **`FollowPath` action** (`{ns}/{local}/follow_path`): takes a reference path,
+  streams feedback (pose, velocity, distance_to_goal, cross_track_error, local_state),
+  terminates with `reached` | `path_blocked` | `cancelled` | `failed`.
+- **`Navigate` action** (`{ns}/navigate`): the top-level contract. Goal is a
+  `PoseStamped` plus `global_planner`, `local_planner`, `global_budget`, `scenario_id`.
 
-| Planner | Replan |
+### Replan triggers
+
+`nav_server` decides when to replan; planners themselves never loop.
+
+| Trigger | Source |
 |---------|--------|
-| A\* | Timer, every `replan_interval` seconds (default 5 s) |
-| D\* Lite | Incremental, on obstacle grid change |
-| JPS | One-shot per goal |
+| `path_blocked` from DWA | FollowPath result |
+| Pose deviates > `replan_deviation_threshold` from active path | Analyze-phase check |
+| Periodic replan | `replan_period_sec` > 0 (off by default for determinism) |
 
-DWA runs a 10 Hz dynamic-window search against the latest grid regardless.
-
-### Stacked mode
-
-When both `global_planner` and `local_planner` are set, the launch file passes
-`stacked:=true` to both:
-
-- The global planner publishes `nav_msgs/Path` on `/{ns}/{planner}/plan` and does not
-  drive.
-- DWA follows the path and drives `cmd_vel`, running its own state machine
-  (`IDLE → NAVIGATING → EMERGENCY_STOPPED → RECOVERING`).
-
-If only one is set, it runs standalone and drives directly.
+D\* Lite keeps its search state alive across calls — when `nav_server` calls it again
+with the same goal, the planner reuses the previous computation and only touches
+vertices where the grid changed. A\* and JPS run fresh each call.
 
 ### RViz config
 
 Generated at launch time to match the selected planners:
 
-- Always: Grid, RobotModel, TF, LaserScan (`/{ns}/scan`), Map (`/{ns}/map`), 2D Goal Pose
-  (`/{ns}/goal_pose`), 2D Pose Estimate (`/{ns}/initialpose`)
-- A\*: `/{ns}/a_star/plan` (green)
-- D\*: `/{ns}/d_star/plan` (orange), `/{ns}/dynamic_grid` overlay
-- JPS: `/{ns}/jps/plan` (blue)
-- DWA: `/{ns}/debug_obstacles`, `/{ns}/dwa/trajectories`, `/{ns}/dwa/best_trajectory`
+- Always: Grid, RobotModel, TF, LaserScan (`{ns}/scan`), Map (`{ns}/map`), 2D Goal
+  Pose (`{ns}/goal_pose`), 2D Pose Estimate (`{ns}/initialpose`)
+- Any global planner: Active Path (`{ns}/nav_server/active_path`), colored per planner
+- DWA: LIDAR Obstacle Grid (`{ns}/obstacle_grid`) and DWA marker topics
+- D\*: adds the obstacle grid display even without DWA
 
-TF is remapped `/tf` → `/{ns}/tf` automatically.
+TF is remapped `/tf` → `{ns}/tf` automatically.
 
 ---
 
@@ -229,140 +224,151 @@ TF is remapped `/tf` → `/{ns}/tf` automatically.
 2. 2D Goal Pose on the target.
 3. The launch terminal prints progress:
    ```
-   [INFO] RViz goal received: (1.50, 2.00, 0.79)
-   [INFO]   [NAVIGATING          ] to_goal: 1.23m  traveled: 0.45m  time: 3.2s  pos: (0.72, 0.88)
-   [INFO]
-   [INFO]   == REACHED ==
-   [INFO]   Distance traveled: 1.87 m
-   [INFO]   Total time:        12.34 s
-   [INFO]   Average speed:     0.152 m/s
+   [INFO] RViz goal → (1.50, 2.00)
+   [INFO] [execute] scenario=rviz global=a_star local=dwa goal=(1.50, 2.00)
+   [INFO] [plan] path received: 18 poses in 0.042s (nodes_expanded=312, cached=False)
+   [INFO] [execute] FollowPath terminal=reached distance=1.87 time=12.34
+   [INFO] [result] outcome=reached distance=1.87 time=12.34 replans=0
    ```
-4. A new goal at any time cancels the current one.
-5. Default timeout is 5 min.
+4. A new 2D Goal Pose at any time cancels the current goal.
+5. Default timeout is 5 min (`navigation_timeout`).
 
 ### CLI
 
 ```bash
 ros2 run nav_server navigate -- --goal 1.5 2.0
-ros2 run nav_server navigate -- --goal 1.5 2.0 0.79   # heading in rad
-ros2 run nav_server navigate -- --cancel
+ros2 run nav_server navigate -- --goal 1.5 2.0 0.79        # heading in rad
+ros2 run nav_server navigate -- --goal 1.5 2.0 --global-planner d_star
+ros2 run nav_server navigate -- --goal 1.5 2.0 --scenario-id test_01
 ```
+
+Ctrl+C cancels the active goal.
 
 ### `Navigate` action
 
-Served at `/{ns}/navigate`. No Nav2 dependency:
+Served at `{ns}/navigate`. The full schema lives in
+[`nav_interfaces/action/Navigate.action`](ros2_ws/src/nav_interfaces/action/Navigate.action):
 
 ```
 # Goal
-string global_planner       # a_star, d_star, jps
-string local_planner        # dwa, none
-float64 goal_x
-float64 goal_y
-float64 goal_theta
+geometry_msgs/PoseStamped goal
+string global_planner        # "a_star" | "d_star" | "jps"
+string local_planner         # "dwa"
+float64 global_budget        # PlanPath budget; 0 = planner default
+string scenario_id           # Optional; correlates the run with a scenario record
 ---
 # Result
 bool success
+string terminal_outcome      # "reached" | "path_blocked" | "timeout" | "cancelled" | "failed"
 float64 total_distance
 float64 total_time
-string final_state          # reached, cancelled, timeout, failed
+uint32 replan_count
 ---
-# Feedback
+# Feedback (published at feedback_hz)
 float64 distance_to_goal
 float64 distance_traveled
 float64 elapsed_time
-string nav_state            # planning, navigating, emergency_stopped, recovering
-float64 current_x
-float64 current_y
+string nav_state             # "planning" | "following" | "replanning" | "recovering"
+geometry_msgs/Pose current_pose
+geometry_msgs/Twist current_velocity
 ```
 
-Preemption is a `CancelNav` service call on each planner.
+Cancellation is standard ROS 2 action cancellation; nav_server propagates it to the
+active FollowPath goal.
 
 ---
 
 ## Package Reference and Parameters
 
-Override any param with `-p name:=value` on `ros2 run`, or via `params_file:=` on the
-launch file.
+Each planner ships its own YAML in `config/`. Override any param with `-p name:=value`
+on `ros2 run`, or pass a replacement file with `--ros-args --params-file`.
 
 ### `nav_server`
 
-Launch file, action server, CLI, RViz config generator.
+Action server, CLI, RViz config generator, launch file.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `namespace` | `/don` | Robot namespace |
-| `global_planner` | `a_star` | Which planner to monitor/cancel (set by launch) |
-| `local_planner` | `dwa` | Which local planner to monitor/cancel (set by launch) |
-| `navigation_timeout` | `300.0` | Max nav time in seconds; 0 disables |
+| `map_frame` | `map` | TF frame for the map |
+| `base_frame` | `base_link` | TF frame for the robot |
+| `default_global_planner` | `a_star` | Fallback when Navigate goal leaves it blank |
+| `default_local_planner` | `dwa` | Fallback when Navigate goal leaves it blank |
+| `navigation_timeout` | `300.0` | Max Navigate duration (s); 0 disables |
+| `plan_timeout` | `5.0` | PlanPath `wait_for_service` timeout (s) |
+| `feedback_hz` | `10.0` | Navigate feedback rate |
+| `replan_on_path_blocked` | `true` | Replan when DWA reports path_blocked |
+| `replan_deviation_threshold` | `0.5` | Meters from nearest path point before replan |
+| `replan_period_sec` | `0.0` | Periodic replan interval (s); 0 = off |
+
+Config file: `nav_server/config/nav_server_params.yaml`.
 
 ### `a_star`
 
-Periodic replanning with RDP simplification and cubic-spline smoothing.
+A\* with RDP simplification and cubic-spline smoothing. Service-only.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `namespace` | `/don` | Robot namespace |
-| `stacked` | `false` | Planner-only mode |
-| `robot_radius` | `0.25` | Robot radius (m) |
-| `safety_clearance` | `0.05` | Extra inflation margin (m) |
-| `linear_speed` | `0.2` | Standalone forward speed (m/s) |
-| `angular_speed` | `0.5` | Standalone rotation speed (rad/s) |
-| `position_tolerance` | `0.1` | Waypoint reached threshold (m) |
-| `angle_tolerance` | `0.1` | Angular alignment threshold (rad) |
-| `max_path_waypoints` | `20` | Max waypoints after simplification (50 in stacked) |
-| `tight_space_radius` | `5` | Cells near start that skip inflation |
-| `max_search_nodes` | `100000` | A\* search cap |
+| `max_search_nodes` | `100000` | A\* expansion cap |
 | `simplification_epsilon` | `0.1` | RDP tolerance (m) |
-| `replan_interval` | `5.0` | Replan period (s); 0 disables |
+| `max_path_waypoints` | `50` | Max waypoints after simplification |
+| `tight_space_radius` | `5` | Cells near start that skip inflation |
+
+Serves `{ns}/a_star/plan_path`. Config: `a_star/config/a_star_params.yaml`.
 
 ### `d_star`
 
-D\* Lite. Replans incrementally when the obstacle grid changes.
+D\* Lite with persistent search state. On repeat calls with the same goal and grid
+frame, only vertices near changed cells get re-touched; the response's `cached` flag
+reports reuse.
 
-```bash
-ros2 run d_star d_star_nav --ros-args -p namespace:=/don
-ros2 run d_star live_visualizer --ros-args -p namespace:=/don   # planned vs traveled
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `namespace` | `/don` | Robot namespace |
+| `max_waypoints` | `50` | Max waypoints in returned path |
+| `tight_space_radius` | `5` | Cells near start that skip inflation |
+| `max_iterations` | `10000000` | compute_shortest_path expansion cap |
 
-Publishes `/{ns}/d_star/plan` and `/{ns}/dynamic_grid`. Params: `namespace`, `stacked`,
-`robot_radius`, `safety_clearance`.
+Serves `{ns}/d_star/plan_path`. Config: `d_star/config/d_star_params.yaml`.
 
 ### `jps`
 
-Jump Point Search. One-shot per goal, fastest on large uniform grids.
+Jump Point Search. One-shot per call, fastest on large uniform grids.
 
-```bash
-ros2 run jps jps_nav --ros-args -p namespace:=/don
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `namespace` | `/don` | Robot namespace |
+| `max_path_waypoints` | `50` | Max waypoints after simplification |
+| `tight_space_radius` | `5` | Cells near start that skip inflation |
+| `simplification_epsilon` | `0.1` | RDP tolerance (m) |
+| `max_jump_depth` | `500` | Per-direction jump recursion cap |
+| `max_search_nodes` | `100000` | Open-list expansion cap |
 
-Publishes `/{ns}/jps/plan`. Params: `namespace`, `stacked`, `robot_radius`,
-`safety_clearance`.
+Serves `{ns}/jps/plan_path`. Config: `jps/config/jps_params.yaml`.
 
 ### `dwa_package`
 
-Dynamic Window Approach. Needs `obstacle_grid`, which the launch file starts for you when
-DWA is selected.
+Dynamic Window Approach as a FollowPath action server. Needs `obstacle_grid`, which
+the launch file starts for you when DWA is selected.
 
-**Cost weights** (7 terms, normalized 0–1):
+**Cost weights** (normalized 0–1):
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `weights.goal` | 0.35 | Progress toward goal |
-| `weights.heading` | 0.05 | Pointing at goal (skipped in stacked) |
 | `weights.velocity` | 0.10 | Prefer higher speed |
 | `weights.smoothness` | 0.05 | Prefer lower angular velocity |
 | `weights.obstacle` | 0.40 | Distance from obstacles |
-| `weights.dist_path` | 0.10 | Stay near global path (stacked only) |
-| `weights.heading_path` | 0.05 | Align with path tangent (stacked only; blends to 0.25 near goal) |
+| `weights.dist_path` | 0.10 | Stay near reference path |
+| `weights.heading_path` | 0.05 | Align with path tangent |
 
 **Velocity and sampling:**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `max_velocity` | 0.4 | Forward cap (m/s) |
-| `min_velocity` | 0.0 | Forward min (m/s) |
 | `max_angular_velocity` | 1.8 | Rotation cap (rad/s) |
-| `min_angular_velocity` | -1.8 | Rotation min (rad/s) |
 | `max_linear_acceleration` | 0.5 | Linear accel (m/s²) |
 | `max_angular_acceleration` | 2.0 | Angular accel (rad/s²) |
 | `v_samples` | 20 | Linear samples |
@@ -373,7 +379,7 @@ DWA is selected.
 | `grid_size` | 161 | Local window side (cells) |
 | `grid_resolution` | 10.0 | Local window (cells/m) |
 
-**Safety and recovery:**
+**Safety and follow semantics:**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -381,39 +387,42 @@ DWA is selected.
 | `emergency_stop_distance` | 0.17 | Immediate stop on LIDAR point (m) |
 | `max_lidar_range` | 8.0 | Ignore returns past this (m) |
 | `goal_tolerance` | 0.2 | Goal-reached threshold (m) |
-| `lookahead` | 0.85 | Stacked-mode carrot distance (m) |
+| `lookahead` | 0.85 | Carrot distance along reference path (m) |
 | `max_path_deviation` | 1.0 | Path distance that scores 0 for `dist_path` (m) |
-| `recovery.angular_velocity` | 0.5 | Rotate-in-place speed (rad/s) |
-| `recovery.backup_velocity` | -0.05 | Reverse speed (m/s) |
-| `recovery.rotate_timeout` | 3.0 | Rotate time before backup (s) |
-| `recovery.total_timeout` | 10.0 | Max recovery before abort (s) |
+| `blocked_ticks_to_abort` | 10 | Consecutive rejected-trajectory ticks → path_blocked |
+| `stuck_timeout` | 8.0 | E-stop hold time before giving up (s) |
+
+Serves `{ns}/dwa/follow_path`. Config: `dwa_package/config/dwa_params.yaml`.
 
 ### `obstacle_grid`
 
 Shared LIDAR occupancy grid in the map frame. Bresenham raycasting clears cells the
-moment a ray passes through; cells that haven't been reconfirmed in `obstacle_decay_seconds`
-fall back to free. Needs AMCL (for `map ← odom` TF).
+moment a ray passes through; cells that haven't been reconfirmed in
+`obstacle_decay_seconds` fall back to free. Needs AMCL (for `map ← odom` TF).
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `namespace` | `/don` | Robot namespace |
 | `obstacle_decay_seconds` | 20.0 | Fallback decay (s) |
 | `robot_radius` | 0.22 | Inflation radius (m) |
 | `safety_clearance` | 0.05 | Extra inflation (m) |
-| `publish_rate` | 10.0 | Hz |
-| `max_lidar_range` | 8.0 | m |
-| `lidar_downsample` | 2 | Every Nth beam |
+| `publish_rate` | 10.0 | Update cycle rate (Hz) |
+| `max_lidar_range` | 8.0 | Max raycast (m) |
+| `lidar_downsample` | 2 | Use every Nth beam |
 
-Publishes `/{ns}/obstacle_grid`. Subscribes `/{ns}/scan` continuously, `/{ns}/map` once
-for dimensions.
+Serves `{ns}/get_grid_snapshot` (raw + inflated pair). Also publishes
+`{ns}/obstacle_grid` (inflated) and `{ns}/obstacle_grid_raw` (pre-inflation).
+Subscribes `{ns}/scan` continuously, `{ns}/map` once for dimensions.
 
 ### `nav_interfaces`
 
-CMake package with the action/msg/srv definitions:
+CMake package with the action/srv definitions:
 
-- `action/Navigate.action` — goal/result/feedback shown above
-- `msg/NavStatus.msg` — globals publish on `/{ns}/{planner}/status`, DWA on
-  `/{ns}/dwa/nav_status`
-- `srv/CancelNav.srv` — preemption, one per planner
+- `action/Navigate.action` — orchestrator entry point
+- `action/FollowPath.action` — local planner contract
+- `action/RunBatch.action` — batch-scenario runner (unused so far)
+- `srv/PlanPath.srv` — global planner contract
+- `srv/GetGridSnapshot.srv` — obstacle grid snapshot contract
 
 ---
 
@@ -468,5 +477,7 @@ echo $ROS_DISTRO
 ### Robot doesn't move
 
 - Undock it. LIDAR is off while docked.
-- `ros2 topic echo /don/goal_pose` to confirm the goal arrived.
-- In RViz, Panels → Tool Properties → 2D Goal Pose → topic is `/don/goal_pose`.
+- `ros2 topic echo /don/goal_pose` to confirm an RViz goal arrived.
+- Check `ros2 action list` shows `/don/navigate`, `/don/dwa/follow_path`.
+- Check `ros2 service list` shows `/don/get_grid_snapshot` and `/don/{planner}/plan_path`.
+- In RViz, Tool Properties → 2D Goal Pose → topic is `/don/goal_pose`.

@@ -5,8 +5,8 @@ navigation_server:
     map_frame: map
     base_frame: base_link
 
-    default_global_planner: a_star   # a_star|d_star|jps|rrt_star|fm2
-    default_local_planner: dwa       # dwa|mppi|rl_policy
+    default_global_planner: a_star   # a_star|d_star|jps
+    default_local_planner: dwa       # dwa
 
     navigation_timeout: 300.0        # seconds; 0 = no timeout
     plan_timeout: 5.0                # seconds for PlanPath wait_for_service

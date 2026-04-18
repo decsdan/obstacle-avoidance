@@ -43,8 +43,8 @@ from std_msgs.msg import Bool
 from tf2_ros import Buffer, TransformListener
 
 
-KNOWN_GLOBALS = {'a_star', 'd_star', 'jps', 'rrt_star', 'fm2'}
-KNOWN_LOCALS = {'dwa', 'mppi', 'rl_policy'}
+KNOWN_GLOBALS = {'a_star', 'd_star', 'jps'}
+KNOWN_LOCALS = {'dwa'}
 
 
 @dataclass
@@ -167,6 +167,19 @@ class NavigationServer(Node):
             Bool, f'{self.ns}/safety/latched',
             self._monitor_safety_latched, latched_qos,
             callback_group=self._cbg)
+
+        # ------------------------------------------------------------------
+        # Active-path publisher -- RViz / observers see whatever PlanPath
+        # most recently produced. Latched so late subscribers catch up.
+        # ------------------------------------------------------------------
+        path_qos = QoSProfile(
+            depth=1,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._active_path_pub = self.create_publisher(
+            Path, f'{self.ns}/nav_server/active_path', path_qos)
 
         # ------------------------------------------------------------------
         # Navigate action server
@@ -464,6 +477,7 @@ class NavigationServer(Node):
 
         self.K.active_path = resp.path
         self.K.last_path_stamp = self.get_clock().now().to_msg()
+        self._active_path_pub.publish(resp.path)
         self.get_logger().info(
             f'[plan] path received: {len(resp.path.poses)} poses in '
             f'{resp.compute_time:.3f}s '
@@ -501,8 +515,6 @@ class NavigationServer(Node):
 
         goal = FollowPath.Goal()
         goal.reference_path = self.K.active_path or Path()
-        goal.mode = ('stacked' if goal.reference_path.poses
-                     else 'standalone')
 
         send_future = client.send_goal_async(
             goal, feedback_callback=self._monitor_follow_feedback)

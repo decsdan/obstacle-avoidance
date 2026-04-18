@@ -7,8 +7,8 @@ Sends a ``Navigate`` goal to the navigation server, prints live
 feedback, and treats Ctrl+C as a cancel request. 
 
     ros2 run nav_server navigate -- --goal X Y [THETA] \\
-        [--global-planner a_star|d_star|jps|rrt_star|fm2] \\
-        [--local-planner dwa|mppi|rl_policy] \\
+        [--global-planner a_star|d_star|jps] \\
+        [--local-planner dwa] \\
         [--namespace /don] [--scenario-id ID] [--budget N]
 """
 
@@ -23,8 +23,8 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 
 
-GLOBAL_CHOICES = ['a_star', 'd_star', 'jps', 'rrt_star', 'fm2']
-LOCAL_CHOICES = ['dwa', 'mppi', 'rl_policy']
+GLOBAL_CHOICES = ['a_star', 'd_star', 'jps']
+LOCAL_CHOICES = ['dwa']
 
 
 class NavigateCLI(Node):
@@ -113,8 +113,6 @@ class NavigateCLI(Node):
             'reached': 'SUCCESS',
             'cancelled': 'CANCELLED',
             'timeout': 'TIMEOUT',
-            'stuck': 'STUCK',
-            'collision': 'COLLISION',
             'path_blocked': 'PATH BLOCKED',
             'failed': 'FAILED',
         }

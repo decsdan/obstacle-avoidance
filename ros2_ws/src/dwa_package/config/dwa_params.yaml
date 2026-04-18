@@ -1,13 +1,5 @@
-# Parameters for a_star (planner) and dwa_follower (local), loaded by
-# nav_server/launch/navigation_launch.py.
-
-a_star_planner:
-  ros__parameters:
-    namespace: /don
-    max_search_nodes: 100000
-    simplification_epsilon: 0.1
-    max_path_waypoints: 50
-    tight_space_radius: 5
+# Parameters for the dwa FollowPath action server node.
+# Loaded by nav_server/launch/navigation_launch.py when local_planner=dwa.
 
 dwa_follower:
   ros__parameters:
