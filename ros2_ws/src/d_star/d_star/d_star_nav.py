@@ -5,8 +5,11 @@
 """D* Lite global path planner.
 
 Planner only, the navigation server calls this node with a grid and a
-start/goal, and it hands back a path. The D* Lite algorithm class is kept;
-for now each call runs fresh, and caching between calls can be added later.
+start/goal, and it hands back a path. State is kept between calls when
+the goal and grid frame match, so follow-up requests reuse the previous
+search and only patch up vertices near cells whose traversability
+changed. The response's ``cached`` flag is true whenever state was
+reused.
 """
 
 import heapq
@@ -209,6 +212,28 @@ class DStarLite:
         return path
 
 
+class _Session:
+    """Cached search state carried across PlanPath calls.
+
+    Reusable when the goal cell and grid frame (shape, resolution, origin)
+    haven't changed since the last call. Holding onto the ``DStarLite``
+    instance is what makes this planner incremental; only vertices near
+    cells whose traversability changed get re-touched.
+    """
+
+    __slots__ = ('dstar', 'grid', 'goal',
+                 'width', 'height', 'resolution', 'origin')
+
+    def __init__(self, dstar, grid, goal, width, height, resolution, origin):
+        self.dstar = dstar
+        self.grid = grid
+        self.goal = goal
+        self.width = width
+        self.height = height
+        self.resolution = resolution
+        self.origin = origin
+
+
 class DStarPlanner(Node):
     """D* Lite PlanPath service server."""
 
@@ -228,6 +253,8 @@ class DStarPlanner(Node):
         self.max_waypoints = self.get_parameter('max_waypoints').value
         self.tight_space_radius = self.get_parameter('tight_space_radius').value
         self.max_iterations = self.get_parameter('max_iterations').value
+
+        self._session = None
 
         self._srv = self.create_service(
             PlanPath, f'{self.ns}/d_star/plan_path', self._handle_plan_path)
@@ -250,6 +277,8 @@ class DStarPlanner(Node):
         resolution = grid_msg.info.resolution
         origin = (grid_msg.info.origin.position.x,
                   grid_msg.info.origin.position.y)
+        width = grid_msg.info.width
+        height = grid_msg.info.height
 
         start_cell = self._world_to_grid(
             request.start.pose.position.x,
@@ -274,15 +303,26 @@ class DStarPlanner(Node):
         budget = int(request.budget) if request.budget > 0 else self.max_iterations
         deadline = t0 + (request.timeout if request.timeout > 0 else 1e9)
 
-        dstar = DStarLite(
-            grid, start_cell, goal_cell,
-            tight_space_radius=self.tight_space_radius,
-            logger=self.get_logger())
+        cached = self._can_reuse(goal_cell, width, height, resolution, origin)
+        if cached:
+            dstar = self._reuse_session(grid, start_cell)
+        else:
+            dstar = DStarLite(
+                grid, start_cell, goal_cell,
+                tight_space_radius=self.tight_space_radius,
+                logger=self.get_logger())
+            self._session = _Session(
+                dstar=dstar, grid=grid.copy(), goal=goal_cell,
+                width=width, height=height,
+                resolution=resolution, origin=origin)
+
         ok, iterations, reason = dstar.compute_shortest_path(budget, deadline)
         if not ok:
+            # Hold onto the session so the next call can pick up where
+            # this one timed out.
             return self._fail(response, reason or 'TIMEOUT', t0,
                               f'compute_shortest_path bailed after {iterations} iterations',
-                              nodes_expanded=iterations)
+                              nodes_expanded=iterations, cached=cached)
 
         path_cells = dstar.extract_path()
         compute_time = time.monotonic() - t0
@@ -292,12 +332,12 @@ class DStarPlanner(Node):
             response.failure_reason = 'NO_PATH'
             response.compute_time = compute_time
             response.nodes_expanded = iterations
-            response.cached = False
+            response.cached = cached
             response.path = Path()
             response.path.header.frame_id = grid_msg.header.frame_id or 'map'
             response.path.header.stamp = self.get_clock().now().to_msg()
             self.get_logger().warn(
-                f'PlanPath NO_PATH (iter {iterations}, '
+                f'PlanPath NO_PATH (cached={cached}, iter {iterations}, '
                 f'{compute_time*1000:.1f} ms)')
             return response
 
@@ -312,12 +352,90 @@ class DStarPlanner(Node):
         response.failure_reason = ''
         response.compute_time = compute_time
         response.nodes_expanded = iterations
-        response.cached = False
+        response.cached = cached
 
         self.get_logger().info(
-            f'PlanPath OK: {len(waypoints)} pts, '
+            f'PlanPath OK (cached={cached}): {len(waypoints)} pts, '
             f'iterations {iterations}, {compute_time*1000:.1f} ms')
         return response
+
+    # ------------------------------------------------------------------
+    # Session reuse
+    # ------------------------------------------------------------------
+
+    def _can_reuse(self, goal_cell, width, height, resolution, origin):
+        s = self._session
+        if s is None:
+            return False
+        if s.goal != goal_cell:
+            return False
+        if s.width != width or s.height != height:
+            return False
+        if abs(s.resolution - resolution) > 1e-6:
+            return False
+        if (abs(s.origin[0] - origin[0]) > 1e-6 or
+                abs(s.origin[1] - origin[1]) > 1e-6):
+            return False
+        return True
+
+    def _reuse_session(self, grid, start_cell):
+        """Patch an existing DStarLite instance to match the new call.
+
+        Applies the standard D* Lite start-change update (``k_m``,
+        ``s_last``) and calls ``update_vertex`` on every cell whose
+        traversability may have changed since the last call, plus their
+        8-neighbors so predecessors' rhs values get recomputed.
+        """
+        s = self._session
+        dstar = s.dstar
+        old_grid = s.grid
+        old_start = dstar.start
+
+        dstar.k_m += DStarLite.heuristic(dstar.s_last, start_cell)
+        dstar.s_last = start_cell
+        dstar.start = start_cell
+        dstar.grid = grid
+
+        for cell in self._changed_cells(old_grid, grid, old_start, start_cell):
+            dstar.update_vertex(cell)
+
+        s.grid = grid.copy()
+        return dstar
+
+    def _changed_cells(self, old_grid, new_grid, old_start, new_start):
+        """Return cells whose ``is_valid`` result may have changed.
+
+        Covers three sources:
+
+        - cells whose occupancy flipped between the two grids;
+        - cells inside ``tight_space_radius`` of either the old or new
+          start, since the tight-space exemption moves with start;
+        - 8-neighbors of all of the above, so predecessors re-evaluate
+          their rhs values against the new edge costs.
+        """
+        rows, cols = new_grid.shape
+        touched = set()
+
+        diff = np.argwhere(old_grid != new_grid)
+        for y, x in diff:
+            touched.add((int(x), int(y)))
+
+        r = self.tight_space_radius
+        if r > 0:
+            for sx, sy in (old_start, new_start):
+                for dx in range(-r, r + 1):
+                    for dy in range(-r, r + 1):
+                        if abs(dx) + abs(dy) <= r:
+                            touched.add((sx + dx, sy + dy))
+
+        expanded = set()
+        for (x, y) in touched:
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < cols and 0 <= ny < rows:
+                        expanded.add((nx, ny))
+        return expanded
 
     # ------------------------------------------------------------------
     # Helpers
@@ -373,12 +491,13 @@ class DStarPlanner(Node):
             path_msg.poses.append(pose)
         return path_msg
 
-    def _fail(self, response, reason, t_start, log_msg, nodes_expanded=0):
+    def _fail(self, response, reason, t_start, log_msg,
+              nodes_expanded=0, cached=False):
         response.success = False
         response.failure_reason = reason
         response.compute_time = time.monotonic() - t_start
         response.nodes_expanded = nodes_expanded
-        response.cached = False
+        response.cached = cached
         response.path = Path()
         response.path.header.frame_id = 'map'
         response.path.header.stamp = self.get_clock().now().to_msg()
