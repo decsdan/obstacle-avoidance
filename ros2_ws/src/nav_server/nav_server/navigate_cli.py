@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
-"""Command-line Navigate action client for the obstacle-avoidance fork.
+# Originally authored by the 2025 Carleton Senior Capstone Project
+# (see AUTHORS.md). Substantially rewritten by Daniel Scheider, 2026.
+"""Command-line Navigate action client for the obstacle-avoidance stack.
 
-Sends a Navigate goal to the navigation server, prints live feedback, and
-treats Ctrl+C as a cancel request. Run with::
+Sends a ``Navigate`` goal to the navigation server, prints live
+feedback, and treats Ctrl+C as a cancel request. 
 
     ros2 run nav_server navigate -- --goal X Y [THETA] \\
-        [--global-planner a_star|d_star|jps] [--local-planner dwa|none] \\
-        [--namespace /don]
+        [--global-planner a_star|d_star|jps|rrt_star|fm2] \\
+        [--local-planner dwa|mppi|rl_policy] \\
+        [--namespace /don] [--scenario-id ID] [--budget N]
 """
 
 import argparse
+import math
 import sys
 
 import rclpy
+from geometry_msgs.msg import PoseStamped
 from nav_interfaces.action import Navigate
 from rclpy.action import ActionClient
 from rclpy.node import Node
+
+
+GLOBAL_CHOICES = ['a_star', 'd_star', 'jps', 'rrt_star', 'fm2']
+LOCAL_CHOICES = ['dwa', 'mppi', 'rl_policy']
 
 
 class NavigateCLI(Node):
@@ -31,25 +40,36 @@ class NavigateCLI(Node):
         self._result = None
 
     def send_goal(self, goal_x, goal_y, goal_theta,
-                  global_planner, local_planner):
-        """Send a Navigate goal; return True if the server is reachable."""
+                  global_planner, local_planner,
+                  scenario_id, budget):
         if not self._action_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().error(
                 f'Navigation server not available on {self.ns}/navigate. '
                 f'Is nav_server running?')
             return False
 
+        goal_pose = PoseStamped()
+        goal_pose.header.frame_id = 'map'
+        goal_pose.header.stamp = self.get_clock().now().to_msg()
+        goal_pose.pose.position.x = goal_x
+        goal_pose.pose.position.y = goal_y
+        goal_pose.pose.position.z = 0.0
+        goal_pose.pose.orientation.z = math.sin(goal_theta / 2.0)
+        goal_pose.pose.orientation.w = math.cos(goal_theta / 2.0)
+
         goal_msg = Navigate.Goal()
+        goal_msg.goal = goal_pose
         goal_msg.global_planner = global_planner
         goal_msg.local_planner = local_planner
-        goal_msg.goal_x = goal_x
-        goal_msg.goal_y = goal_y
-        goal_msg.goal_theta = goal_theta
+        goal_msg.global_budget = budget
+        goal_msg.scenario_id = scenario_id
 
         print(f'\n  Navigating to '
               f'({goal_x:.2f}, {goal_y:.2f}, {goal_theta:.2f})')
         print(f'  Global planner: {global_planner}')
         print(f'  Local planner:  {local_planner}')
+        print(f'  Budget:         {budget:.0f} (0 = planner default)')
+        print(f'  Scenario ID:    {scenario_id or "-"}')
         print(f'  Namespace:      {self.ns}')
         print('  Press Ctrl+C to cancel\n')
 
@@ -64,7 +84,6 @@ class NavigateCLI(Node):
             print('  Goal REJECTED by server')
             self._done = True
             return
-
         print('  Goal accepted\n')
         self._goal_handle = goal_handle
         result_future = goal_handle.get_result_async()
@@ -75,12 +94,14 @@ class NavigateCLI(Node):
         state_str = fb.nav_state.upper()
         dist_str = (f'{fb.distance_to_goal:.2f}m'
                     if fb.distance_to_goal >= 0 else '---')
+        px = fb.current_pose.position.x
+        py = fb.current_pose.position.y
         print(
             f'\r  [{state_str:20s}] '
             f'dist_to_goal: {dist_str}  '
             f'traveled: {fb.distance_traveled:.2f}m  '
             f'time: {fb.elapsed_time:.1f}s  '
-            f'pos: ({fb.current_x:.2f}, {fb.current_y:.2f})   ',
+            f'pos: ({px:.2f}, {py:.2f})   ',
             end='', flush=True)
 
     def _result_cb(self, future):
@@ -92,20 +113,24 @@ class NavigateCLI(Node):
             'reached': 'SUCCESS',
             'cancelled': 'CANCELLED',
             'timeout': 'TIMEOUT',
+            'stuck': 'STUCK',
+            'collision': 'COLLISION',
+            'path_blocked': 'PATH BLOCKED',
             'failed': 'FAILED',
         }
-        label = labels.get(result.final_state, result.final_state.upper())
+        label = labels.get(result.terminal_outcome,
+                           result.terminal_outcome.upper())
 
         print(f'\n\n  === {label} ===')
         print(f'  Distance traveled: {result.total_distance:.2f} m')
         print(f'  Total time:        {result.total_time:.2f} s')
+        print(f'  Replans:           {result.replan_count}')
         if result.total_time > 0:
             avg_speed = result.total_distance / result.total_time
             print(f'  Average speed:     {avg_speed:.3f} m/s')
         print()
 
     def cancel_goal(self):
-        """Send a cancel request for the active goal, if any."""
         if self._goal_handle is not None:
             print('\n\n  Cancelling navigation...')
             self._goal_handle.cancel_goal_async()
@@ -121,22 +146,27 @@ def main(args=None):
         help='Goal coordinates: X Y [THETA]')
     parser.add_argument(
         '--global-planner', default='a_star',
-        choices=['a_star', 'd_star', 'jps'],
-        help='Global planner to use (default: a_star)')
+        choices=GLOBAL_CHOICES,
+        help='Global planner (default: a_star)')
     parser.add_argument(
         '--local-planner', default='dwa',
-        choices=['dwa', 'none'],
-        help='Local planner to use (default: dwa)')
+        choices=LOCAL_CHOICES,
+        help='Local planner (default: dwa)')
     parser.add_argument(
         '--namespace', default='/don',
         help='Robot namespace (default: /don)')
+    parser.add_argument(
+        '--scenario-id', default='',
+        help='Optional scenario ID for dataset correlation')
+    parser.add_argument(
+        '--budget', type=float, default=0.0,
+        help='PlanPath budget (nodes/samples); 0 = planner default')
 
     filtered_args = []
     for arg in sys.argv[1:]:
         if arg == '--ros-args':
             break
         filtered_args.append(arg)
-
     parsed = parser.parse_args(filtered_args)
 
     if len(parsed.goal) < 2:
@@ -150,7 +180,8 @@ def main(args=None):
 
     success = node.send_goal(
         goal_x, goal_y, goal_theta,
-        parsed.global_planner, parsed.local_planner)
+        parsed.global_planner, parsed.local_planner,
+        parsed.scenario_id, parsed.budget)
 
     if not success:
         node.destroy_node()

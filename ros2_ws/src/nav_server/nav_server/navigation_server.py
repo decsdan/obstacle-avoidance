@@ -1,351 +1,579 @@
 #!/usr/bin/env python3
-"""Navigate action server and RViz goal monitor for the obstacle-avoidance fork.
+# Originally authored by the 2025 Carleton Senior Capstone Project
+# (see AUTHORS.md). Substantially rewritten by Daniel Scheider, 2026.
+"""Call/response orchestrator for the obstacle-avoidance stack.
 
-Watches /{ns}/goal_pose for RViz clicks, dispatches them to the configured
-global and local planners, and prints live NavStatus feedback to the launch
-terminal. Also exposes a Navigate action for programmatic use. New goals
-preempt any in-flight navigation via the planners' CancelNav services.
+Serves the top-level ``Navigate`` action and drives global planners
+(``PlanPath`` service) and local planners (``FollowPath`` action) 
+This node manages all replanning for the other nodes
+
+* ``_monitor_*`` -- read external state (TF, feedback topics).
+* ``_analyze_*`` -- decide whether to adapt.
+* ``_plan_*``    -- request a new strategy or path.
+* ``_execute_*`` -- dispatch a strategy to the managed system.
+
+Shared state lives on ``self.K`` (Knowledge). In v2.0 all four phases
+run in the same node -- the labels are there to keep the structural
+door open for a future managing-system split.
 """
 
 import asyncio
 import math
+from dataclasses import dataclass, field
+from typing import Optional
 
 import rclpy
-import rclpy.time
-from geometry_msgs.msg import PoseStamped
-from nav_interfaces.action import Navigate
-from nav_interfaces.msg import NavStatus
-from nav_interfaces.srv import CancelNav
-from rclpy.action import ActionServer, CancelResponse, GoalResponse
+import tf2_ros
+from builtin_interfaces.msg import Time as TimeMsg
+from geometry_msgs.msg import Pose, PoseStamped, Twist
+from nav_interfaces.action import FollowPath, Navigate
+from nav_interfaces.srv import GetGridSnapshot, PlanPath
+from nav_msgs.msg import Path
+from rclpy.action import (
+    ActionClient, ActionServer, CancelResponse, GoalResponse,
+)
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.time import Time
+from tf2_ros import Buffer, TransformListener
+
+
+KNOWN_GLOBALS = {'a_star', 'd_star', 'jps', 'rrt_star', 'fm2'}
+KNOWN_LOCALS = {'dwa', 'mppi', 'rl_policy'}
+
+
+@dataclass
+class NavKnowledge:
+    """The K in MAPE-K. All state observed or decided by the orchestrator."""
+
+    # Current goal context
+    goal: Optional[PoseStamped] = None
+    scenario_id: str = ''
+    global_planner: str = ''
+    local_planner: str = ''
+    global_budget: float = 0.0
+
+    # Plan state
+    active_path: Optional[Path] = None
+    last_path_stamp: Optional[TimeMsg] = None
+    last_grid_stamp: Optional[TimeMsg] = None
+
+    # Pose/velocity (from TF or FollowPath feedback, whichever is fresher)
+    current_pose: Pose = field(default_factory=Pose)
+    current_velocity: Twist = field(default_factory=Twist)
+    pose_valid: bool = False
+
+    # Derived metrics
+    distance_to_goal: float = -1.0
+    distance_traveled: float = 0.0
+    cross_track_error: float = 0.0
+    local_state: str = 'idle'
+    waypoint_index: int = -1
+
+    # Orchestrator state machine
+    nav_state: str = 'idle'  # planning | following | replanning | recovering | idle
+    replan_count: int = 0
+    replan_reason: str = ''
+
+    # Terminal outcome from the FollowPath action, set by its result callback
+    follow_terminal: Optional[str] = None
+
+    # Timing
+    start_time: Optional[Time] = None
 
 
 class NavigationServer(Node):
-    """Orchestrate planners and stream feedback for RViz-driven navigation."""
+    """Orchestrates call/response navigation; implements the Navigate action."""
 
     def __init__(self):
         super().__init__('navigation_server')
 
+        # ------------------------------------------------------------------
+        # Parameters
+        # ------------------------------------------------------------------
         self.declare_parameter('namespace', '/don')
+        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('default_global_planner', 'a_star')
+        self.declare_parameter('default_local_planner', 'dwa')
         self.declare_parameter('navigation_timeout', 300.0)
-        self.declare_parameter('global_planner', 'a_star')
-        self.declare_parameter('local_planner', 'dwa')
+        self.declare_parameter('plan_timeout', 5.0)
+        self.declare_parameter('plan_budget_default', 0.0)
+        self.declare_parameter('feedback_hz', 10.0)
+        self.declare_parameter('replan_on_path_blocked', True)
+        self.declare_parameter('replan_deviation_threshold', 0.5)
+        # Periodic replanning is OFF by default: PRD §4.5 requires replan
+        # decisions to be deterministic functions of grid/path, not timers.
+        self.declare_parameter('replan_period_sec', 0.0)
 
-        self.ns = self.get_parameter('namespace').value
-        self.nav_timeout = self.get_parameter('navigation_timeout').value
-        self.global_planner = self.get_parameter('global_planner').value
-        self.local_planner = self.get_parameter('local_planner').value
+        p = self.get_parameter
+        self.ns = p('namespace').value
+        self.map_frame = p('map_frame').value
+        self.base_frame = p('base_frame').value
+        self.default_global = p('default_global_planner').value
+        self.default_local = p('default_local_planner').value
+        self.nav_timeout = float(p('navigation_timeout').value)
+        self.plan_timeout = float(p('plan_timeout').value)
+        self.plan_budget_default = float(p('plan_budget_default').value)
+        self.feedback_period = 1.0 / float(p('feedback_hz').value)
+        self.replan_on_path_blocked = bool(p('replan_on_path_blocked').value)
+        self.replan_deviation_m = float(p('replan_deviation_threshold').value)
+        self.replan_period_sec = float(p('replan_period_sec').value)
 
-        self._action_cb_group = ReentrantCallbackGroup()
+        # ------------------------------------------------------------------
+        # Callback groups & knowledge
+        # ------------------------------------------------------------------
+        self._cbg = ReentrantCallbackGroup()
+        self.K = NavKnowledge()
+        self._last_pose_for_distance: Optional[Pose] = None
+        self._follow_goal_handle = None
+        self._navigate_goal_handle = None
+
+        # ------------------------------------------------------------------
+        # TF listener -- pose source during planning phase (Monitor)
+        # ------------------------------------------------------------------
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+
+        # ------------------------------------------------------------------
+        # Clients
+        # ------------------------------------------------------------------
+        self._plan_clients = {}
+        self._follow_clients = {}
+        self._grid_client = self.create_client(
+            GetGridSnapshot, f'{self.ns}/obstacle_grid/get_snapshot',
+            callback_group=self._cbg)
+
+        # ------------------------------------------------------------------
+        # Navigate action server
+        # ------------------------------------------------------------------
         self._action_server = ActionServer(
             self,
             Navigate,
             f'{self.ns}/navigate',
-            execute_callback=self._action_execute_callback,
-            goal_callback=self._action_goal_callback,
-            cancel_callback=self._action_cancel_callback,
-            callback_group=self._action_cb_group,
+            execute_callback=self._execute_navigate,
+            goal_callback=self._monitor_accept_goal,
+            cancel_callback=self._monitor_accept_cancel,
+            callback_group=self._cbg,
         )
 
-        self._local_status = None
-        self._global_status = None
-
-        self.local_status_sub = self.create_subscription(
-            NavStatus, f'{self.ns}/dwa/nav_status', self._local_status_cb, 10)
-
-        global_status_map = {
-            'a_star': f'{self.ns}/a_star/status',
-            'd_star': f'{self.ns}/d_star/status',
-            'jps': f'{self.ns}/jps/status',
-        }
-        global_status_topic = global_status_map.get(
-            self.global_planner, f'{self.ns}/a_star/status')
-        self.global_status_sub = self.create_subscription(
-            NavStatus, global_status_topic, self._global_status_cb, 10)
-
-        self._cancel_clients = {}
-
-        self._rviz_active = False
-        self._rviz_goal = None
-        self._rviz_start_time = None
-        self._rviz_last_status_line = ''
-        self._self_published_goal = False
-
+        # ------------------------------------------------------------------
+        # RViz convenience: single-click 2D Goal Pose dispatcher
+        # ------------------------------------------------------------------
         self._rviz_sub = self.create_subscription(
-            PoseStamped, f'{self.ns}/goal_pose', self._goal_pose_cb, 10)
-        self._goal_pub = self.create_publisher(
-            PoseStamped, f'{self.ns}/goal_pose', 10)
-
-        self._monitor_timer = self.create_timer(0.2, self._monitor_loop)
+            PoseStamped, f'{self.ns}/goal_pose',
+            self._monitor_rviz_goal, 10, callback_group=self._cbg)
+        self._rviz_self_client = ActionClient(
+            self, Navigate, f'{self.ns}/navigate',
+            callback_group=self._cbg)
+        self._rviz_goal_handle = None
 
         self.get_logger().info(
-            f'Navigation server ready | namespace={self.ns} '
-            f'| global={self.global_planner} local={self.local_planner}')
-        self.get_logger().info(
-            f'Send goals via RViz "2D Goal Pose" tool on {self.ns}/goal_pose')
+            f'nav_server ready | ns={self.ns} | '
+            f'default_global={self.default_global} '
+            f'default_local={self.default_local} | '
+            f'feedback_hz={1.0 / self.feedback_period:.1f}')
 
-    def _goal_pose_cb(self, msg):
-        """Handle goal_pose messages from RViz or the action server."""
-        if self._self_published_goal:
-            self._self_published_goal = False
+    # ----------------------------------------------------------------------
+    # RViz convenience entry point
+    # ----------------------------------------------------------------------
+
+    def _monitor_rviz_goal(self, msg: PoseStamped):
+        """Route an RViz goal_pose through our own Navigate action."""
+        if not self._rviz_self_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().warn(
+                'Own Navigate server not reachable from RViz hook')
             return
 
-        goal_x = msg.pose.position.x
-        goal_y = msg.pose.position.y
-        q = msg.pose.orientation
-        goal_theta = math.atan2(
-            2.0 * (q.w * q.z + q.x * q.y),
-            1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-
-        if self._rviz_active:
-            self.get_logger().info('New RViz goal -- preempting previous navigation')
-            self._cancel_active_planners()
-
-        self._rviz_goal = (goal_x, goal_y, goal_theta)
-        self._rviz_start_time = self.get_clock().now()
-        self._rviz_active = True
-        self._rviz_last_status_line = ''
+        goal = Navigate.Goal()
+        goal.goal = msg
+        goal.global_planner = self.default_global
+        goal.local_planner = self.default_local
+        goal.global_budget = self.plan_budget_default
+        goal.scenario_id = 'rviz'
 
         self.get_logger().info(
-            f'RViz goal received: ({goal_x:.2f}, {goal_y:.2f}, {goal_theta:.2f})')
+            f'RViz goal → ({msg.pose.position.x:.2f}, '
+            f'{msg.pose.position.y:.2f})')
 
-    def _monitor_loop(self):
-        """Tick at 5 Hz; print live feedback while a goal is active."""
-        if not self._rviz_active:
-            return
+        if self._rviz_goal_handle is not None:
+            self._rviz_goal_handle.cancel_goal_async()
+            self._rviz_goal_handle = None
 
-        use_local = self.local_planner not in ('none', '')
-        status = self._local_status if use_local else self._global_status
-        elapsed = self._elapsed(self._rviz_start_time)
+        self._rviz_self_client.send_goal_async(goal).add_done_callback(
+            self._rviz_goal_accepted)
 
-        if self.nav_timeout > 0 and elapsed > self.nav_timeout:
+    def _rviz_goal_accepted(self, future):
+        handle = future.result()
+        if handle.accepted:
+            self._rviz_goal_handle = handle
+
+    # ----------------------------------------------------------------------
+    # Monitor: action-server accept gates
+    # ----------------------------------------------------------------------
+
+    def _monitor_accept_goal(self, goal_request):
+        g = goal_request.global_planner.lower() or self.default_global
+        loc = goal_request.local_planner.lower() or self.default_local
+        if g not in KNOWN_GLOBALS:
             self.get_logger().error(
-                f'Navigation timeout ({self.nav_timeout:.0f}s) -- cancelling')
-            self._cancel_active_planners()
-            self._finish_rviz('TIMEOUT', elapsed, status)
-            return
-
-        if status is None:
-            self.get_logger().info(
-                f'Waiting for planner status... ({elapsed:.1f}s)',
-                throttle_duration_sec=2.0)
-            return
-
-        if status.goal_reached:
-            self._finish_rviz('REACHED', elapsed, status)
-            return
-
-        if (elapsed > 3.0 and
-                status.nav_state == 'idle' and
-                not status.has_active_goal and
-                not status.goal_reached):
-            self._finish_rviz('FAILED', elapsed, status)
-            return
-
-        state = status.nav_state.upper()
-        dist = (f'{status.distance_to_goal:.2f}m'
-                if status.distance_to_goal >= 0 else '---')
-        line = (
-            f'  [{state:20s}] '
-            f'to_goal: {dist}  '
-            f'traveled: {status.distance_traveled:.2f}m  '
-            f'time: {elapsed:.1f}s  '
-            f'pos: ({status.current_x:.2f}, {status.current_y:.2f})')
-
-        if line != self._rviz_last_status_line:
-            self.get_logger().info(line)
-            self._rviz_last_status_line = line
-
-    def _finish_rviz(self, outcome, elapsed, status):
-        """Print final result and reset RViz monitoring state."""
-        dist = status.distance_traveled if status else 0.0
-        self.get_logger().info('')
-        self.get_logger().info(f'  == {outcome} ==')
-        self.get_logger().info(f'  Distance traveled: {dist:.2f} m')
-        self.get_logger().info(f'  Total time:        {elapsed:.2f} s')
-        if elapsed > 0 and dist > 0:
-            self.get_logger().info(
-                f'  Average speed:     {dist / elapsed:.3f} m/s')
-        self.get_logger().info('')
-
-        self._rviz_active = False
-        self._rviz_goal = None
-        self._rviz_start_time = None
-        self._rviz_last_status_line = ''
-
-    def _local_status_cb(self, msg):
-        self._local_status = msg
-
-    def _global_status_cb(self, msg):
-        self._global_status = msg
-
-    def _action_goal_callback(self, goal_request):
-        """Accept or reject action goals."""
-        planner = goal_request.global_planner.lower()
-        local = goal_request.local_planner.lower()
-
-        known_global = {'a_star', 'd_star', 'jps'}
-        known_local = {'dwa', 'none', ''}
-
-        if planner not in known_global:
-            self.get_logger().error(
-                f'Unknown global_planner: "{planner}". Valid: {known_global}')
+                f'Unknown global_planner "{g}"; valid: {sorted(KNOWN_GLOBALS)}')
             return GoalResponse.REJECT
-
-        if local not in known_local:
+        if loc not in KNOWN_LOCALS:
             self.get_logger().error(
-                f'Unknown local_planner: "{local}". Valid: {known_local}')
+                f'Unknown local_planner "{loc}"; valid: {sorted(KNOWN_LOCALS)}')
             return GoalResponse.REJECT
-
-        # Preempt any active RViz navigation
-        if self._rviz_active:
-            self.get_logger().info('Action goal preempts active RViz navigation')
-            self._cancel_active_planners()
-            self._rviz_active = False
-
-        self.get_logger().info(
-            f'Action goal accepted: ({goal_request.goal_x:.2f}, '
-            f'{goal_request.goal_y:.2f}) global={planner} local={local}')
         return GoalResponse.ACCEPT
 
-    def _action_cancel_callback(self, goal_handle):
-        """Accept all cancel requests."""
-        self.get_logger().info('Action cancel request received')
+    def _monitor_accept_cancel(self, goal_handle):
         return CancelResponse.ACCEPT
 
-    async def _action_execute_callback(self, goal_handle):
-        """Execute a Navigate action goal (programmatic interface)."""
-        request = goal_handle.request
-        global_planner = request.global_planner.lower()
-        local_planner = request.local_planner.lower()
+    # ----------------------------------------------------------------------
+    # Execute: the main call/response loop
+    # ----------------------------------------------------------------------
 
-        self._local_status = None
-        self._global_status = None
+    async def _execute_navigate(self, goal_handle):
+        req = goal_handle.request
+        self.K = NavKnowledge(
+            goal=req.goal,
+            scenario_id=req.scenario_id,
+            global_planner=(req.global_planner.lower() or self.default_global),
+            local_planner=(req.local_planner.lower() or self.default_local),
+            global_budget=(req.global_budget if req.global_budget > 0.0
+                           else self.plan_budget_default),
+            start_time=self.get_clock().now(),
+        )
+        self._last_pose_for_distance = None
+        self._navigate_goal_handle = goal_handle
 
-        use_local = local_planner not in ('none', '')
+        self.get_logger().info(
+            f'[execute] scenario={self.K.scenario_id or "-"} '
+            f'global={self.K.global_planner} '
+            f'local={self.K.local_planner} '
+            f'goal=({req.goal.pose.position.x:.2f}, '
+            f'{req.goal.pose.position.y:.2f})')
 
-        # Publish goal_pose (set flag so our subscription ignores it)
-        goal_msg = PoseStamped()
-        goal_msg.header.stamp = self.get_clock().now().to_msg()
-        goal_msg.header.frame_id = 'map'
-        goal_msg.pose.position.x = request.goal_x
-        goal_msg.pose.position.y = request.goal_y
-        goal_msg.pose.position.z = 0.0
-        goal_msg.pose.orientation.z = math.sin(request.goal_theta / 2.0)
-        goal_msg.pose.orientation.w = math.cos(request.goal_theta / 2.0)
+        # Plan once up front; replan is driven by analyze-phase triggers.
+        if not await self._plan_request_new_path('initial'):
+            goal_handle.abort()
+            return self._finalize_result('failed', success=False)
 
-        self._self_published_goal = True
-        self._goal_pub.publish(goal_msg)
+        if not await self._execute_start_follow():
+            goal_handle.abort()
+            return self._finalize_result('failed', success=False)
 
-        result = Navigate.Result()
-        feedback = Navigate.Feedback()
-        start_time = self.get_clock().now()
-        rate_period = 1.0 / 5.0
-
+        last_periodic_replan = self.get_clock().now()
         while rclpy.ok():
             if goal_handle.is_cancel_requested:
-                self._cancel_planners(global_planner, local_planner)
+                await self._execute_cancel_follow()
                 goal_handle.canceled()
-                result.success = False
-                result.final_state = 'cancelled'
-                result.total_time = self._elapsed(start_time)
-                result.total_distance = self._get_distance_traveled(use_local)
-                return result
+                return self._finalize_result('cancelled', success=False)
 
-            elapsed = self._elapsed(start_time)
+            elapsed = self._elapsed(self.K.start_time)
             if self.nav_timeout > 0 and elapsed > self.nav_timeout:
-                self._cancel_planners(global_planner, local_planner)
+                await self._execute_cancel_follow()
                 goal_handle.abort()
-                result.success = False
-                result.final_state = 'timeout'
-                result.total_time = elapsed
-                result.total_distance = self._get_distance_traveled(use_local)
-                return result
+                return self._finalize_result('timeout', success=False)
 
-            status = self._local_status if use_local else self._global_status
+            # Monitor: refresh pose from TF when FollowPath isn't feeding us
+            if self.K.nav_state != 'following':
+                self._monitor_pose_from_tf()
 
-            if status is not None:
-                feedback.nav_state = status.nav_state
-                feedback.distance_to_goal = status.distance_to_goal
-                feedback.distance_traveled = status.distance_traveled
-                feedback.elapsed_time = elapsed
-                feedback.current_x = status.current_x
-                feedback.current_y = status.current_y
-                goal_handle.publish_feedback(feedback)
+            self._publish_navigate_feedback(goal_handle, elapsed)
 
-                if status.goal_reached:
+            # Did the FollowPath action terminate?
+            if self.K.follow_terminal is not None:
+                outcome = self.K.follow_terminal
+                self.K.follow_terminal = None
+                self._follow_goal_handle = None
+
+                if outcome == 'reached':
                     goal_handle.succeed()
-                    result.success = True
-                    result.final_state = 'reached'
-                    result.total_time = elapsed
-                    result.total_distance = status.distance_traveled
-                    return result
+                    return self._finalize_result('reached', success=True)
 
-                if (elapsed > 2.0 and
-                        status.nav_state == 'idle' and
-                        not status.has_active_goal and
-                        not status.goal_reached):
+                if outcome == 'path_blocked' and self.replan_on_path_blocked:
+                    if await self._analyze_and_replan('path_blocked'):
+                        continue
                     goal_handle.abort()
-                    result.success = False
-                    result.final_state = 'failed'
-                    result.total_time = elapsed
-                    result.total_distance = status.distance_traveled
-                    return result
+                    return self._finalize_result('failed', success=False)
 
-            await asyncio.sleep(rate_period)
+                # cancelled or failed from the local planner itself
+                goal_handle.abort()
+                return self._finalize_result(outcome, success=False)
 
-    def _elapsed(self, start_time):
-        return (self.get_clock().now() - start_time).nanoseconds / 1e9
+            # Analyze-phase replan triggers
+            if self._analyze_deviation_exceeded():
+                await self._analyze_and_replan('deviation')
+            elif (self.replan_period_sec > 0.0 and
+                  self._elapsed(last_periodic_replan) > self.replan_period_sec):
+                await self._analyze_and_replan('periodic')
+                last_periodic_replan = self.get_clock().now()
 
-    def _get_distance_traveled(self, use_local):
-        status = self._local_status if use_local else self._global_status
-        return status.distance_traveled if status is not None else 0.0
+            await asyncio.sleep(self.feedback_period)
 
-    def _cancel_active_planners(self):
-        """Cancel whichever planners are configured for this server."""
-        self._cancel_planners(self.global_planner, self.local_planner)
+        # rclpy shutdown during execution
+        await self._execute_cancel_follow()
+        goal_handle.abort()
+        return self._finalize_result('failed', success=False)
 
-    def _cancel_planners(self, global_planner, local_planner):
-        """Call CancelNav services on specified planners."""
-        cancel_map = {
-            'a_star': f'{self.ns}/a_star/cancel',
-            'd_star': f'{self.ns}/d_star/cancel',
-            'jps': f'{self.ns}/jps/cancel',
-            'dwa': f'{self.ns}/dwa/cancel',
-        }
+    # ----------------------------------------------------------------------
+    # Monitor
+    # ----------------------------------------------------------------------
 
-        planners_to_cancel = [global_planner]
-        if local_planner not in ('none', ''):
-            planners_to_cancel.append(local_planner)
+    def _monitor_pose_from_tf(self):
+        try:
+            t = self._tf_buffer.lookup_transform(
+                self.map_frame, self.base_frame, Time())
+        except (tf2_ros.LookupException,
+                tf2_ros.ExtrapolationException,
+                tf2_ros.ConnectivityException):
+            return
+        self.K.current_pose.position.x = t.transform.translation.x
+        self.K.current_pose.position.y = t.transform.translation.y
+        self.K.current_pose.position.z = t.transform.translation.z
+        self.K.current_pose.orientation = t.transform.rotation
+        self.K.pose_valid = True
+        self.K.distance_to_goal = self._distance_to_goal()
 
-        for planner in planners_to_cancel:
-            service_name = cancel_map.get(planner)
-            if service_name is None:
-                continue
+    def _monitor_follow_feedback(self, feedback_msg):
+        fb = feedback_msg.feedback
+        new_pose = fb.current_pose
+        # Accumulate distance_traveled locally; FollowPath doesn't publish it.
+        if self._last_pose_for_distance is not None:
+            dx = new_pose.position.x - self._last_pose_for_distance.position.x
+            dy = new_pose.position.y - self._last_pose_for_distance.position.y
+            self.K.distance_traveled += math.hypot(dx, dy)
+        self._last_pose_for_distance = new_pose
 
-            if service_name not in self._cancel_clients:
-                self._cancel_clients[service_name] = self.create_client(
-                    CancelNav, service_name)
+        self.K.current_pose = new_pose
+        self.K.current_velocity = fb.current_velocity
+        self.K.distance_to_goal = fb.distance_to_goal
+        self.K.cross_track_error = fb.cross_track_error
+        self.K.local_state = fb.local_state
+        self.K.waypoint_index = fb.waypoint_index
+        self.K.pose_valid = True
 
-            client = self._cancel_clients[service_name]
-            if client.service_is_ready():
-                req = CancelNav.Request()
-                client.call_async(req)
-                self.get_logger().info(f'Cancel sent to {service_name}')
-            else:
-                self.get_logger().warn(
-                    f'Cancel service {service_name} not available')
+    # ----------------------------------------------------------------------
+    # Analyze
+    # ----------------------------------------------------------------------
+
+    def _analyze_deviation_exceeded(self) -> bool:
+        """True when the robot has drifted beyond the threshold from the path."""
+        if not self.K.pose_valid or self.K.active_path is None:
+            return False
+        if not self.K.active_path.poses:
+            return False
+        px = self.K.current_pose.position.x
+        py = self.K.current_pose.position.y
+        best_sq = math.inf
+        for p in self.K.active_path.poses:
+            dx = p.pose.position.x - px
+            dy = p.pose.position.y - py
+            d2 = dx * dx + dy * dy
+            if d2 < best_sq:
+                best_sq = d2
+        return math.sqrt(best_sq) > self.replan_deviation_m
+
+    async def _analyze_and_replan(self, reason: str) -> bool:
+        self.K.replan_reason = reason
+        self.K.replan_count += 1
+        self.K.nav_state = 'replanning'
+        self.get_logger().info(f'[analyze] replan triggered: {reason}')
+
+        await self._execute_cancel_follow()
+        if not await self._plan_request_new_path(reason):
+            return False
+        return await self._execute_start_follow()
+
+    # ----------------------------------------------------------------------
+    # Plan
+    # ----------------------------------------------------------------------
+
+    async def _plan_request_new_path(self, reason: str) -> bool:
+        self.K.nav_state = 'planning'
+        self._monitor_pose_from_tf()
+
+        snap = await self._plan_get_grid_snapshot()
+        if snap is None:
+            self.get_logger().error('[plan] grid snapshot unavailable')
+            return False
+        self.K.last_grid_stamp = snap.stamp
+
+        client = self._plan_client_for(self.K.global_planner)
+        if not client.wait_for_service(timeout_sec=self.plan_timeout):
+            self.get_logger().error(
+                f'[plan] PlanPath service unavailable for '
+                f'{self.K.global_planner}')
+            return False
+
+        req = PlanPath.Request()
+        req.grid_snapshot = snap.inflated
+        req.start = self._current_pose_stamped()
+        req.goal = self.K.goal
+        req.budget = self.K.global_budget
+        req.timeout = self.plan_timeout
+
+        self.get_logger().info(
+            f'[plan] PlanPath({self.K.global_planner}, reason={reason}) '
+            f'budget={req.budget:.0f} timeout={req.timeout:.1f}s')
+
+        future = client.call_async(req)
+        await future
+        resp = future.result()
+        if resp is None or not resp.success:
+            fr = resp.failure_reason if resp is not None else 'NO_RESPONSE'
+            self.get_logger().error(f'[plan] PlanPath failed: {fr}')
+            return False
+
+        self.K.active_path = resp.path
+        self.K.last_path_stamp = self.get_clock().now().to_msg()
+        self.get_logger().info(
+            f'[plan] path received: {len(resp.path.poses)} poses in '
+            f'{resp.compute_time:.3f}s '
+            f'(nodes_expanded={resp.nodes_expanded}, cached={resp.cached})')
+        return True
+
+    async def _plan_get_grid_snapshot(self):
+        if not self._grid_client.wait_for_service(timeout_sec=self.plan_timeout):
+            return None
+        future = self._grid_client.call_async(GetGridSnapshot.Request())
+        await future
+        return future.result()
+
+    def _plan_client_for(self, name: str):
+        if name not in self._plan_clients:
+            self._plan_clients[name] = self.create_client(
+                PlanPath, f'{self.ns}/{name}/plan_path',
+                callback_group=self._cbg)
+        return self._plan_clients[name]
+
+    # ----------------------------------------------------------------------
+    # Execute
+    # ----------------------------------------------------------------------
+
+    async def _execute_start_follow(self) -> bool:
+        self.K.nav_state = 'following'
+        self.K.follow_terminal = None
+
+        client = self._follow_client_for(self.K.local_planner)
+        if not client.wait_for_server(timeout_sec=self.plan_timeout):
+            self.get_logger().error(
+                f'[execute] FollowPath server unavailable for '
+                f'{self.K.local_planner}')
+            return False
+
+        goal = FollowPath.Goal()
+        goal.reference_path = self.K.active_path or Path()
+        goal.mode = ('stacked' if goal.reference_path.poses
+                     else 'standalone')
+
+        send_future = client.send_goal_async(
+            goal, feedback_callback=self._monitor_follow_feedback)
+        await send_future
+        handle = send_future.result()
+        if handle is None or not handle.accepted:
+            self.get_logger().error('[execute] FollowPath goal rejected')
+            return False
+
+        self._follow_goal_handle = handle
+        handle.get_result_async().add_done_callback(
+            self._execute_follow_result)
+        return True
+
+    def _execute_follow_result(self, future):
+        """Callback invoked when the FollowPath action terminates."""
+        try:
+            result = future.result().result
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().error(f'[execute] FollowPath result error: {e}')
+            self.K.follow_terminal = 'failed'
+            return
+        self.K.follow_terminal = result.terminal_outcome
+        # Prefer the planner's own total_distance if it's non-zero; otherwise
+        # keep the locally-accumulated value from feedback-pose deltas.
+        if result.total_distance > 0.0:
+            self.K.distance_traveled = result.total_distance
+        self.get_logger().info(
+            f'[execute] FollowPath terminal={result.terminal_outcome} '
+            f'distance={result.total_distance:.2f} '
+            f'time={result.total_time:.2f}')
+
+    async def _execute_cancel_follow(self):
+        if self._follow_goal_handle is None:
+            return
+        try:
+            cancel_future = self._follow_goal_handle.cancel_goal_async()
+            await cancel_future
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f'[execute] follow cancel raised: {e}')
+        self._follow_goal_handle = None
+
+    def _follow_client_for(self, name: str):
+        if name not in self._follow_clients:
+            self._follow_clients[name] = ActionClient(
+                self, FollowPath, f'{self.ns}/{name}/follow_path',
+                callback_group=self._cbg)
+        return self._follow_clients[name]
+
+    # ----------------------------------------------------------------------
+    # Feedback / result helpers
+    # ----------------------------------------------------------------------
+
+    def _publish_navigate_feedback(self, goal_handle, elapsed: float):
+        fb = Navigate.Feedback()
+        fb.distance_to_goal = self.K.distance_to_goal
+        fb.distance_traveled = self.K.distance_traveled
+        fb.elapsed_time = elapsed
+        fb.nav_state = self.K.nav_state
+        fb.current_pose = self.K.current_pose
+        fb.current_velocity = self.K.current_velocity
+        goal_handle.publish_feedback(fb)
+
+    def _finalize_result(self, outcome: str, success: bool) -> Navigate.Result:
+        r = Navigate.Result()
+        r.success = success
+        r.terminal_outcome = outcome
+        r.total_distance = self.K.distance_traveled
+        r.total_time = (self._elapsed(self.K.start_time)
+                        if self.K.start_time else 0.0)
+        r.replan_count = self.K.replan_count
+        self.K.nav_state = 'idle'
+        self.get_logger().info(
+            f'[result] outcome={outcome} '
+            f'distance={r.total_distance:.2f} '
+            f'time={r.total_time:.2f} replans={r.replan_count}')
+        return r
+
+    # ----------------------------------------------------------------------
+    # Utilities
+    # ----------------------------------------------------------------------
+
+    def _elapsed(self, start) -> float:
+        if start is None:
+            return 0.0
+        return (self.get_clock().now() - start).nanoseconds / 1e9
+
+    def _current_pose_stamped(self) -> PoseStamped:
+        ps = PoseStamped()
+        ps.header.frame_id = self.map_frame
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose = self.K.current_pose
+        return ps
+
+    def _distance_to_goal(self) -> float:
+        if self.K.goal is None or not self.K.pose_valid:
+            return -1.0
+        dx = self.K.goal.pose.position.x - self.K.current_pose.position.x
+        dy = self.K.goal.pose.position.y - self.K.current_pose.position.y
+        return math.hypot(dx, dy)
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = NavigationServer()
-
     executor = MultiThreadedExecutor()
     executor.add_node(node)
-
     try:
         executor.spin()
     except KeyboardInterrupt:

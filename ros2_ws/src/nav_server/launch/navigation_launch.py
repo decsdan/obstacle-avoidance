@@ -8,7 +8,7 @@ AMCL localization must be running separately to provide the map -> odom
 transform. After launch, send goals via the RViz '2D Goal Pose' tool or
 ``ros2 run nav_server navigate -- --goal X Y``.
 
-Common invocations::
+Common Commands:
 
     # A* + DWA stacked (default)
     ros2 launch nav_server navigation_launch.py map_yaml:=/path/to/map.yaml
@@ -121,17 +121,24 @@ def _launch_setup(context):
         ))
 
     if use_server:
+        server_overrides = [
+            '--ros-args',
+            '-p', f'namespace:={ns}',
+        ]
+        if has_global:
+            server_overrides += [
+                '-p', f'default_global_planner:={global_planner}',
+            ]
+        if has_local:
+            server_overrides += [
+                '-p', f'default_local_planner:={local_planner}',
+            ]
         actions.append(Node(
             package='nav_server',
             executable='navigation_server',
             name='navigation_server',
             parameters=[nav_params],
-            arguments=[
-                '--ros-args',
-                '-p', f'namespace:={ns}',
-                '-p', f'global_planner:={global_planner}',
-                '-p', f'local_planner:={local_planner}',
-            ],
+            arguments=server_overrides,
             output='screen',
         ))
 
@@ -169,10 +176,13 @@ def generate_launch_description():
             description='Robot namespace'),
         DeclareLaunchArgument(
             'global_planner', default_value='a_star',
-            description='Global planner: a_star, d_star, jps, or none'),
+            description=('Global planner: a_star, d_star, jps, rrt_star, fm2, '
+                         'or none (skip global launch)')),
         DeclareLaunchArgument(
             'local_planner', default_value='dwa',
-            description='Local planner: dwa or none'),
+            description=('Local planner: dwa, mppi, rl_policy, or none '
+                         '(skip local launch). nav_server still requires a '
+                         'valid local for the Navigate contract.')),
         DeclareLaunchArgument(
             'rviz', default_value='true',
             description='Launch RViz with auto-configured displays'),
