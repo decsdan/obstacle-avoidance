@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
+# Originally authored by the 2025 Carleton Senior Capstone Project
+# (see AUTHORS.md). Substantially rewritten by Daniel Scheider, 2026.
 """Shared LIDAR obstacle grid node.
 
-Converts LaserScan data to a map-frame OccupancyGrid using Bresenham
-raycasting with temporal decay and EDT inflation. The latest raw and
-inflated grids are both published on topics for visualization and DWA,
-and also served through the ``GetGridSnapshot`` service so the
-navigation server can pull a consistent pair at plan time.
+Maintains a log-odds occupancy grid updated with Amanatides-Woo voxel
+traversal and a Gaussian endpoint-probability inverse sensor model.
+Publishes the raw log-odds grid (probability percent) and a shared
+inflated grid (binary obstacle dilation), and serves the matched pair
+through ``GetGridSnapshot`` so planners see a stamp-stable snapshot.
 """
 
 import math
@@ -14,6 +16,8 @@ import sys
 import numpy as np
 
 import rclpy
+from nav_interfaces.srv import GetGridSnapshot
+from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
@@ -22,33 +26,37 @@ from rclpy.qos import (
     ReliabilityPolicy,
     qos_profile_sensor_data,
 )
-from nav_interfaces.srv import GetGridSnapshot
-from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from tf2_ros import Buffer, TransformListener
 
-from obstacle_grid.raycaster import apply_temporal_decay, inflate_grid, process_scan
+from obstacle_grid import log_odds
+from obstacle_grid.distance_grid import inflate_binary
 
 
 class ObstacleGridNode(Node):
-    """Converts LIDAR scans to a shared obstacle occupancy grid."""
+    """Shared log-odds occupancy grid for global and local planners."""
 
     def __init__(self):
-        _ns = '/don'
+        ns = '/don'
         for i, arg in enumerate(sys.argv):
             if arg.startswith('namespace:='):
-                _ns = arg.split(':=', 1)[1]
-            elif arg == '-p' and i + 1 < len(sys.argv) and sys.argv[i+1].startswith('namespace:='):
-                _ns = sys.argv[i+1].split(':=', 1)[1]
+                ns = arg.split(':=', 1)[1]
+            elif arg == '-p' and i + 1 < len(sys.argv) and \
+                    sys.argv[i + 1].startswith('namespace:='):
+                ns = sys.argv[i + 1].split(':=', 1)[1]
 
-        _user_args = sys.argv[1:]
-        _tf_remaps = ['-r', f'/tf:={_ns}/tf', '-r', f'/tf_static:={_ns}/tf_static']
-        if '--ros-args' in _user_args:
-            _combined = _user_args + _tf_remaps
+        user_args = sys.argv[1:]
+        tf_remaps = ['-r', f'/tf:={ns}/tf', '-r', f'/tf_static:={ns}/tf_static']
+        if '--ros-args' in user_args:
+            combined = user_args + tf_remaps
         else:
-            _combined = _user_args + ['--ros-args'] + _tf_remaps
+            combined = user_args + ['--ros-args'] + tf_remaps
 
-        super().__init__('obstacle_grid_node', cli_args=_combined, use_global_arguments=False)
+        super().__init__(
+            'obstacle_grid_node',
+            cli_args=combined,
+            use_global_arguments=False,
+        )
 
         self.declare_parameter('namespace', '/don')
         self.ns = self.get_parameter('namespace').value
@@ -66,33 +74,49 @@ class ObstacleGridNode(Node):
 
         self.declare_parameter('robot_radius', 0.22)
         self.declare_parameter('safety_clearance', 0.05)
-        self.declare_parameter('obstacle_decay_seconds', 20.0)
         self.declare_parameter('publish_rate', 10.0)
+
+        # Log-odds inverse sensor model
+        self.declare_parameter('l_free', -0.4)
+        self.declare_parameter('l_occ', 0.85)
+        self.declare_parameter('l_clamp', 5.0)
+        self.declare_parameter('sensor_noise_sigma', 0.02)
+        self.declare_parameter('decay_tau_seconds', 30.0)
+        self.declare_parameter('occ_threshold_log_odds', 0.4)
 
         self.max_range = self.get_parameter('max_lidar_range').value
         self.min_range = self.get_parameter('min_lidar_range').value
         self.downsample = self.get_parameter('lidar_downsample').value
-        self.decay_seconds = self.get_parameter('obstacle_decay_seconds').value
         self.publish_rate = self.get_parameter('publish_rate').value
 
         robot_radius = self.get_parameter('robot_radius').value
         safety_clearance = self.get_parameter('safety_clearance').value
         self.resolution = self.get_parameter('grid_resolution').value
-        self.inflation_cells = int((robot_radius + safety_clearance) / self.resolution)
+        self.inflation_cells = int(
+            (robot_radius + safety_clearance) / self.resolution)
 
-        self.grid = None
-        self.last_occupied = None
+        self.l_free = float(self.get_parameter('l_free').value)
+        self.l_occ = float(self.get_parameter('l_occ').value)
+        self.l_clamp = float(self.get_parameter('l_clamp').value)
+        self.sensor_noise_sigma = float(
+            self.get_parameter('sensor_noise_sigma').value)
+        self.decay_tau = float(self.get_parameter('decay_tau_seconds').value)
+        self.occ_threshold = float(
+            self.get_parameter('occ_threshold_log_odds').value)
+
+        self.log_odds = None
         self.grid_width = 0
         self.grid_height = 0
         self.origin_x = 0.0
         self.origin_y = 0.0
         self._grid_initialized = False
+        self._last_update_time = None
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.scan_msg = None
-        self.scan_sub = self.create_subscription(
+        self.create_subscription(
             LaserScan,
             f'{self.ns}/scan',
             self._scan_callback,
@@ -105,9 +129,9 @@ class ObstacleGridNode(Node):
                 reliability=ReliabilityPolicy.RELIABLE,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
                 history=HistoryPolicy.KEEP_LAST,
-                depth=1
+                depth=1,
             )
-            self.map_sub = self.create_subscription(
+            self.create_subscription(
                 OccupancyGrid,
                 f'{self.ns}/map',
                 self._map_callback,
@@ -117,78 +141,64 @@ class ObstacleGridNode(Node):
             self._init_grid_from_params()
 
         self.grid_pub = self.create_publisher(
-            OccupancyGrid,
-            f'{self.ns}/obstacle_grid',
-            10,
-        )
+            OccupancyGrid, f'{self.ns}/obstacle_grid', 10)
         self.raw_grid_pub = self.create_publisher(
-            OccupancyGrid,
-            f'{self.ns}/obstacle_grid_raw',
-            10,
-        )
+            OccupancyGrid, f'{self.ns}/obstacle_grid_raw', 10)
 
-        # Cached latest snapshot for the service. Populated by the update
-        # loop once the grid is initialized and a scan has been ingested.
         self._latest_raw_msg = None
         self._latest_inflated_msg = None
 
-        self.snapshot_srv = self.create_service(
+        self.create_service(
             GetGridSnapshot,
             f'{self.ns}/get_grid_snapshot',
             self._handle_get_snapshot,
         )
 
-        self.update_timer = self.create_timer(1.0 / self.publish_rate, self._update_cycle)
+        self.create_timer(1.0 / self.publish_rate, self._update_cycle)
 
         self.get_logger().info(
-            f'obstacle_grid initialized | ns={self.ns} res={self.resolution}m '
-            f'inflation={self.inflation_cells}cells decay={self.decay_seconds}s')
+            f'obstacle_grid (log-odds) ready | ns={self.ns} '
+            f'res={self.resolution}m inflation={self.inflation_cells}cells '
+            f'l_free={self.l_free} l_occ={self.l_occ} '
+            f'sigma={self.sensor_noise_sigma}m tau={self.decay_tau}s')
 
     def _init_grid_from_params(self):
-        """Initialize grid from ROS parameters when no SLAM map is available."""
+        """Allocate the log-odds grid from launch parameters (no SLAM map)."""
         self.grid_width = self.get_parameter('grid_width').value
         self.grid_height = self.get_parameter('grid_height').value
         self.resolution = self.get_parameter('grid_resolution').value
         self.origin_x = self.get_parameter('grid_origin_x').value
         self.origin_y = self.get_parameter('grid_origin_y').value
-
-        self.grid = np.zeros((self.grid_height, self.grid_width), dtype=np.int8)
-        self.last_occupied = np.zeros((self.grid_height, self.grid_width), dtype=np.float64)
-        self._grid_initialized = True
-        self.get_logger().info(
-            f'Grid from params: {self.grid_width}x{self.grid_height} '
-            f'res={self.resolution}m origin=({self.origin_x:.2f}, {self.origin_y:.2f})')
+        self._allocate_grid()
 
     def _map_callback(self, msg: OccupancyGrid):
-        """One-shot callback to grab SLAM map dimensions."""
+        """One-shot adopt the SLAM map's dimensions and origin."""
         if self._slam_initialized:
             return
-
         self._slam_initialized = True
         self.grid_width = msg.info.width
         self.grid_height = msg.info.height
         self.resolution = msg.info.resolution
         self.origin_x = msg.info.origin.position.x
         self.origin_y = msg.info.origin.position.y
-
-        self.grid = np.zeros((self.grid_height, self.grid_width), dtype=np.int8)
-        self.last_occupied = np.zeros((self.grid_height, self.grid_width), dtype=np.float64)
-        self._grid_initialized = True
-
         self.inflation_cells = int(
             (self.get_parameter('robot_radius').value +
              self.get_parameter('safety_clearance').value) / self.resolution)
-
+        self._allocate_grid()
         self.get_logger().info(
-            f'Grid from SLAM map: {self.grid_width}x{self.grid_height} '
+            f'Adopted SLAM map dims: {self.grid_width}x{self.grid_height} '
             f'res={self.resolution}m inflation={self.inflation_cells}cells')
 
+    def _allocate_grid(self):
+        self.log_odds = np.zeros(
+            (self.grid_height, self.grid_width), dtype=np.float32)
+        self._grid_initialized = True
+
     def _scan_callback(self, msg: LaserScan):
-        """Store latest scan for processing."""
         self.scan_msg = msg
 
     def _update_cycle(self):
-        """Process latest scan, update grid, publish."""
+        """Apply latest scan, decay, threshold + inflate, publish."""
         if not self._grid_initialized or self.scan_msg is None:
             return
 
@@ -207,67 +217,62 @@ class ObstacleGridNode(Node):
             1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
         ranges = np.array(self.scan_msg.ranges)[::self.downsample]
-        angles = np.linspace(
+        beam_angles = np.linspace(
             self.scan_msg.angle_min,
             self.scan_msg.angle_max,
-            len(self.scan_msg.ranges)
+            len(self.scan_msg.ranges),
         )[::self.downsample]
+        world_angles = beam_angles + sensor_yaw
 
-        current_time = self.get_clock().now().nanoseconds / 1e9
+        now = self.get_clock().now().nanoseconds / 1e9
+        if self._last_update_time is not None:
+            log_odds.decay(
+                self.log_odds, now - self._last_update_time, self.decay_tau)
+        self._last_update_time = now
 
-        process_scan(
-            self.grid,
-            self.last_occupied,
+        log_odds.apply_scan(
+            self.log_odds,
             ranges,
-            angles,
+            world_angles,
             sensor_x,
             sensor_y,
-            sensor_yaw,
             self.origin_x,
             self.origin_y,
             self.resolution,
             self.max_range,
             self.min_range,
-            current_time,
+            self.l_free,
+            self.l_occ,
+            self.l_clamp,
+            self.sensor_noise_sigma,
         )
 
-        apply_temporal_decay(
-            self.grid,
-            self.last_occupied,
-            current_time,
-            self.decay_seconds,
-        )
-
-        inflated = inflate_grid(self.grid, self.inflation_cells)
+        raw = log_odds.to_occupancy_raw(self.log_odds)
+        binary = log_odds.to_occupancy_binary(self.log_odds, self.occ_threshold)
+        inflated = inflate_binary(binary, self.inflation_cells)
 
         stamp = self.get_clock().now().to_msg()
-        raw_msg = self._build_grid_msg(self.grid, stamp)
-        inflated_msg = self._build_grid_msg(inflated, stamp)
-
-        self._latest_raw_msg = raw_msg
-        self._latest_inflated_msg = inflated_msg
-
-        self.raw_grid_pub.publish(raw_msg)
-        self.grid_pub.publish(inflated_msg)
+        self._latest_raw_msg = self._build_grid_msg(raw, stamp)
+        self._latest_inflated_msg = self._build_grid_msg(inflated, stamp)
+        self.raw_grid_pub.publish(self._latest_raw_msg)
+        self.grid_pub.publish(self._latest_inflated_msg)
 
     def _build_grid_msg(self, grid_data: np.ndarray, stamp) -> OccupancyGrid:
-        """Package a grid array as an ``OccupancyGrid`` in the map frame."""
+        """Wrap a 2D int8 grid as an ``OccupancyGrid`` in the map frame."""
         msg = OccupancyGrid()
         msg.header.stamp = stamp
         msg.header.frame_id = 'map'
-
         msg.info.resolution = self.resolution
         msg.info.width = self.grid_width
         msg.info.height = self.grid_height
         msg.info.origin.position.x = self.origin_x
         msg.info.origin.position.y = self.origin_y
         msg.info.origin.position.z = 0.0
-
         msg.data = grid_data.flatten().tolist()
         return msg
 
     def _handle_get_snapshot(self, _request, response):
-        """Return the latest raw/inflated pair, or empty grids if none yet."""
+        """Return the latest raw + inflated pair, or empty grids if none yet."""
         if self._latest_raw_msg is None or self._latest_inflated_msg is None:
             stamp = self.get_clock().now().to_msg()
             response.raw = OccupancyGrid()
@@ -278,7 +283,7 @@ class ObstacleGridNode(Node):
             response.inflated.header.frame_id = 'map'
             response.stamp = stamp
             self.get_logger().warn(
-                'GetGridSnapshot called before first scan, returning empty grids')
+                'GetGridSnapshot called before first scan; returning empty grids')
             return response
 
         response.raw = self._latest_raw_msg

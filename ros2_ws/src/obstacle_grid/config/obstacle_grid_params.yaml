@@ -17,8 +17,13 @@ obstacle_grid_node:
     robot_radius: 0.22
     safety_clearance: 0.05
 
-    # Temporal decay: unobserved obstacles clear after this many seconds
-    obstacle_decay_seconds: 2.5
-
     # Publishing rate (Hz)
     publish_rate: 10.0
+
+    # Log-odds inverse sensor model
+    l_free: -0.4
+    l_occ: 0.85
+    l_clamp: 5.0
+    sensor_noise_sigma: 0.02
+    decay_tau_seconds: 30.0
+    occ_threshold_log_odds: 0.4
