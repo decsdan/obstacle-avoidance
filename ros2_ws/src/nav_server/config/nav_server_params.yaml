@@ -17,6 +17,6 @@ navigation_server:
     # Replan policy. Determinism requires periodic replans be OFF
     # for canonical data-collection runs; triggers must be functions of grid
     # snapshot + path, not wall-clock.
-    replan_on_path_blocked: true
+    replan_on_local_block: true      # triggers on follower stuck or path_blocked
     replan_deviation_threshold: 0.5  # meters from nearest path point
     replan_period_sec: 0.0           # 0 = off; enable only for debugging

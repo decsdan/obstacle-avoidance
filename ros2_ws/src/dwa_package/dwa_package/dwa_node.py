@@ -287,16 +287,20 @@ class DWAFollower(Node):
                                           f'dist={distance_traveled:.2f} m')
 
             # Front-cone e-stop: hold until clear, or give up after stuck_timeout.
+            # Terminal is 'stuck' -- the local planner cannot make forward
+            # progress through the immediate geometry. The global path may
+            # still be valid, which is the orchestrator's cue to replan.
             if not self._front_cone_clear():
                 self._publish_stop()
                 if stuck_since is None:
                     stuck_since = time.monotonic()
                 stuck_for = time.monotonic() - stuck_since
                 if stuck_for > self.stuck_timeout:
-                    return self._finalize(goal_handle, 'path_blocked',
+                    return self._finalize(goal_handle, 'stuck',
                                           distance=distance_traveled,
                                           elapsed=time.monotonic() - start_time,
-                                          log=f'stuck for {stuck_for:.1f}s')
+                                          log=f'front-cone blocked '
+                                              f'{stuck_for:.1f}s')
                 self._publish_feedback(
                     goal_handle, curr_x, curr_y, curr_theta, 0.0, 0.0,
                     dist_to_goal, path_pts, state='stuck',
@@ -323,6 +327,11 @@ class DWAFollower(Node):
             self._publish_trajectory_markers(trajectories, scores, best_idx)
 
             if scores[best_idx] == -np.inf:
+                # Dynamic-window exhaustion: every sampled velocity would
+                # hit an obstacle. Semantically the same as the front-cone
+                # case -- local planner cannot proceed -- so terminal is
+                # 'stuck'. Feedback state still uses path_blocked to give
+                # observers a finer-grained view of *why* we're stuck.
                 blocked_tick_count += 1
                 self._publish_stop()
                 self._publish_feedback(
@@ -331,7 +340,7 @@ class DWAFollower(Node):
                     waypoint_index=-1)
                 if blocked_tick_count >= self.blocked_ticks_to_abort:
                     return self._finalize(
-                        goal_handle, 'path_blocked',
+                        goal_handle, 'stuck',
                         distance=distance_traveled,
                         elapsed=time.monotonic() - start_time,
                         log=f'no viable trajectories for '

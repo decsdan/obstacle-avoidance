@@ -2,7 +2,7 @@
 nav_msgs/Path reference_path            # Required; empty paths are rejected
 ---
 # Result
-string terminal_outcome                 # "reached" | "path_blocked" | "cancelled" | "failed"
+string terminal_outcome                 # "reached" | "stuck" | "path_blocked" | "collision" | "cancelled" | "failed"
 float64 total_distance                  # Meters traveled during this action
 float64 total_time                      # Seconds elapsed
 ---
@@ -11,5 +11,5 @@ geometry_msgs/Pose current_pose         # Map frame
 geometry_msgs/Twist current_velocity    # Body frame
 float64 distance_to_goal                # Meters to path endpoint
 float64 cross_track_error               # Meters from nearest path point
-string local_state                      # "running" | "path_blocked" | "stuck"
+string local_state                      # "running" | "stuck" | "path_blocked"
 int32 waypoint_index                    # Current tracking index; -1 when no path

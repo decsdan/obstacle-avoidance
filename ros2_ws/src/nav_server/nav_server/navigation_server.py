@@ -72,17 +72,29 @@ class NavKnowledge:
     distance_to_goal: float = -1.0
     distance_traveled: float = 0.0
     cross_track_error: float = 0.0
-    local_state: str = ''  # mirrors FollowPath feedback: running|path_blocked|stuck
+    local_state: str = ''  # mirrors FollowPath feedback: running|stuck|path_blocked
     waypoint_index: int = -1
 
     # Orchestrator state machine; values restricted to the Navigate feedback
-    # enum (planning | following | replanning | recovering).
+    # enum (planning | following | replanning | stuck | collision).
     nav_state: str = 'planning'
     replan_count: int = 0
     replan_reason: str = ''
 
     # Terminal outcome from the FollowPath action, set by its result callback
     follow_terminal: Optional[str] = None
+
+    # Plan failure classification from the most recent PlanPath attempt.
+    # Empty on success; 'NO_PATH' | 'TIMEOUT' | 'BAD_INPUT' | 'INFRASTRUCTURE'
+    # on failure. Used to pick between terminal 'path_blocked' vs 'failed'.
+    last_plan_failure: str = ''
+
+    # Pluggable condition-detector flags. Hardcoded detectors publish on
+    # /{ns}/conditions/{stuck,collision}; a learned detector swaps in on
+    # the same topics. nav_server propagates these into nav_state and
+    # terminal_outcome.
+    stuck_detected: bool = False
+    collision_detected: bool = False
 
     # Safety mux latched flag; any transition to True forces an abort
     safety_latched: bool = False
@@ -109,7 +121,10 @@ class NavigationServer(Node):
         self.declare_parameter('plan_timeout', 5.0)
         self.declare_parameter('plan_budget_default', 0.0)
         self.declare_parameter('feedback_hz', 10.0)
-        self.declare_parameter('replan_on_path_blocked', True)
+        # Replan when the local planner reports stuck or path_blocked.
+        # Either outcome means the current reference path is unusable; the
+        # orchestrator tries a new global plan before giving up.
+        self.declare_parameter('replan_on_local_block', True)
         self.declare_parameter('replan_deviation_threshold', 0.5)
         # Periodic replanning is OFF by default; replan decisions must be
         # deterministic functions of grid/path, not wall-clock timers.
@@ -125,7 +140,7 @@ class NavigationServer(Node):
         self.plan_timeout = float(p('plan_timeout').value)
         self.plan_budget_default = float(p('plan_budget_default').value)
         self.feedback_period = 1.0 / float(p('feedback_hz').value)
-        self.replan_on_path_blocked = bool(p('replan_on_path_blocked').value)
+        self.replan_on_local_block = bool(p('replan_on_local_block').value)
         self.replan_deviation_m = float(p('replan_deviation_threshold').value)
         self.replan_period_sec = float(p('replan_period_sec').value)
 
@@ -154,8 +169,15 @@ class NavigationServer(Node):
             callback_group=self._cbg)
 
         # ------------------------------------------------------------------
-        # Safety mux latch subscription -- observe-only; the mux owns the
-        # cmd_vel override path directly and does not depend on this node.
+        # Safety mux latch + pluggable condition detectors.
+        #
+        # safety/latched is observe-only; the mux owns the cmd_vel override
+        # path directly and does not depend on this node.
+        #
+        # conditions/{stuck,collision} are the typed condition signals.
+        # Hardcoded detectors publish them in v2.0; a learned detector can
+        # swap in on the same topics for a like-for-like comparison. This
+        # is the first pluggable managing-system slot.
         # ------------------------------------------------------------------
         latched_qos = QoSProfile(
             depth=1,
@@ -166,6 +188,14 @@ class NavigationServer(Node):
         self._safety_sub = self.create_subscription(
             Bool, f'{self.ns}/safety/latched',
             self._monitor_safety_latched, latched_qos,
+            callback_group=self._cbg)
+        self._collision_sub = self.create_subscription(
+            Bool, f'{self.ns}/conditions/collision',
+            self._monitor_collision, latched_qos,
+            callback_group=self._cbg)
+        self._stuck_sub = self.create_subscription(
+            Bool, f'{self.ns}/conditions/stuck',
+            self._monitor_stuck, latched_qos,
             callback_group=self._cbg)
 
         # ------------------------------------------------------------------
@@ -293,7 +323,8 @@ class NavigationServer(Node):
         # Plan once up front; replan is driven by analyze-phase triggers.
         if not await self._plan_request_new_path('initial'):
             goal_handle.abort()
-            return self._finalize_result('failed', success=False)
+            return self._finalize_result(
+                self._plan_failure_terminal(), success=False)
 
         if not await self._execute_start_follow():
             goal_handle.abort()
@@ -312,6 +343,17 @@ class NavigationServer(Node):
                 goal_handle.abort()
                 return self._finalize_result('timeout', success=False)
 
+            # Collision takes precedence over every other non-terminal state;
+            # the condition detector fired, abort immediately.
+            if self.K.collision_detected:
+                self.K.nav_state = 'collision'
+                await self._execute_cancel_follow()
+                goal_handle.abort()
+                return self._finalize_result('collision', success=False)
+
+            # Any non-collision safety latch (e.g. sensor-stale watchdog) is
+            # treated as an infrastructure failure -- we don't know why the
+            # mux latched, only that cmd_vel is overridden.
             if self.K.safety_latched:
                 await self._execute_cancel_follow()
                 goal_handle.abort()
@@ -333,11 +375,24 @@ class NavigationServer(Node):
                     goal_handle.succeed()
                     return self._finalize_result('reached', success=True)
 
-                if outcome == 'path_blocked' and self.replan_on_path_blocked:
-                    if await self._analyze_and_replan('path_blocked'):
-                        continue
+                # Collision from the follower is terminal immediately; no
+                # replan will save us from physical contact.
+                if outcome == 'collision':
                     goal_handle.abort()
-                    return self._finalize_result('failed', success=False)
+                    return self._finalize_result('collision', success=False)
+
+                # Stuck or path_blocked: replan if allowed. If replan fails
+                # the routing is genuinely impossible, so we surface
+                # path_blocked as the compounding terminal.
+                if outcome in ('stuck', 'path_blocked'):
+                    if self.replan_on_local_block:
+                        if await self._analyze_and_replan(outcome):
+                            continue
+                        goal_handle.abort()
+                        return self._finalize_result(
+                            self._plan_failure_terminal(), success=False)
+                    goal_handle.abort()
+                    return self._finalize_result(outcome, success=False)
 
                 # cancelled or failed from the local planner itself
                 goal_handle.abort()
@@ -384,6 +439,16 @@ class NavigationServer(Node):
         if self.K.safety_latched and not was_latched:
             self.get_logger().warn(
                 '[monitor] safety mux latched -- aborting active Navigate goal')
+
+    def _monitor_collision(self, msg: Bool):
+        """Condition-detector signal: robot in contact or cliff triggered."""
+        self.K.collision_detected = bool(msg.data)
+        if self.K.collision_detected:
+            self.get_logger().warn('[monitor] collision detected')
+
+    def _monitor_stuck(self, msg: Bool):
+        """Condition-detector signal: robot failing to make forward progress."""
+        self.K.stuck_detected = bool(msg.data)
 
     def _monitor_follow_feedback(self, feedback_msg):
         fb = feedback_msg.feedback
@@ -445,12 +510,14 @@ class NavigationServer(Node):
 
         snap = await self._plan_get_grid_snapshot()
         if snap is None:
+            self.K.last_plan_failure = 'INFRASTRUCTURE'
             self.get_logger().error('[plan] grid snapshot unavailable')
             return False
         self.K.last_grid_stamp = snap.stamp
 
         client = self._plan_client_for(self.K.global_planner)
         if not client.wait_for_service(timeout_sec=self.plan_timeout):
+            self.K.last_plan_failure = 'INFRASTRUCTURE'
             self.get_logger().error(
                 f'[plan] PlanPath service unavailable for '
                 f'{self.K.global_planner}')
@@ -470,11 +537,17 @@ class NavigationServer(Node):
         future = client.call_async(req)
         await future
         resp = future.result()
-        if resp is None or not resp.success:
-            fr = resp.failure_reason if resp is not None else 'NO_RESPONSE'
-            self.get_logger().error(f'[plan] PlanPath failed: {fr}')
+        if resp is None:
+            self.K.last_plan_failure = 'INFRASTRUCTURE'
+            self.get_logger().error('[plan] PlanPath returned no response')
+            return False
+        if not resp.success:
+            self.K.last_plan_failure = resp.failure_reason or 'NO_PATH'
+            self.get_logger().error(
+                f'[plan] PlanPath failed: {self.K.last_plan_failure}')
             return False
 
+        self.K.last_plan_failure = ''
         self.K.active_path = resp.path
         self.K.last_path_stamp = self.get_clock().now().to_msg()
         self._active_path_pub.publish(resp.path)
@@ -483,6 +556,18 @@ class NavigationServer(Node):
             f'{resp.compute_time:.3f}s '
             f'(nodes_expanded={resp.nodes_expanded}, cached={resp.cached})')
         return True
+
+    def _plan_failure_terminal(self) -> str:
+        """Map the most recent PlanPath failure reason to a Navigate terminal.
+
+        NO_PATH and TIMEOUT both mean "no route within the planner's budget";
+        surface as ``path_blocked`` so the RL reward can treat them as
+        routing-impossible. BAD_INPUT and INFRASTRUCTURE are stack faults,
+        not policy-attributable, so they surface as ``failed``.
+        """
+        if self.K.last_plan_failure in ('NO_PATH', 'TIMEOUT'):
+            return 'path_blocked'
+        return 'failed'
 
     async def _plan_get_grid_snapshot(self):
         if not self._grid_client.wait_for_service(timeout_sec=self.plan_timeout):

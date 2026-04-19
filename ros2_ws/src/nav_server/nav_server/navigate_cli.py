@@ -111,9 +111,11 @@ class NavigateCLI(Node):
 
         labels = {
             'reached': 'SUCCESS',
-            'cancelled': 'CANCELLED',
-            'timeout': 'TIMEOUT',
+            'stuck': 'STUCK',
+            'collision': 'COLLISION',
             'path_blocked': 'PATH BLOCKED',
+            'timeout': 'TIMEOUT',
+            'cancelled': 'CANCELLED',
             'failed': 'FAILED',
         }
         label = labels.get(result.terminal_outcome,

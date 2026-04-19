@@ -7,7 +7,7 @@ string scenario_id                      # Optional; correlates the run with a sc
 ---
 # Result
 bool success
-string terminal_outcome                 # "reached" | "path_blocked" | "timeout" | "cancelled" | "failed"
+string terminal_outcome                 # "reached" | "stuck" | "path_blocked" | "collision" | "timeout" | "cancelled" | "failed"
 float64 total_distance
 float64 total_time
 uint32 replan_count
@@ -16,6 +16,6 @@ uint32 replan_count
 float64 distance_to_goal
 float64 distance_traveled
 float64 elapsed_time
-string nav_state                        # "planning" | "following" | "replanning" | "recovering"
+string nav_state                        # "planning" | "following" | "replanning" | "stuck" | "collision"
 geometry_msgs/Pose current_pose
 geometry_msgs/Twist current_velocity
