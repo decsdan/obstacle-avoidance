@@ -259,7 +259,8 @@ string scenario_id           # Optional; correlates the run with a scenario reco
 ---
 # Result
 bool success
-string terminal_outcome      # "reached" | "path_blocked" | "timeout" | "cancelled" | "failed"
+string terminal_outcome      # "reached" | "stuck" | "path_blocked" | "collision"
+                             # | "timeout" | "cancelled" | "failed"
 float64 total_distance
 float64 total_time
 uint32 replan_count
@@ -268,7 +269,7 @@ uint32 replan_count
 float64 distance_to_goal
 float64 distance_traveled
 float64 elapsed_time
-string nav_state             # "planning" | "following" | "replanning" | "recovering"
+string nav_state             # "planning" | "following" | "replanning" | "stuck" | "collision"
 geometry_msgs/Pose current_pose
 geometry_msgs/Twist current_velocity
 ```
@@ -297,7 +298,7 @@ Action server, CLI, RViz config generator, launch file.
 | `navigation_timeout` | `300.0` | Max Navigate duration (s); 0 disables |
 | `plan_timeout` | `5.0` | PlanPath `wait_for_service` timeout (s) |
 | `feedback_hz` | `10.0` | Navigate feedback rate |
-| `replan_on_path_blocked` | `true` | Replan when DWA reports path_blocked |
+| `replan_on_local_block` | `true` | Replan when the follower returns `stuck` or `path_blocked` |
 | `replan_deviation_threshold` | `0.5` | Meters from nearest path point before replan |
 | `replan_period_sec` | `0.0` | Periodic replan interval (s); 0 = off |
 
