@@ -108,7 +108,7 @@ class DWAFollower(Node):
         self.declare_parameter('namespace', DWAConstants.DEFAULT_NAMESPACE)
         self.declare_parameter('lookahead', 0.85)
 
-        self.declare_parameter('max_velocity', 0.4)
+        self.declare_parameter('max_velocity', 0.31)
         self.declare_parameter('min_velocity', 0.0)
         self.declare_parameter('max_angular_velocity', 1.8)
         self.declare_parameter('min_angular_velocity', -1.8)

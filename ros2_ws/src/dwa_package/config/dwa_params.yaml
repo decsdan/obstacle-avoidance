@@ -6,7 +6,7 @@ dwa_follower:
     namespace: /don
     lookahead: 0.85
 
-    max_velocity: 0.4
+    max_velocity: 0.31
     min_velocity: 0.0
     max_angular_velocity: 1.8
     min_angular_velocity: -1.8
