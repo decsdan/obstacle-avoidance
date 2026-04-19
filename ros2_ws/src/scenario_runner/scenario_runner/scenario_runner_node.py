@@ -36,7 +36,13 @@ from rclpy.qos import (
 )
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool
-from tf2_ros import Buffer, TransformListener
+from tf2_ros import (
+    Buffer,
+    ConnectivityException,
+    ExtrapolationException,
+    LookupException,
+    TransformListener,
+)
 
 from scenario_runner.episode import Episode, EpisodePaths, pose_from_transform
 from scenario_runner.dataset_writer import TickRecord
@@ -423,7 +429,7 @@ class ScenarioRunnerNode(Node):
         try:
             tf = self.tf_buffer.lookup_transform(
                 'map', 'base_link', rclpy.time.Time())
-        except Exception:
+        except (LookupException, ConnectivityException, ExtrapolationException):
             return None
         return pose_from_transform(tf.transform.translation, tf.transform.rotation)
 

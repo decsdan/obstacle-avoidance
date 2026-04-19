@@ -27,7 +27,13 @@ from rclpy.qos import (
     qos_profile_sensor_data,
 )
 from sensor_msgs.msg import LaserScan
-from tf2_ros import Buffer, TransformListener
+from tf2_ros import (
+    Buffer,
+    ConnectivityException,
+    ExtrapolationException,
+    LookupException,
+    TransformListener,
+)
 
 from obstacle_grid import log_odds
 from obstacle_grid.distance_grid import inflate_binary
@@ -206,7 +212,7 @@ class ObstacleGridNode(Node):
         try:
             tf = self.tf_buffer.lookup_transform(
                 'map', sensor_frame, rclpy.time.Time())
-        except Exception:
+        except (LookupException, ConnectivityException, ExtrapolationException):
             return
 
         sensor_x = tf.transform.translation.x

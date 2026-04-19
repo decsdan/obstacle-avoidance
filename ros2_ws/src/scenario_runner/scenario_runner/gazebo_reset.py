@@ -10,6 +10,7 @@ Relaunch-on-drift fallback is handled at the runner level, not here;
 this module only exposes the service-based reset.
 """
 
+import math
 from typing import Optional
 
 import rclpy
@@ -65,8 +66,8 @@ class GazeboResetClient:
         req.pose.position.z = 0.0
         # 2D yaw -> quaternion (z, w)
         half = 0.5 * float(theta)
-        req.pose.orientation.z = float(__import__('math').sin(half))
-        req.pose.orientation.w = float(__import__('math').cos(half))
+        req.pose.orientation.z = float(math.sin(half))
+        req.pose.orientation.w = float(math.cos(half))
         future = self._pose_cli.call_async(req)
         return self._spin_future(future, timeout_sec)
 

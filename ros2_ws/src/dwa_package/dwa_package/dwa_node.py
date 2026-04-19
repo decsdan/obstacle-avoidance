@@ -30,7 +30,13 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import ColorRGBA
-from tf2_ros import Buffer, TransformListener
+from tf2_ros import (
+    Buffer,
+    ConnectivityException,
+    ExtrapolationException,
+    LookupException,
+    TransformListener,
+)
 from visualization_msgs.msg import Marker
 
 
@@ -447,7 +453,7 @@ class DWAFollower(Node):
             y = tf.transform.translation.y
             theta = _yaw(tf.transform.rotation)
             return (x, y, theta)
-        except Exception:
+        except (LookupException, ConnectivityException, ExtrapolationException):
             return None
 
     def _front_cone_clear(self):

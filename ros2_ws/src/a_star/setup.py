@@ -28,8 +28,6 @@ setup(
     entry_points={
         'console_scripts': [
             'a_star_nav = a_star.a_star_nav:main',
-            'odom = a_star.odom_subscriber:main',
-            'visualizer = a_star.visualizer:main',
         ],
     },
 )
