@@ -1,0 +1,14 @@
+safety_mux:
+  ros__parameters:
+    # Override namespace at launch-arg time
+    namespace: /don
+
+    # Seconds without a /scan or /odom message before latching
+    stale_timeout: 0.5
+
+    # Rate at which zero-twist is republished while latched; keeps the
+    # override alive for downstream consumers with BEST_EFFORT QoS
+    publish_zero_hz: 20.0
+
+    # Most locals (DWA) publish TwistStamped. Toggle for plain Twist sources.
+    input_is_stamped: true
