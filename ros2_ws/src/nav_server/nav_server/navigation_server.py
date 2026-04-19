@@ -617,11 +617,20 @@ class NavigationServer(Node):
     def _execute_follow_result(self, future):
         """Callback invoked when the FollowPath action terminates."""
         try:
-            result = future.result().result
-        except Exception as e:  # noqa: BLE001
+            wrapper = future.result()
+        except Exception as e:
+            # RCLError (DDS transport failure) or AttributeError (null
+            # result during shutdown); both are terminal, handle the same.
             self.get_logger().error(f'[execute] FollowPath result error: {e}')
             self.K.follow_terminal = 'failed'
             return
+
+        if wrapper is None or wrapper.result is None:
+            self.get_logger().error('[execute] FollowPath returned no result')
+            self.K.follow_terminal = 'failed'
+            return
+
+        result = wrapper.result
         self.K.follow_terminal = result.terminal_outcome
         # Prefer the planner's own total_distance if it's non-zero; otherwise
         # keep the locally-accumulated value from feedback-pose deltas.
@@ -638,7 +647,9 @@ class NavigationServer(Node):
         try:
             cancel_future = self._follow_goal_handle.cancel_goal_async()
             await cancel_future
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
+            # RCLError (server unreachable) or CancelledError (shutdown);
+            # both mean we can't cancel cleanly, so log and continue.
             self.get_logger().warn(f'[execute] follow cancel raised: {e}')
         self._follow_goal_handle = None
 

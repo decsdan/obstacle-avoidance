@@ -28,7 +28,6 @@ setup(
     entry_points={
         'console_scripts': [
             'd_star_nav = d_star.d_star_nav:main',
-            'live_visualizer = d_star.live_visualizer:main',
         ],
     },
 )
