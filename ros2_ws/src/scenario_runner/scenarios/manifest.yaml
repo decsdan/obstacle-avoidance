@@ -1,0 +1,6 @@
+version: 1
+scenarios:
+  - id: indoor_basic_01
+  - id: indoor_basic_01
+    repeat: 3
+    seed_offset: 1000

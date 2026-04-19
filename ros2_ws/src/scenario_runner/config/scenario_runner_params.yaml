@@ -1,0 +1,18 @@
+scenario_runner:
+  ros__parameters:
+    namespace: /don
+
+    # Control cycle rate for per-tick dataset capture; matches nav_server
+    tick_hz: 10.0
+
+    # Repository root used for commit-SHA capture in episode metadata
+    repo_root: ""
+
+    # Empty = read from installed package share; override to point at a
+    # checked-in scenarios directory during development
+    scenarios_dir: ""
+
+    # service = Gazebo reset_world + set_pose; relaunch = kill and respawn
+    reset_mode: service
+    gazebo_world_name: default
+    entity_name: turtlebot4
