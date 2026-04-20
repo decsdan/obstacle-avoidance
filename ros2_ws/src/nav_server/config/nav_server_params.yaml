@@ -1,0 +1,22 @@
+# Navigation server parameters (nav_server v2.0, call/response orchestrator).
+navigation_server:
+  ros__parameters:
+    namespace: /don
+    map_frame: map
+    base_frame: base_link
+
+    default_global_planner: a_star   # a_star|d_star|jps
+    default_local_planner: dwa       # dwa
+
+    navigation_timeout: 300.0        # seconds; 0 = no timeout
+    plan_timeout: 5.0                # seconds for PlanPath wait_for_service
+    plan_budget_default: 0.0         # 0 = planner picks its default
+
+    feedback_hz: 10.0                # Navigate feedback publish rate
+
+    # Replan policy. Determinism requires periodic replans be OFF
+    # for canonical data-collection runs; triggers must be functions of grid
+    # snapshot + path, not wall-clock.
+    replan_on_local_block: true      # triggers on follower stuck or path_blocked
+    replan_deviation_threshold: 0.5  # meters from nearest path point
+    replan_period_sec: 0.0           # 0 = off; enable only for debugging

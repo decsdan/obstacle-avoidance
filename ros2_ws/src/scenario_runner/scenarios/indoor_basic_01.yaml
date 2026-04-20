@@ -1,0 +1,36 @@
+id: indoor_basic_01
+world: W1_indoor_office
+seed: 42
+description: "Short hallway, one static obstacle mid-path"
+
+start_pose:
+  x: 0.0
+  y: 0.0
+  theta: 0.0
+
+goal_pose:
+  x: 3.5
+  y: 1.2
+  theta: 0.0
+
+strategy:
+  global: a_star
+  local: dwa
+
+termination:
+  goal_tolerance: 0.2
+  timeout_sec: 120.0
+  stuck_window_sec: 10.0
+  stuck_distance_m: 0.05
+
+randomization:
+  lidar_range_sigma: 0.01
+  lidar_dropout_rate: 0.0
+  odom_linear_sigma: 0.005
+  odom_angular_sigma: 0.01
+
+logging:
+  include_raw_scan: true
+  include_tf_tree: true
+  include_debug_markers: true
+  downsample_hz: null

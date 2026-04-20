@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>scenario_runner</name>
+  <version>2.0.0</version>
+  <description>Episode lifecycle driver and dataset writer. Reads scenario YAMLs, resets Gazebo, dispatches Navigate goals, detects terminals, and writes matched rosbag2 + HDF5 sidecar artifacts per episode.</description>
+  <maintainer email="scheiderd@carleton.edu">daniel</maintainer>
+  <license></license>
+
+  <depend>geometry_msgs</depend>
+  <depend>nav_interfaces</depend>
+  <depend>nav_msgs</depend>
+  <depend>rclpy</depend>
+  <depend>rosbag2_py</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2_ros</depend>
+
+  <exec_depend>python3-h5py</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

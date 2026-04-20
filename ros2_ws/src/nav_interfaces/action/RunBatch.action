@@ -1,0 +1,18 @@
+# Goal
+string manifest_path                    # Path to scenarios/manifest.yaml
+string output_dir                       # Root directory for episode artifacts
+uint32 start_index                      # Resume from the Nth scenario; 0 to start fresh
+bool stop_on_first_failure              # Debug mode
+---
+# Result
+uint32 episodes_run
+uint32 episodes_reached
+uint32 episodes_collision
+uint32 episodes_timeout
+uint32 episodes_stuck
+string output_dir                       # Echoed from the goal for downstream indexing
+---
+# Feedback
+uint32 current_index
+string current_scenario_id
+string current_outcome                  # Empty until the current episode completes

@@ -1,0 +1,10 @@
+# Parameters for the a_star PlanPath service node.
+# Loaded by nav_server/launch/navigation_launch.py when global_planner=a_star.
+
+a_star_planner:
+  ros__parameters:
+    namespace: /don
+    max_search_nodes: 100000
+    simplification_epsilon: 0.1
+    max_path_waypoints: 50
+    tight_space_radius: 5

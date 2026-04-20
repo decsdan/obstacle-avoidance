@@ -1,0 +1,11 @@
+# Parameters for the jps PlanPath service node.
+# Loaded by nav_server/launch/navigation_launch.py when global_planner=jps.
+
+jps_planner:
+  ros__parameters:
+    namespace: /don
+    max_path_waypoints: 50
+    tight_space_radius: 5
+    simplification_epsilon: 0.1
+    max_jump_depth: 500
+    max_search_nodes: 100000

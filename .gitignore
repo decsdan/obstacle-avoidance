@@ -11,5 +11,6 @@
 **/install/
 **/log/
 
-#
-.claude
+# Python bytecode caches
+**/__pycache__/
+*.pyc

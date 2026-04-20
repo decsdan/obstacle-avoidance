@@ -1,0 +1,9 @@
+# Parameters for the d_star PlanPath service node.
+# Loaded by nav_server/launch/navigation_launch.py when global_planner=d_star.
+
+d_star_planner:
+  ros__parameters:
+    namespace: /don
+    max_waypoints: 50
+    tight_space_radius: 5
+    max_iterations: 10000000

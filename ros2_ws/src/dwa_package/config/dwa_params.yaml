@@ -1,0 +1,49 @@
+# Parameters for the dwa FollowPath action server node.
+# Loaded by nav_server/launch/navigation_launch.py when local_planner=dwa.
+
+dwa_follower:
+  ros__parameters:
+    namespace: /don
+    lookahead: 0.85
+
+    max_velocity: 0.26
+    min_velocity: 0.0
+    max_angular_velocity: 1.8
+    min_angular_velocity: -1.8
+    max_linear_acceleration: 0.5
+    max_angular_acceleration: 2.0
+
+    v_samples: 20
+    w_samples: 20
+    dt: 0.1
+    prediction_steps: 25
+    window_steps: 5
+    LIDAR_downsample: 2
+
+    grid_size: 161
+    grid_resolution: 10.0
+
+    critical_radius: 0.20
+    emergency_stop_distance: 0.17
+    max_lidar_range: 8.0
+    goal_tolerance: 0.2
+
+    weights:
+      goal: 0.35
+      velocity: 0.10
+      smoothness: 0.05
+      obstacle: 0.40
+      dist_path: 0.10
+      heading_path: 0.05
+      blend_w_goal: 0.60
+      blend_w_heading: 0.25
+      blend_w_dist_factor: 0.7
+
+    max_path_deviation: 1.0
+    lidar_angle_offset: 1.5708
+
+    blocked_ticks_to_abort: 10
+    stuck_timeout: 8.0
+
+    visualize_trajectories: true
+    trajectory_visualization_downsample: 10

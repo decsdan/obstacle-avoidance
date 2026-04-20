@@ -1,0 +1,14 @@
+# Request
+nav_msgs/OccupancyGrid grid_snapshot    # Inflated costmap from GetGridSnapshot
+geometry_msgs/PoseStamped start
+geometry_msgs/PoseStamped goal
+float64 budget                          # Max expanded nodes / samples; 0 = planner default
+float64 timeout                         # Wall seconds; 0 = unbounded
+---
+# Response
+nav_msgs/Path path                      # Empty when success is false
+bool success
+string failure_reason                   # NO_PATH | TIMEOUT | BAD_INPUT | ""
+float64 compute_time                    # Seconds spent planning
+uint64 nodes_expanded                   # Expanded nodes, samples, or cells processed
+bool cached                             # True if the planner reused a previous result
