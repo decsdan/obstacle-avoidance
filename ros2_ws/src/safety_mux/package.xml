@@ -5,7 +5,7 @@
   <version>2.0.0</version>
   <description>cmd_vel multiplexer and safety override. Latches a zero-velocity command on bumper, cliff, or sensor-staleness, independent of the orchestrator.</description>
   <maintainer email="scheiderd@carleton.edu">daniel</maintainer>
-  <license></license>
+  <license>TODO</license>
 
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>

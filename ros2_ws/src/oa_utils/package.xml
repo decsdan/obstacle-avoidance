@@ -5,7 +5,7 @@
   <version>2.0.0</version>
   <description>Shared utilities and base classes for obstacle-avoidance global planners.</description>
   <maintainer email="scheiderd@carleton.edu">daniel</maintainer>
-  <license></license>
+  <license>TODO</license>
 
   <depend>geometry_msgs</depend>
   <depend>nav_interfaces</depend>

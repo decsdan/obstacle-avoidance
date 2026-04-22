@@ -5,7 +5,7 @@
   <version>2.0.0</version>
   <description>D* Lite global path planner. The navigation server calls it with a grid and a start/goal and gets back a path.</description>
   <maintainer email="scheiderd@carleton.edu">daniel</maintainer>
-  <license></license>
+  <license>TODO</license>
 
   <depend>geometry_msgs</depend>
   <depend>nav_interfaces</depend>

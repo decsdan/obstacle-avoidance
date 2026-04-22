@@ -5,7 +5,7 @@
   <version>2.0.0</version>
   <description>Episode lifecycle driver and dataset writer. Reads scenario YAMLs, resets Gazebo, dispatches Navigate goals, detects terminals, and writes matched rosbag2 + HDF5 sidecar artifacts per episode.</description>
   <maintainer email="scheiderd@carleton.edu">daniel</maintainer>
-  <license></license>
+  <license>TODO</license>
 
   <depend>geometry_msgs</depend>
   <depend>nav_interfaces</depend>

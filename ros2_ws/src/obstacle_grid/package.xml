@@ -5,7 +5,7 @@
   <version>2.0.0</version>
   <description>Shared LIDAR obstacle grid. Publishes raw and inflated OccupancyGrids and serves matched pairs through GetGridSnapshot for planners.</description>
   <maintainer email="scheiderd@carleton.edu">daniel</maintainer>
-  <license></license>
+  <license>TODO</license>
 
   <depend>nav_interfaces</depend>
   <depend>nav_msgs</depend>
