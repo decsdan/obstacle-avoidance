@@ -8,8 +8,6 @@ from dataclasses import asdict, dataclass
 
 @dataclass(frozen=True)
 class EnvVersions:
-    """Snapshot of versions pinned to an episode for replay verification."""
-
     commit_sha: str
     commit_dirty: bool
     ros_distro: str
@@ -62,7 +60,6 @@ def _gazebo_version() -> str:
 
 
 def capture(repo_root: str = '.') -> EnvVersions:
-    """Collect the full version snapshot in one call."""
     sha, dirty = _git_sha(repo_root)
     return EnvVersions(
         commit_sha=sha,

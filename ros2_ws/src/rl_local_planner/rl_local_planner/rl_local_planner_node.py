@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 # Originally authored by Daniel Scheider, 2026.
-"""Reinforcement Learning based local planner node."""
-
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
@@ -11,10 +9,6 @@ from geometry_msgs.msg import Twist
 import numpy as np
 
 class RLLocalPlanner(Node):
-    """
-    FollowPath action server that uses a trained RL policy to drive the robot.
-    Adheres to PRD v2.0 §5.3 Gymnasium-style contract.
-    """
 
     def __init__(self):
         super().__init__('rl_local_planner')
@@ -38,7 +32,6 @@ class RLLocalPlanner(Node):
         self.get_logger().info(f'RL Local Planner ready on {self.ns}/rl_local_planner/follow_path')
 
     def _goal_callback(self, goal_request):
-        """Accept or reject a goal request."""
         self.get_logger().info('Received FollowPath goal request')
         if not goal_request.reference_path.poses:
             self.get_logger().warn('Goal rejected: reference_path is empty')
@@ -46,12 +39,10 @@ class RLLocalPlanner(Node):
         return GoalResponse.ACCEPT
 
     def _cancel_callback(self, goal_handle):
-        """Accept or reject a cancellation request."""
         self.get_logger().info('Received cancellation request')
         return CancelResponse.ACCEPT
 
     async def _execute_callback(self, goal_handle):
-        """Execute the FollowPath goal."""
         self.get_logger().info('Executing FollowPath goal')
         
         feedback_msg = FollowPath.Feedback()

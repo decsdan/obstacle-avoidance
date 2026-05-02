@@ -1,4 +1,4 @@
-"""Scenario YAML loader, schema validator, and manifest expander."""
+"""Scenario and manifest YAML loading with schema validation."""
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -96,7 +96,6 @@ def _parse_pose(raw: dict, context: str) -> Pose2D:
 
 
 def load_scenario(path: str) -> Scenario:
-    """Parse and validate one scenario YAML."""
     with open(path, 'r') as handle:
         raw = yaml.safe_load(handle) or {}
 
@@ -141,7 +140,7 @@ def load_scenario(path: str) -> Scenario:
 
 
 def load_manifest(path: str) -> Manifest:
-    """Parse and validate a manifest YAML, expanding ``repeat`` entries."""
+    """Load a manifest YAML; ``repeat`` entries are expanded to individual rows."""
     with open(path, 'r') as handle:
         raw = yaml.safe_load(handle) or {}
 

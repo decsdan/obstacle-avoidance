@@ -31,7 +31,6 @@ def grid_to_world(gx: int, gy: int, resolution: float, origin: tuple[float, floa
 
 
 def build_path_msg(waypoints: list[tuple[float, float]], frame_id: str, stamp) -> Path:
-    """Construct a nav_msgs/Path from a list of (x, y) world coordinates."""
     path_msg = Path()
     path_msg.header.stamp = stamp
     path_msg.header.frame_id = frame_id

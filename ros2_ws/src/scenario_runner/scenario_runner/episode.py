@@ -35,7 +35,7 @@ class EpisodePaths:
 
 
 class Episode:
-    """State for one scenario run; one instance per episode."""
+    """State container for one scenario run."""
 
     def __init__(
         self,

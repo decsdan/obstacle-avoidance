@@ -78,7 +78,6 @@ def decay(log_odds: np.ndarray, dt: float, tau: float):
 
 
 def to_probability(log_odds: np.ndarray) -> np.ndarray:
-    """Convert log-odds to probability in [0, 1]."""
     return 1.0 / (1.0 + np.exp(-log_odds))
 
 

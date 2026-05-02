@@ -1,4 +1,4 @@
-"""Distance-transform helpers for shared inflated costmap output."""
+"""Distance-transform utilities for occupancy grid inflation."""
 import numpy as np
 from scipy.ndimage import binary_dilation, distance_transform_edt
 
@@ -16,10 +16,6 @@ def inflate_binary(binary_grid: np.ndarray, inflation_cells: int) -> np.ndarray:
 
 
 def distance_field(binary_grid: np.ndarray, resolution: float) -> np.ndarray:
-    """Return the Euclidean distance to the nearest obstacle (meters).
-
-    Used by local planners that score trajectories by clearance and by
-    FM² as the speed-map prior.
-    """
+    """Euclidean distance to nearest obstacle (meters)."""
     free = binary_grid < 100
     return distance_transform_edt(free).astype(np.float32) * resolution

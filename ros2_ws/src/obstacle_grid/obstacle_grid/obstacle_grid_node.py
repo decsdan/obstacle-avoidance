@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Shared LIDAR obstacle grid node."""
 import math
 import sys
 
@@ -30,7 +29,6 @@ from obstacle_grid.distance_grid import inflate_binary
 
 
 class ObstacleGridNode(Node):
-    """Shared log-odds occupancy grid for global and local planners."""
 
     def __init__(self):
         super().__init__('obstacle_grid_node')
@@ -175,7 +173,6 @@ class ObstacleGridNode(Node):
         self.scan_msg = msg
 
     def _update_cycle(self):
-        """Apply latest scan, decay, threshold + inflate, publish."""
         if not self._grid_initialized or self.scan_msg is None:
             return
 

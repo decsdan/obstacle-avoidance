@@ -26,6 +26,7 @@ setup(
     entry_points={
         'console_scripts': [
             'safety_mux = safety_mux.safety_mux_node:main',
+            'hazard_adapter = safety_mux.hazard_adapter_node:main',
         ],
     },
 )

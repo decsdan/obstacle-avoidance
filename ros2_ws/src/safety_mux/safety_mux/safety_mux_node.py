@@ -17,7 +17,6 @@ from std_srvs.srv import Trigger
 
 
 class SafetyMux(Node):
-    """cmd_vel multiplexer with bumper/cliff/staleness override."""
 
     def __init__(self):
         super().__init__('safety_mux')
@@ -169,7 +168,6 @@ class SafetyMux(Node):
         self._collision_pub.publish(msg)
 
     def _handle_clear(self, _request, response):
-        """Unlatch and resume pass-through."""
         was_latched = self._latched
         self._latched = False
         self._collision = False

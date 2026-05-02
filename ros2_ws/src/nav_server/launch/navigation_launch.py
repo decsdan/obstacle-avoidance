@@ -46,6 +46,8 @@ def _launch_setup(context):
     map_yaml = LaunchConfiguration('map_yaml').perform(context)
     use_rviz = LaunchConfiguration('rviz').perform(context).lower() == 'true'
     use_server = LaunchConfiguration('server').perform(context).lower() == 'true'
+    use_sim_time_str = LaunchConfiguration('use_sim_time').perform(context)
+    sim_time_param = {'use_sim_time': use_sim_time_str.lower() == 'true'}
 
     nav_pkg_dir = get_package_share_directory('nav_server')
     nav_params = os.path.join(nav_pkg_dir, 'config', 'nav_server_params.yaml')
@@ -71,6 +73,7 @@ def _launch_setup(context):
             package='obstacle_grid',
             executable='obstacle_grid',
             name='obstacle_grid_node',
+            parameters=[sim_time_param],
             arguments=['--ros-args', '-p', f'namespace:={ns}'],
             output='screen',
         ))
@@ -84,7 +87,7 @@ def _launch_setup(context):
             package=spec['package'],
             executable=spec['executable'],
             name=spec['node_name'],
-            parameters=[params_file],
+            parameters=[params_file, sim_time_param],
             arguments=['--ros-args', '-p', f'namespace:={ns}'],
             output='screen',
         ))
@@ -97,7 +100,7 @@ def _launch_setup(context):
             package='dwa_package',
             executable='dwa_node',
             name='dwa_follower',
-            parameters=[dwa_params],
+            parameters=[dwa_params, sim_time_param],
             arguments=['--ros-args', '-p', f'namespace:={ns}'],
             output='screen',
         ))
@@ -119,7 +122,7 @@ def _launch_setup(context):
             package='nav_server',
             executable='navigation_server',
             name='navigation_server',
-            parameters=[nav_params],
+            parameters=[nav_params, sim_time_param],
             arguments=server_overrides,
             output='screen',
         ))
@@ -168,6 +171,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'server', default_value='true',
             description='Launch the navigation action server'),
+        DeclareLaunchArgument(
+            'use_sim_time', default_value='true',
+            description=('Use sim-time clock; required true for deterministic '
+                         'scenario_runner replays (PRD §4.5)')),
 
         OpaqueFunction(function=_launch_setup),
     ])

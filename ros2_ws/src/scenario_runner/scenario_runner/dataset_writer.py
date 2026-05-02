@@ -202,12 +202,7 @@ class HDF5SidecarWriter:
 
 
 class BagRecorder:
-    """Thin rosbag2_py wrapper scoped to one episode.
-
-    Records the full topic stream for fidelity replay. Topic-type mapping
-    is supplied by the caller so tests can construct it without requiring
-    rosbag2_py to be importable.
-    """
+    """Thin rosbag2_py wrapper for one episode; topic-type mapping is caller-supplied for testability."""
 
     def __init__(self, uri: str, storage_id: str = 'sqlite3'):
         self._uri = uri

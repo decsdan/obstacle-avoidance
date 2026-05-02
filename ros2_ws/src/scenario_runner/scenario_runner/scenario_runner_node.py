@@ -36,7 +36,6 @@ from scenario_runner.versioning import capture as capture_env
 
 # TODO: support multiple concurrent scenarios
 class ScenarioRunnerNode(Node):
-    """Drives episodes end-to-end; implements the RunBatch action server."""
 
     def __init__(self):
         super().__init__('scenario_runner')
@@ -228,7 +227,6 @@ class ScenarioRunnerNode(Node):
         env_versions,
         scenario_yaml_text: str,
     ) -> str:
-        """Run one episode start to finish; return the terminal outcome string."""
         self._reset_per_episode_state()
 
         if not self._reset_world(scenario):

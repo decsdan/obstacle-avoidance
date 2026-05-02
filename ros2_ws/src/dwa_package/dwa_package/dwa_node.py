@@ -41,7 +41,6 @@ class DWAConstants:
 
 
 class DWAFollower(Node):
-    """FollowPath action server that tracks a reference path using DWA."""
 
     def __init__(self):
         super().__init__('dwa_follower')
@@ -215,7 +214,6 @@ class DWAFollower(Node):
         return CancelResponse.ACCEPT
 
     def _execute(self, goal_handle):
-        """Drive the robot along the reference path until done."""
         path_pts = np.array([
             [p.pose.position.x, p.pose.position.y]
             for p in goal_handle.request.reference_path.poses
@@ -471,7 +469,6 @@ class DWAFollower(Node):
 
     def _sample_and_predict(self, curr_x, curr_y, curr_theta, curr_v, curr_w,
                             dist_to_goal):
-        """Sample (v, w) pairs in the dynamic window and forward-simulate."""
         # Clamp max_v near the goal so we don't overshoot.
         # HACK: 0.15 floor on effective_max_v prevents the robot from stalling in tight corridors
         effective_max_v = float(
