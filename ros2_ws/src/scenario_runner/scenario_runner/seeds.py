@@ -13,7 +13,6 @@ class SubordinateSeeds:
 
 
 def derive(master_seed: int) -> SubordinateSeeds:
-    # per PRD §4.5
     master = int(master_seed) & 0xFFFFFFFFFFFFFFFF
     return SubordinateSeeds(
         master=master,

@@ -15,7 +15,6 @@ except ImportError:  # allow unit tests to import without rosbag2_py
 
 @dataclass
 class TickRecord:
-    # one control-cycle snapshot (matches PRD tick schema)
 
     timestamp_sim: float
     timestamp_wall: float

@@ -173,8 +173,6 @@ def generate_launch_description():
             description='Launch the navigation action server'),
         DeclareLaunchArgument(
             'use_sim_time', default_value='true',
-            description=('Use sim-time clock; required true for deterministic '
-                         'scenario_runner replays (PRD §4.5)')),
-
+            description='Use sim-time clock; required true for deterministic'),
         OpaqueFunction(function=_launch_setup),
     ])

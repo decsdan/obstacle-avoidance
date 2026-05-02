@@ -406,7 +406,6 @@ class ScenarioRunnerNode(Node):
             return (None, None, None)
         arr = np.asarray(raw.data, dtype=np.int8).reshape(
             raw.info.height, raw.info.width)
-        # Map int8 [-128, 127] to uint8 [0, 255] for HDF5 storage per PRD
         packed = (arr.astype(np.int16) + 128).astype(np.uint8)
         origin = (
             float(raw.info.origin.position.x),
